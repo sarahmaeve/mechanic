@@ -10,9 +10,16 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 /// does not populate `KeyEvent::text` for Ctrl+key combos — we must
 /// synthesize the control character ourselves.
 ///
+/// `cursor_app_mode` should be `terminal.cursor_app_mode()` — when true,
+/// arrow keys and Home/End send SS3 sequences instead of CSI sequences.
+///
 /// Returns `None` for key events that don't produce terminal input
 /// (e.g. modifier-only presses, key releases).
-pub fn translate_key(event: &KeyEvent, modifiers: ModifiersState) -> Option<Vec<u8>> {
+pub fn translate_key(
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+    cursor_app_mode: bool,
+) -> Option<Vec<u8>> {
     // Only act on key presses (including auto-repeat).
     if event.state != ElementState::Pressed {
         return None;
@@ -20,9 +27,18 @@ pub fn translate_key(event: &KeyEvent, modifiers: ModifiersState) -> Option<Vec<
 
     match &event.logical_key {
         Key::Named(named) => {
-            // Modifier-aware arrow key handling.
-            if let Some(bytes) = modified_arrow(named, modifiers) {
+            // Priority order: modified_named_key → modified_arrow →
+            // named_key_bytes_app_mode (when flag set) → named_key_bytes.
+            if let Some(bytes) = modified_named_key(named, modifiers) {
                 return Some(bytes);
+            }
+            if let Some(bytes) = modified_arrow(named, modifiers, cursor_app_mode) {
+                return Some(bytes);
+            }
+            if cursor_app_mode {
+                if let Some(bytes) = named_key_bytes_app_mode(named) {
+                    return Some(bytes);
+                }
             }
             named_key_bytes(named)
         }
@@ -60,7 +76,7 @@ pub fn translate_key(event: &KeyEvent, modifiers: ModifiersState) -> Option<Vec<
 /// Ctrl+a → 0x01, Ctrl+b → 0x02, … Ctrl+z → 0x1A.
 /// Also handles Ctrl+\[ → 0x1B (ESC), Ctrl+\\ → 0x1C, Ctrl+] → 0x1D,
 /// Ctrl+^ → 0x1E, Ctrl+_ → 0x1F, Ctrl+@ → 0x00 (NUL).
-pub(crate) fn ctrl_char(ch: &str) -> Option<u8> {
+pub fn ctrl_char(ch: &str) -> Option<u8> {
     let c = ch.chars().next()?;
     match c {
         'a'..='z' => Some(c as u8 - b'a' + 1),
@@ -77,10 +93,10 @@ pub(crate) fn ctrl_char(ch: &str) -> Option<u8> {
 
 /// Map a `NamedKey` to its standard VT/ANSI escape sequence bytes.
 ///
-/// Exposed as `pub(crate)` so the unit-test module can call it directly
+/// Exposed as `pub` so the unit-test module can call it directly
 /// without needing to construct a `KeyEvent` (whose `platform_specific`
 /// field is private to winit).
-pub(crate) fn named_key_bytes(key: &NamedKey) -> Option<Vec<u8>> {
+pub fn named_key_bytes(key: &NamedKey) -> Option<Vec<u8>> {
     let seq: &[u8] = match key {
         NamedKey::Space => b" ",
         NamedKey::Enter => b"\r",
@@ -125,10 +141,44 @@ pub(crate) fn named_key_bytes(key: &NamedKey) -> Option<Vec<u8>> {
     Some(seq.to_vec())
 }
 
+/// Map the 6 keys that change in DECCKM application cursor mode (DECSET 1).
+///
+/// Returns `Some` only for the keys that differ from normal mode; the caller
+/// falls through to `named_key_bytes` for everything else.
+pub fn named_key_bytes_app_mode(key: &NamedKey) -> Option<Vec<u8>> {
+    let seq: &[u8] = match key {
+        NamedKey::ArrowUp => b"\x1bOA",
+        NamedKey::ArrowDown => b"\x1bOB",
+        NamedKey::ArrowRight => b"\x1bOC",
+        NamedKey::ArrowLeft => b"\x1bOD",
+        NamedKey::Home => b"\x1bOH",
+        NamedKey::End => b"\x1bOF",
+        _ => return None,
+    };
+    Some(seq.to_vec())
+}
+
+/// Handle named-key + modifier combos that don't fit the arrow-key pattern.
+///
+/// Currently:
+/// - Shift+Tab  → `\x1b[Z`  (reverse-tab; needed for TUI menus, fzf, etc.)
+/// - Ctrl+Space → `\x00`    (NUL; common bind, e.g. emacs set-mark-command)
+pub fn modified_named_key(key: &NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
+    match key {
+        NamedKey::Tab if modifiers.shift_key() => Some(b"\x1b[Z".to_vec()),
+        NamedKey::Space if modifiers.control_key() => Some(vec![0x00]),
+        _ => None,
+    }
+}
+
 /// Map an arrow key + modifier combo to its shell escape sequence.
 ///
 /// Returns `None` if the key isn't an arrow or no modifier is held
 /// (the caller falls back to the unmodified `named_key_bytes`).
+///
+/// `cursor_app_mode` controls whether Cmd+Left/Right emit SS3 (`\x1bOH`/`\x1bOF`)
+/// or CSI (`\x1b[H`/`\x1b[F`).  Opt+Left/Right are readline word-motion sequences
+/// and are unaffected by the mode.
 ///
 /// # Platform note
 ///
@@ -138,7 +188,11 @@ pub(crate) fn named_key_bytes(key: &NamedKey) -> Option<Vec<u8>> {
 /// non-macOS platforms.  macOS users can use Ctrl+A / Ctrl+E for line
 /// start/end instead — those are raw control characters and bypass
 /// the text-input layer entirely.
-pub(crate) fn modified_arrow(key: &NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
+pub fn modified_arrow(
+    key: &NamedKey,
+    modifiers: ModifiersState,
+    cursor_app_mode: bool,
+) -> Option<Vec<u8>> {
     let is_alt = modifiers.alt_key();
     let is_super = modifiers.super_key();
 
@@ -148,10 +202,12 @@ pub(crate) fn modified_arrow(key: &NamedKey, modifiers: ModifiersState) -> Optio
     }
 
     let seq: &[u8] = match (key, is_alt, is_super) {
-        // Opt+Arrow — word movement via readline conventions.
+        // Opt+Arrow — word movement via readline conventions (unchanged by mode).
         (NamedKey::ArrowLeft, true, _) => b"\x1bb",
         (NamedKey::ArrowRight, true, _) => b"\x1bf",
-        // Cmd+Arrow — line start/end via Home/End escape sequences.
+        // Cmd+Arrow — line start/end; respects cursor_app_mode.
+        (NamedKey::ArrowLeft, _, true) if cursor_app_mode => b"\x1bOH",
+        (NamedKey::ArrowRight, _, true) if cursor_app_mode => b"\x1bOF",
         (NamedKey::ArrowLeft, _, true) => b"\x1b[H",
         (NamedKey::ArrowRight, _, true) => b"\x1b[F",
         _ => return None,
@@ -477,47 +533,147 @@ mod tests {
     #[test]
     fn opt_arrow_left_is_backward_word() {
         let mods = ModifiersState::ALT;
-        assert_eq!(modified_arrow(&NamedKey::ArrowLeft, mods), Some(b"\x1bb".to_vec()));
+        assert_eq!(modified_arrow(&NamedKey::ArrowLeft, mods, false), Some(b"\x1bb".to_vec()));
     }
 
     #[test]
     fn opt_arrow_right_is_forward_word() {
         let mods = ModifiersState::ALT;
-        assert_eq!(modified_arrow(&NamedKey::ArrowRight, mods), Some(b"\x1bf".to_vec()));
+        assert_eq!(modified_arrow(&NamedKey::ArrowRight, mods, false), Some(b"\x1bf".to_vec()));
     }
 
     #[test]
     fn cmd_arrow_left_is_line_start() {
         let mods = ModifiersState::SUPER;
-        assert_eq!(modified_arrow(&NamedKey::ArrowLeft, mods), Some(b"\x1b[H".to_vec()));
+        assert_eq!(modified_arrow(&NamedKey::ArrowLeft, mods, false), Some(b"\x1b[H".to_vec()));
     }
 
     #[test]
     fn cmd_arrow_right_is_line_end() {
         let mods = ModifiersState::SUPER;
-        assert_eq!(modified_arrow(&NamedKey::ArrowRight, mods), Some(b"\x1b[F".to_vec()));
+        assert_eq!(modified_arrow(&NamedKey::ArrowRight, mods, false), Some(b"\x1b[F".to_vec()));
     }
 
     #[test]
     fn unmodified_arrow_falls_through() {
         // No modifier → function returns None so the caller uses named_key_bytes.
         let mods = ModifiersState::empty();
-        assert_eq!(modified_arrow(&NamedKey::ArrowLeft, mods), None);
-        assert_eq!(modified_arrow(&NamedKey::ArrowRight, mods), None);
+        assert_eq!(modified_arrow(&NamedKey::ArrowLeft, mods, false), None);
+        assert_eq!(modified_arrow(&NamedKey::ArrowRight, mods, false), None);
     }
 
     #[test]
     fn non_arrow_keys_ignored() {
         let mods = ModifiersState::ALT;
-        assert_eq!(modified_arrow(&NamedKey::Enter, mods), None);
-        assert_eq!(modified_arrow(&NamedKey::Backspace, mods), None);
+        assert_eq!(modified_arrow(&NamedKey::Enter, mods, false), None);
+        assert_eq!(modified_arrow(&NamedKey::Backspace, mods, false), None);
     }
 
     #[test]
     fn opt_arrow_up_and_down_ignored() {
         // We only handle horizontal arrows — Opt+Up/Down fall through.
         let mods = ModifiersState::ALT;
-        assert_eq!(modified_arrow(&NamedKey::ArrowUp, mods), None);
-        assert_eq!(modified_arrow(&NamedKey::ArrowDown, mods), None);
+        assert_eq!(modified_arrow(&NamedKey::ArrowUp, mods, false), None);
+        assert_eq!(modified_arrow(&NamedKey::ArrowDown, mods, false), None);
+    }
+
+    // ── Fix 2: Shift+Tab / Ctrl+Space ────────────────────────────────────────
+
+    #[test]
+    fn shift_tab_is_reverse_tab() {
+        let mods = ModifiersState::SHIFT;
+        assert_eq!(
+            modified_named_key(&NamedKey::Tab, mods),
+            Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_space_is_nul() {
+        let mods = ModifiersState::CONTROL;
+        assert_eq!(
+            modified_named_key(&NamedKey::Space, mods),
+            Some(vec![0x00])
+        );
+    }
+
+    // Regression: unmodified Tab still returns \t via named_key_bytes.
+    #[test]
+    fn tab_without_modifier_unchanged() {
+        assert_eq!(named_key_bytes(&NamedKey::Tab), Some(b"\t".to_vec()));
+    }
+
+    // ── Fix 1: DECCKM application cursor mode ────────────────────────────────
+
+    #[test]
+    fn arrow_up_app_mode() {
+        assert_eq!(
+            named_key_bytes_app_mode(&NamedKey::ArrowUp),
+            Some(b"\x1bOA".to_vec())
+        );
+    }
+
+    #[test]
+    fn arrow_down_app_mode() {
+        assert_eq!(
+            named_key_bytes_app_mode(&NamedKey::ArrowDown),
+            Some(b"\x1bOB".to_vec())
+        );
+    }
+
+    #[test]
+    fn arrow_right_app_mode() {
+        assert_eq!(
+            named_key_bytes_app_mode(&NamedKey::ArrowRight),
+            Some(b"\x1bOC".to_vec())
+        );
+    }
+
+    #[test]
+    fn arrow_left_app_mode() {
+        assert_eq!(
+            named_key_bytes_app_mode(&NamedKey::ArrowLeft),
+            Some(b"\x1bOD".to_vec())
+        );
+    }
+
+    #[test]
+    fn home_app_mode() {
+        assert_eq!(
+            named_key_bytes_app_mode(&NamedKey::Home),
+            Some(b"\x1bOH".to_vec())
+        );
+    }
+
+    #[test]
+    fn end_app_mode() {
+        assert_eq!(
+            named_key_bytes_app_mode(&NamedKey::End),
+            Some(b"\x1bOF".to_vec())
+        );
+    }
+
+    #[test]
+    fn cmd_arrow_left_app_mode() {
+        let mods = ModifiersState::SUPER;
+        assert_eq!(
+            modified_arrow(&NamedKey::ArrowLeft, mods, true),
+            Some(b"\x1bOH".to_vec())
+        );
+    }
+
+    #[test]
+    fn cmd_arrow_right_app_mode() {
+        let mods = ModifiersState::SUPER;
+        assert_eq!(
+            modified_arrow(&NamedKey::ArrowRight, mods, true),
+            Some(b"\x1bOF".to_vec())
+        );
+    }
+
+    // Regression: normal (non-app) mode still sends CSI sequences.
+    #[test]
+    fn arrow_up_non_app_mode() {
+        assert_eq!(named_key_bytes(&NamedKey::ArrowUp), Some(b"\x1b[A".to_vec()));
     }
 }

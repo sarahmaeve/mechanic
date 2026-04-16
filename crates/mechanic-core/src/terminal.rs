@@ -247,6 +247,15 @@ impl Terminal {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// Whether the shell has enabled DECSET 1 (DECCKM) — application
+    /// cursor mode.  When true, cursor / navigation keys must send SS3
+    /// sequences (ESC O *) instead of CSI (ESC [ *).  Set by vim, less,
+    /// tmux, readline's `cursor-keys-mode-application` option.
+    pub fn cursor_app_mode(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
     /// Number of columns in the grid.
     pub fn columns(&self) -> usize {
         self.term.grid().columns()

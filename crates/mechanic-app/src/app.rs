@@ -450,7 +450,7 @@ impl ApplicationHandler for App {
 
                 state.last_input_time = std::time::Instant::now();
 
-                if let Some(bytes) = crate::input::translate_key(&key_event, state.modifiers) {
+                if let Some(bytes) = crate::input::translate_key(&key_event, state.modifiers, state.terminal.cursor_app_mode()) {
                     // Clear any visible selection as a side effect of typing.
                     //
                     // Earlier we tried to gate Escape on selection presence
