@@ -50,6 +50,9 @@ fn rgb_to_f32(c: Rgb) -> [f32; 4] {
 struct Globals {
     viewport_size: [f32; 2],
     cell_size: [f32; 2],
+    time: f32,
+    content_opacity: f32,
+    _pad: [f32; 2], // keep 16-byte aligned
 }
 
 // ── RenderState ───────────────────────────────────────────────────────────────
@@ -133,7 +136,7 @@ impl RenderState {
             height: size.1,
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
             view_formats: vec![],
         };
         surface.configure(&device, &surface_config);
@@ -156,7 +159,7 @@ impl RenderState {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -247,6 +250,9 @@ impl RenderState {
         let globals = Globals {
             viewport_size: [size.0 as f32, size.1 as f32],
             cell_size: [cell_size.0, cell_size.1],
+            time: 0.0,
+            content_opacity: 1.0,
+            _pad: [0.0; 2],
         };
 
         let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -364,10 +370,13 @@ impl RenderState {
         self.surface_config.height = new_size.1;
         self.surface.configure(&self.device, &self.surface_config);
 
-        // Update the globals uniform.
+        // Update the globals uniform (time/opacity are overwritten each frame).
         let globals = Globals {
             viewport_size: [new_size.0 as f32, new_size.1 as f32],
             cell_size: [self.cell_size.0, self.cell_size.1],
+            time: 0.0,
+            content_opacity: 1.0,
+            _pad: [0.0; 2],
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
     }
@@ -378,7 +387,20 @@ impl RenderState {
         grid: &RenderGrid,
         text_renderer: &mut TextRenderer,
         font_config: &mechanic_config::font::FontConfig,
+        content_opacity: f32,
+        time: f32,
     ) {
+        // ── Update globals uniform ────────────────────────────────────────────
+
+        let globals = Globals {
+            viewport_size: [self.size.0 as f32, self.size.1 as f32],
+            cell_size: [self.cell_size.0, self.cell_size.1],
+            time,
+            content_opacity,
+            _pad: [0.0; 2],
+        };
+        self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+
         // ── Build instance list ───────────────────────────────────────────────
 
         let total_cells = grid.cols * grid.rows;
@@ -514,6 +536,14 @@ impl RenderState {
             label: Some("frame_encoder"),
         });
 
+        // Premultiplied alpha clear color: multiply RGB by alpha.
+        let clear_color = wgpu::Color {
+            r: self.clear_color.r * content_opacity as f64,
+            g: self.clear_color.g * content_opacity as f64,
+            b: self.clear_color.b * content_opacity as f64,
+            a: content_opacity as f64,
+        };
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("cell_pass"),
@@ -522,7 +552,7 @@ impl RenderState {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

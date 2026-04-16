@@ -12,6 +12,12 @@ struct Globals {
     viewport_size: vec2<f32>,
     // Cell size in pixels.
     cell_size: vec2<f32>,
+    // Elapsed seconds since app start (for animation).
+    time: f32,
+    // Content opacity (activity-based fade).
+    content_opacity: f32,
+    // Padding to maintain 16-byte alignment.
+    _pad: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -47,6 +53,7 @@ struct VertexOutput {
     @location(1) fg_color: vec4<f32>,
     @location(2) bg_color: vec4<f32>,
     @location(3) use_atlas: u32,
+    @location(4) pixel_pos: vec2<f32>,  // pixel position for gradient
 }
 
 // Quad corners in local [0,1]^2 space (two triangles, 6 vertices).
@@ -110,6 +117,7 @@ fn vs_main(
     out.fg_color  = inst.fg_color;
     out.bg_color  = inst.bg_color;
     out.use_atlas = inst.use_atlas;
+    out.pixel_pos = px;
 
     return out;
 }
@@ -119,13 +127,42 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if in.use_atlas == 1u {
-        // Sample the glyph mask (alpha-only).  The atlas stores pre-rendered
-        // alpha coverage in the R channel.
         let alpha = textureSample(atlas_texture, atlas_sampler, in.uv).r;
-        // Composite glyph over background.
-        return mix(in.bg_color, in.fg_color, alpha);
+        var color = mix(in.bg_color, in.fg_color, alpha);
+        // Apply content opacity (premultiplied alpha).
+        color = vec4<f32>(color.rgb * globals.content_opacity, color.a * globals.content_opacity);
+        return color;
     } else {
-        // Solid background — no glyph.
-        return in.bg_color;
+        // Background cell — apply gradient and opacity.
+        var bg = in.bg_color;
+
+        // Animated gradient glow in the lower-right corner.
+        // Normalized position in the viewport.
+        let uv_pos = in.pixel_pos / globals.viewport_size;
+
+        // Distance from lower-right corner (1.0, 1.0).
+        let dist = length(uv_pos - vec2<f32>(1.0, 1.0));
+
+        // Gradient intensity: strong near corner, fading out.
+        // The `0.08` controls the radius of the glow.
+        let gradient_strength = exp(-dist * dist / 0.08) * 0.15;
+
+        // Animated color: slowly rotating between electric cyan (#52E8FF)
+        // and azure (#007FFF) over time.
+        let phase = globals.time * 0.3;  // slow rotation
+        let gradient_r = mix(0.322, 0.0, sin(phase) * 0.5 + 0.5) * gradient_strength;
+        let gradient_g = mix(0.910, 0.498, sin(phase) * 0.5 + 0.5) * gradient_strength;
+        let gradient_b = mix(1.0, 1.0, 1.0) * gradient_strength;
+
+        bg = vec4<f32>(
+            bg.r + gradient_r,
+            bg.g + gradient_g,
+            bg.b + gradient_b,
+            bg.a,
+        );
+
+        // Apply content opacity (premultiplied alpha).
+        bg = vec4<f32>(bg.rgb * globals.content_opacity, bg.a * globals.content_opacity);
+        return bg;
     }
 }

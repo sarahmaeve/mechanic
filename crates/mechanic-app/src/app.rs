@@ -42,6 +42,10 @@ struct AppState {
     modifiers: ModifiersState,
     /// Clipboard handle for copy/paste operations.
     clipboard: Option<arboard::Clipboard>,
+    /// Instant of the last user interaction (key press, mouse click, etc.).
+    last_input_time: std::time::Instant,
+    /// Instant when the application started (used to compute the `time` uniform).
+    start_time: std::time::Instant,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -129,7 +133,8 @@ impl ApplicationHandler for App {
         // ── Create window ─────────────────────────────────────────────────────
         let attrs = WindowAttributes::default()
             .with_title("Mechanic")
-            .with_inner_size(LogicalSize::new(1024u32, 768u32));
+            .with_inner_size(LogicalSize::new(1024u32, 768u32))
+            .with_transparent(true);
 
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -189,6 +194,7 @@ impl ApplicationHandler for App {
         window.set_ime_allowed(true);
 
         // ── Store state and request first frame ───────────────────────────────
+        let now = std::time::Instant::now();
         self.state = Some(AppState {
             window: window.clone(),
             terminal,
@@ -198,6 +204,8 @@ impl ApplicationHandler for App {
             mouse_pressed: false,
             modifiers: ModifiersState::empty(),
             clipboard,
+            last_input_time: now,
+            start_time: now,
         });
         window.request_redraw();
     }
@@ -267,6 +275,7 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                state.last_input_time = std::time::Instant::now();
                 if let Some(bytes) = crate::input::translate_key(&key_event, state.modifiers) {
                     if let Err(e) = state.terminal.write_to_pty(&bytes) {
                         log::warn!("PTY write failed: {e}");
@@ -322,6 +331,7 @@ impl ApplicationHandler for App {
                 let rows = state.terminal.screen_lines();
                 let (point, side) = pixel_to_grid_point(x, y, cw, ch, cols, rows);
 
+                state.last_input_time = std::time::Instant::now();
                 match btn_state {
                     ElementState::Pressed => {
                         state.mouse_pressed = true;
@@ -353,6 +363,7 @@ impl ApplicationHandler for App {
 
             // ── Mouse wheel / scroll ──────────────────────────────────────────
             WindowEvent::MouseWheel { delta, .. } => {
+                state.last_input_time = std::time::Instant::now();
                 let cell_height = state.cell_metrics.cell_height;
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as i32,
@@ -374,10 +385,17 @@ impl ApplicationHandler for App {
                 // 2. Convert the grid to a renderer-friendly snapshot.
                 let grid = crate::convert::convert_grid(&state.terminal, &self.config.theme);
 
-                // 3. Submit the frame to the GPU.
-                state.renderer.render(&grid);
+                // 3. Compute activity-based opacity.
+                let elapsed_secs = state.last_input_time.elapsed().as_secs_f32();
+                let opacity = compute_opacity(elapsed_secs, &self.config.theme.opacity);
 
-                // 4. Update the window title if the terminal has set one.
+                // 4. Compute elapsed time since app start for animation.
+                let time = state.start_time.elapsed().as_secs_f32();
+
+                // 5. Submit the frame to the GPU.
+                state.renderer.render(&grid, opacity, time);
+
+                // 6. Update the window title if the terminal has set one.
                 let title = state.terminal.title();
                 if !title.is_empty() {
                     state.window.set_title(title);
@@ -398,5 +416,29 @@ impl ApplicationHandler for App {
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
         }
+    }
+}
+
+// ── Opacity computation ───────────────────────────────────────────────────────
+
+/// Compute content opacity based on seconds since last user interaction.
+///
+/// Returns `content_active_opacity` during active use, smoothly fading
+/// to `content_idle_opacity` between `fade_begin_secs` and `fade_end_secs`.
+fn compute_opacity(elapsed_secs: f32, config: &mechanic_config::OpacityConfig) -> f32 {
+    let begin = config.fade_begin_secs as f32;
+    let end = config.fade_end_secs as f32;
+
+    if elapsed_secs <= begin {
+        config.content_active_opacity
+    } else if elapsed_secs >= end {
+        config.content_idle_opacity
+    } else {
+        // Smooth ease-in-out interpolation between active and idle.
+        let t = (elapsed_secs - begin) / (end - begin);
+        // Smoothstep: 3t² - 2t³
+        let smooth_t = t * t * (3.0 - 2.0 * t);
+        config.content_active_opacity
+            + (config.content_idle_opacity - config.content_active_opacity) * smooth_t
     }
 }

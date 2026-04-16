@@ -104,7 +104,7 @@ impl Renderer {
     }
 
     /// Render one frame from the given terminal grid.
-    pub fn render(&mut self, grid: &RenderGrid) {
-        self.state.render(grid, &mut self.text, &self.font_config);
+    pub fn render(&mut self, grid: &RenderGrid, content_opacity: f32, time: f32) {
+        self.state.render(grid, &mut self.text, &self.font_config, content_opacity, time);
     }
 }
