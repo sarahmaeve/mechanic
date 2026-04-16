@@ -262,7 +262,7 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                if let Some(bytes) = crate::input::translate_key(&key_event) {
+                if let Some(bytes) = crate::input::translate_key(&key_event, state.modifiers) {
                     if let Err(e) = state.terminal.write_to_pty(&bytes) {
                         log::warn!("PTY write failed: {e}");
                     }

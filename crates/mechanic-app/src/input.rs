@@ -1,13 +1,18 @@
 //! Keyboard input translation: winit KeyEvent → PTY byte sequences.
 
 use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// Translate a winit KeyEvent into bytes to send to the PTY.
 ///
+/// `modifiers` is the current keyboard modifier state (tracked via
+/// `WindowEvent::ModifiersChanged`).  It is needed because macOS often
+/// does not populate `KeyEvent::text` for Ctrl+key combos — we must
+/// synthesize the control character ourselves.
+///
 /// Returns `None` for key events that don't produce terminal input
 /// (e.g. modifier-only presses, key releases).
-pub fn translate_key(event: &KeyEvent) -> Option<Vec<u8>> {
+pub fn translate_key(event: &KeyEvent, modifiers: ModifiersState) -> Option<Vec<u8>> {
     // Only act on key presses (including auto-repeat).
     if event.state != ElementState::Pressed {
         return None;
@@ -15,22 +20,51 @@ pub fn translate_key(event: &KeyEvent) -> Option<Vec<u8>> {
 
     match &event.logical_key {
         Key::Named(named) => named_key_bytes(named),
-        Key::Character(_) => {
-            // Prefer the OS-resolved text (handles Ctrl combos, dead keys, etc.).
+        Key::Character(ch) => {
+            // ── Ctrl+letter → control character ──────────────────────────
+            //
+            // On macOS, `event.text` is often `None` for Ctrl+key combos.
+            // Synthesize the standard ASCII control character (Ctrl+A = 0x01,
+            // Ctrl+C = 0x03, … Ctrl+Z = 0x1A).
+            if modifiers.control_key() {
+                if let Some(ctrl_byte) = ctrl_char(ch) {
+                    return Some(vec![ctrl_byte]);
+                }
+            }
+
+            // Prefer the OS-resolved text (handles dead keys, shifted chars, etc.).
             if let Some(text) = &event.text {
                 if !text.is_empty() {
                     return Some(text.as_bytes().to_vec());
                 }
             }
             // text was None or empty — encode the character string as UTF-8.
-            if let Key::Character(s) = &event.logical_key {
-                if !s.is_empty() {
-                    return Some(s.as_bytes().to_vec());
-                }
+            if !ch.is_empty() {
+                return Some(ch.as_bytes().to_vec());
             }
             None
         }
         // Unidentified / Dead keys — nothing to send.
+        _ => None,
+    }
+}
+
+/// Convert a character to its ASCII control-character byte when Ctrl is held.
+///
+/// Ctrl+a → 0x01, Ctrl+b → 0x02, … Ctrl+z → 0x1A.
+/// Also handles Ctrl+\[ → 0x1B (ESC), Ctrl+\\ → 0x1C, Ctrl+] → 0x1D,
+/// Ctrl+^ → 0x1E, Ctrl+_ → 0x1F, Ctrl+@ → 0x00 (NUL).
+pub(crate) fn ctrl_char(ch: &str) -> Option<u8> {
+    let c = ch.chars().next()?;
+    match c {
+        'a'..='z' => Some(c as u8 - b'a' + 1),
+        'A'..='Z' => Some(c as u8 - b'A' + 1),
+        '[' => Some(0x1B),
+        '\\' => Some(0x1C),
+        ']' => Some(0x1D),
+        '^' => Some(0x1E),
+        '_' => Some(0x1F),
+        '@' => Some(0x00),
         _ => None,
     }
 }
@@ -42,6 +76,7 @@ pub fn translate_key(event: &KeyEvent) -> Option<Vec<u8>> {
 /// field is private to winit).
 pub(crate) fn named_key_bytes(key: &NamedKey) -> Option<Vec<u8>> {
     let seq: &[u8] = match key {
+        NamedKey::Space => b" ",
         NamedKey::Enter => b"\r",
         NamedKey::Backspace => b"\x7f",
         NamedKey::Tab => b"\t",
@@ -91,6 +126,11 @@ mod tests {
     use super::*;
 
     // ── named key → escape sequence ──────────────────────────────────────────
+
+    #[test]
+    fn space() {
+        assert_eq!(named_key_bytes(&NamedKey::Space), Some(b" ".to_vec()));
+    }
 
     #[test]
     fn enter() {
@@ -242,6 +282,48 @@ mod tests {
     #[test]
     fn super_returns_none() {
         assert_eq!(named_key_bytes(&NamedKey::Super), None);
+    }
+
+    // ── ctrl_char ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ctrl_a() {
+        assert_eq!(ctrl_char("a"), Some(0x01));
+    }
+
+    #[test]
+    fn ctrl_c_synthesized() {
+        assert_eq!(ctrl_char("c"), Some(0x03));
+    }
+
+    #[test]
+    fn ctrl_d() {
+        assert_eq!(ctrl_char("d"), Some(0x04));
+    }
+
+    #[test]
+    fn ctrl_z() {
+        assert_eq!(ctrl_char("z"), Some(0x1A));
+    }
+
+    #[test]
+    fn ctrl_uppercase_c() {
+        assert_eq!(ctrl_char("C"), Some(0x03));
+    }
+
+    #[test]
+    fn ctrl_bracket() {
+        assert_eq!(ctrl_char("["), Some(0x1B)); // ESC
+    }
+
+    #[test]
+    fn ctrl_at() {
+        assert_eq!(ctrl_char("@"), Some(0x00)); // NUL
+    }
+
+    #[test]
+    fn ctrl_non_alpha_returns_none() {
+        assert_eq!(ctrl_char("1"), None);
     }
 
     // ── character key helpers (test the inner logic directly) ─────────────────
