@@ -149,10 +149,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // Animated color: slowly rotating between electric cyan (#52E8FF)
         // and azure (#007FFF) over time.
-        let phase = globals.time * 0.3;  // slow rotation
-        let gradient_r = mix(0.322, 0.0, sin(phase) * 0.5 + 0.5) * gradient_strength;
-        let gradient_g = mix(0.910, 0.498, sin(phase) * 0.5 + 0.5) * gradient_strength;
-        let gradient_b = mix(1.0, 1.0, 1.0) * gradient_strength;
+        let phase: f32 = globals.time * 0.3;  // slow rotation
+        let t: f32 = sin(phase) * 0.5 + 0.5;
+        let gradient_r: f32 = mix(0.322, 0.0, t) * gradient_strength;
+        let gradient_g: f32 = mix(0.910, 0.498, t) * gradient_strength;
+        let gradient_b: f32 = gradient_strength;
 
         bg = vec4<f32>(
             bg.r + gradient_r,

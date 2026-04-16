@@ -1189,6 +1189,7 @@ dependencies = [
  "cosmic-text",
  "log",
  "mechanic-config",
+ "naga",
  "raw-window-handle",
  "wgpu",
 ]

@@ -108,3 +108,40 @@ impl Renderer {
         self.state.render(grid, &mut self.text, &self.font_config, content_opacity, time);
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    /// Validate every bundled WGSL shader at test time.
+    ///
+    /// wgpu uses naga internally to validate shaders when creating a
+    /// `ShaderModule`.  If a shader has a type error or other validation
+    /// failure, it won't be caught until runtime — long after `cargo test`
+    /// has declared success.  This test runs the same parse + validate
+    /// pipeline naga uses, so shader bugs fail the test suite immediately.
+    #[test]
+    fn cell_shader_is_valid_wgsl() {
+        let source = include_str!("shaders/cell.wgsl");
+        validate_wgsl("cell.wgsl", source);
+    }
+
+    /// Parse `source` as WGSL and run the full validator.
+    ///
+    /// Panics with a readable error if parsing or validation fails.
+    fn validate_wgsl(name: &str, source: &str) {
+        let module = match naga::front::wgsl::parse_str(source) {
+            Ok(m) => m,
+            Err(e) => panic!("{name}: WGSL parse error:\n{}", e.emit_to_string(source)),
+        };
+
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+
+        if let Err(e) = validator.validate(&module) {
+            panic!("{name}: WGSL validation error:\n{e:?}");
+        }
+    }
+}

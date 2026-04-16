@@ -13,3 +13,6 @@ mechanic-config.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
 bitflags = "2"
 raw-window-handle = "0.6"
+
+[dev-dependencies]
+naga = { version = "29", features = ["wgsl-in"] }
