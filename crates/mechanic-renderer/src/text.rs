@@ -67,7 +67,16 @@ impl TextRenderer {
     }
 
     /// Construct a new `TextRenderer`, loading fonts from `config`.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, config: &FontConfig) -> Self {
+    ///
+    /// `scale_factor` is the window's DPI scale (e.g. 2.0 on Retina Macs).
+    /// Glyph rasterization uses `font_size * scale_factor` so glyphs are
+    /// sharp at the display's native resolution.
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &FontConfig,
+        scale_factor: f32,
+    ) -> Self {
         let font_system = FontSystem::new();
 
         // Set the primary font family preference.  cosmic-text's FontSystem
@@ -76,8 +85,9 @@ impl TextRenderer {
 
         let swash_cache = SwashCache::new();
 
-        // Font size in points → metrics.
-        let px_size = config.size;
+        // Font size in physical pixels — scale the point size by the display
+        // factor so glyphs are rendered at native resolution.
+        let px_size = config.size * scale_factor;
         let line_height = px_size * 1.3; // a reasonable default
         let metrics = Metrics::new(px_size, line_height);
 

@@ -27,18 +27,22 @@ impl Renderer {
     /// Construct the renderer for the given window.
     ///
     /// `size` is the initial surface size in physical pixels.
+    /// `scale_factor` is the window's DPI scale (e.g. 2.0 on Retina Macs).
     pub async fn new<W>(
         window: W,
         size: (u32, u32),
+        scale_factor: f32,
         theme: &Theme,
         font_config: FontConfig,
     ) -> Result<Self, Box<dyn std::error::Error>>
     where
         W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
     {
-        let state = RenderState::new(window, size, font_config.size, theme.background).await?;
+        let state =
+            RenderState::new(window, size, font_config.size, scale_factor, theme.background)
+                .await?;
 
-        let text = TextRenderer::new(&state.device, &state.queue, &font_config);
+        let text = TextRenderer::new(&state.device, &state.queue, &font_config, scale_factor);
 
         Ok(Self { state, text, font_config })
     }

@@ -31,6 +31,8 @@ struct AppState {
     terminal: Terminal,
     /// GPU renderer (wgpu pipeline + cosmic-text).
     renderer: Renderer,
+    /// The window's DPI scale factor (e.g. 2.0 on Retina Macs).
+    scale_factor: f32,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -56,26 +58,24 @@ impl App {
 
     // ── Cell-size helpers ─────────────────────────────────────────────────────
 
-    /// Estimated pixel width of one character cell.
+    /// Compute cell dimensions in **physical pixels** for the given scale factor.
     ///
-    /// Matches the approximation used by the renderer:
-    /// `cell_width = font_size * 0.6`.
-    fn cell_width(&self) -> f32 {
-        self.config.font.size * 0.6
+    /// Returns `(cell_width, cell_height)` matching the renderer's estimate:
+    /// `cell_width = font_size * 0.6 * scale_factor`.
+    fn cell_size_physical(&self, scale_factor: f32) -> (f32, f32) {
+        let cw = (self.config.font.size * 0.6 * scale_factor).max(1.0);
+        let ch = (self.config.font.size * 1.3 * scale_factor).max(1.0);
+        (cw, ch)
     }
 
-    /// Estimated pixel height of one character cell.
-    ///
-    /// Matches the approximation used by the renderer:
-    /// `cell_height = font_size * 1.3`.
-    fn cell_height(&self) -> f32 {
-        self.config.font.size * 1.3
-    }
-
-    /// Compute [`TerminalSize`] from a physical pixel surface size.
-    fn terminal_size_from_pixels(&self, width: u32, height: u32) -> TerminalSize {
-        let cw = self.cell_width().max(1.0);
-        let ch = self.cell_height().max(1.0);
+    /// Compute [`TerminalSize`] from a physical pixel surface size and scale factor.
+    fn terminal_size_from_pixels(
+        &self,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+    ) -> TerminalSize {
+        let (cw, ch) = self.cell_size_physical(scale_factor);
 
         let columns = ((width as f32) / cw).floor() as usize;
         let rows = ((height as f32) / ch).floor() as usize;
@@ -119,7 +119,8 @@ impl ApplicationHandler for App {
 
         // ── Terminal ──────────────────────────────────────────────────────────
         let size = window.inner_size();
-        let terminal_size = self.terminal_size_from_pixels(size.width, size.height);
+        let scale_factor = window.scale_factor() as f32;
+        let terminal_size = self.terminal_size_from_pixels(size.width, size.height, scale_factor);
 
         let terminal = match Terminal::new(&self.config, terminal_size) {
             Ok(t) => t,
@@ -137,6 +138,7 @@ impl ApplicationHandler for App {
         let renderer = match pollster::block_on(Renderer::new(
             window.clone(),
             (size.width, size.height),
+            scale_factor,
             &self.config.theme,
             self.config.font.clone(),
         )) {
@@ -149,12 +151,16 @@ impl ApplicationHandler for App {
         };
 
         // ── Store state and request first frame ───────────────────────────────
-        self.state = Some(AppState { window: window.clone(), terminal, renderer });
+        self.state = Some(AppState { window: window.clone(), terminal, renderer, scale_factor });
         window.request_redraw();
     }
 
     /// Handles all windowing events for a single window.
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Copy font size before borrowing state mutably, so we can compute
+        // cell dimensions without conflicting borrows.
+        let font_size = self.config.font.size;
+
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -170,11 +176,8 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 state.renderer.resize((size.width, size.height));
 
-                // Compute cell dimensions from config without borrowing `self`
-                // mutably a second time while `state` is already borrowed.
-                let font_size = self.config.font.size;
-                let cw = (font_size * 0.6).max(1.0);
-                let ch = (font_size * 1.3).max(1.0);
+                let cw = (font_size * 0.6 * state.scale_factor).max(1.0);
+                let ch = (font_size * 1.3 * state.scale_factor).max(1.0);
                 let new_term_size = TerminalSize {
                     columns: ((size.width as f32 / cw).floor() as usize).max(1),
                     rows: ((size.height as f32 / ch).floor() as usize).max(1),

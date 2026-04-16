@@ -68,14 +68,16 @@ pub struct RenderState {
 }
 
 impl RenderState {
-    /// Estimate cell size from the font metrics.
+    /// Estimate cell size from the font metrics in physical pixels.
     ///
+    /// `scale_factor` is the window's DPI scale (e.g. 2.0 on Retina Macs).
     /// For Phase 1 we use a fixed monospace approximation; a proper
     /// implementation queries the font metrics from `TextRenderer`.
-    fn estimate_cell_size(font_size: f32) -> (f32, f32) {
+    fn estimate_cell_size(font_size: f32, scale_factor: f32) -> (f32, f32) {
         // Monospace width ≈ 0.6 × size; height = 1.3 × size (line height).
-        let w = font_size * 0.6;
-        let h = font_size * 1.3;
+        // Scale by the display factor so cells are sized in physical pixels.
+        let w = font_size * 0.6 * scale_factor;
+        let h = font_size * 1.3 * scale_factor;
         (w, h)
     }
 
@@ -90,6 +92,7 @@ impl RenderState {
         window: W,
         size: (u32, u32),
         font_size: f32,
+        scale_factor: f32,
         bg: Rgb,
     ) -> Result<Self, Box<dyn std::error::Error>>
     where
@@ -241,7 +244,7 @@ impl RenderState {
 
         // ── Globals uniform buffer ────────────────────────────────────────────
 
-        let cell_size = Self::estimate_cell_size(font_size);
+        let cell_size = Self::estimate_cell_size(font_size, scale_factor);
         let globals = Globals {
             viewport_size: [size.0 as f32, size.1 as f32],
             cell_size: [cell_size.0, cell_size.1],
