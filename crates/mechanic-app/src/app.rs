@@ -69,9 +69,6 @@ pub struct App {
     config: Config,
     /// All currently open windows, keyed by winit's [`WindowId`].
     windows: HashMap<WindowId, AppState>,
-    /// Counter used to offset subsequent windows so they don't stack exactly
-    /// on top of the first one.
-    window_count: u32,
 }
 
 impl App {
@@ -79,7 +76,7 @@ impl App {
     ///
     /// The first window is created in [`Self::resumed`].
     pub fn new(config: Config) -> Self {
-        Self { config, windows: HashMap::new(), window_count: 0 }
+        Self { config, windows: HashMap::new() }
     }
 
     // ── Window management helpers ─────────────────────────────────────────────
@@ -138,7 +135,7 @@ impl App {
     fn spawn_window(&mut self, event_loop: &ActiveEventLoop) -> Option<WindowId> {
         // Offset subsequent windows diagonally so new ones are visible behind
         // the spawning one.  First window (count == 0) uses the default position.
-        let offset = self.window_count.saturating_mul(24) as i32;
+        let offset = (self.windows.len() as i32).saturating_mul(24);
         let mut attrs = WindowAttributes::default()
             .with_title("Mechanic")
             .with_inner_size(LogicalSize::new(1024u32, 768u32))
@@ -214,7 +211,6 @@ impl App {
         };
 
         self.windows.insert(window_id, state);
-        self.window_count += 1;
         window.request_redraw();
 
         log::info!("spawned window {window_id:?} (total: {})", self.windows.len());

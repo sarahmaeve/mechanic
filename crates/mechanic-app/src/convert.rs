@@ -238,15 +238,7 @@ fn resolve_named(named: NamedColor, theme: &Theme) -> Rgb {
         NamedColor::Background => theme.background,
         NamedColor::Cursor => theme.cursor,
 
-        // Standard 16-color ANSI palette.
-        NamedColor::Black => ansi.black,
-        NamedColor::Red => ansi.red,
-        NamedColor::Green => ansi.green,
-        NamedColor::Yellow => ansi.yellow,
-        NamedColor::Blue => ansi.blue,
-        NamedColor::Magenta => ansi.magenta,
-        NamedColor::Cyan => ansi.cyan,
-        NamedColor::White => ansi.white,
+        // Bright variants of the standard 8 ANSI colors.
         NamedColor::BrightBlack => ansi.bright_black,
         NamedColor::BrightRed => ansi.bright_red,
         NamedColor::BrightGreen => ansi.bright_green,
@@ -258,14 +250,14 @@ fn resolve_named(named: NamedColor, theme: &Theme) -> Rgb {
 
         // Dim variants — map to their normal counterparts (dim rendering is
         // deferred; we don't darken colors at this stage).
-        NamedColor::DimBlack => ansi.black,
-        NamedColor::DimRed => ansi.red,
-        NamedColor::DimGreen => ansi.green,
-        NamedColor::DimYellow => ansi.yellow,
-        NamedColor::DimBlue => ansi.blue,
-        NamedColor::DimMagenta => ansi.magenta,
-        NamedColor::DimCyan => ansi.cyan,
-        NamedColor::DimWhite => ansi.white,
+        NamedColor::Black | NamedColor::DimBlack => ansi.black,
+        NamedColor::Red | NamedColor::DimRed => ansi.red,
+        NamedColor::Green | NamedColor::DimGreen => ansi.green,
+        NamedColor::Yellow | NamedColor::DimYellow => ansi.yellow,
+        NamedColor::Blue | NamedColor::DimBlue => ansi.blue,
+        NamedColor::Magenta | NamedColor::DimMagenta => ansi.magenta,
+        NamedColor::Cyan | NamedColor::DimCyan => ansi.cyan,
+        NamedColor::White | NamedColor::DimWhite => ansi.white,
 
         // Bright / dim foreground aliases.
         NamedColor::BrightForeground => theme.foreground,
