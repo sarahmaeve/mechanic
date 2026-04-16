@@ -228,6 +228,7 @@ fn pixel_to_grid_point(
     cell_height: f32,
     cols: usize,
     rows: usize,
+    display_offset: usize,
 ) -> (GridPoint, GridSide) {
     let col = (x / cell_width as f64) as usize;
     let row = (y / cell_height as f64) as usize;
@@ -237,7 +238,12 @@ fn pixel_to_grid_point(
     let frac = (x / cell_width as f64).fract();
     let side = if frac < 0.5 { GridSide::Left } else { GridSide::Right };
 
-    (GridPoint::new(GridLine(row as i32), GridColumn(col)), side)
+    // Convert viewport row to alacritty grid line.  When the user has
+    // scrolled back, the top of the viewport is `Line(-display_offset)`
+    // rather than `Line(0)` — without this correction, selections in
+    // scrollback would target lines in the active area instead.
+    let grid_line = row as i32 - display_offset as i32;
+    (GridPoint::new(GridLine(grid_line), GridColumn(col)), side)
 }
 
 // ── ApplicationHandler ────────────────────────────────────────────────────────
@@ -511,7 +517,8 @@ impl ApplicationHandler for App {
                 let ch = state.cell_metrics.cell_height;
                 let cols = state.terminal.columns();
                 let rows = state.terminal.screen_lines();
-                let (point, side) = pixel_to_grid_point(x, y, cw, ch, cols, rows);
+                let display_offset = state.terminal.grid().display_offset();
+                let (point, side) = pixel_to_grid_point(x, y, cw, ch, cols, rows, display_offset);
 
                 state.last_input_time = std::time::Instant::now();
                 match btn_state {
@@ -588,8 +595,16 @@ impl ApplicationHandler for App {
                     let ch = state.cell_metrics.cell_height;
                     let cols = state.terminal.columns();
                     let rows = state.terminal.screen_lines();
-                    let (point, side) =
-                        pixel_to_grid_point(position.x, position.y, cw, ch, cols, rows);
+                    let display_offset = state.terminal.grid().display_offset();
+                    let (point, side) = pixel_to_grid_point(
+                        position.x,
+                        position.y,
+                        cw,
+                        ch,
+                        cols,
+                        rows,
+                        display_offset,
+                    );
                     state.terminal.update_selection(point, side);
                     state.window.request_redraw();
                 }

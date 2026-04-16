@@ -112,7 +112,12 @@ impl Terminal {
     }
 
     /// Send keyboard / paste `data` to the PTY.
+    ///
+    /// Also snaps the display back to the live area — matches xterm /
+    /// iTerm2 / Terminal.app, where any user input into the shell returns
+    /// the viewport to the cursor so the user can see what they're typing.
     pub fn write_to_pty(&mut self, data: &[u8]) -> Result<(), TerminalError> {
+        self.term.scroll_display(Scroll::Bottom);
         self.pty.write(data)
     }
 
