@@ -33,7 +33,7 @@ pub mod terminal;
 
 pub use error::TerminalError;
 pub use event::{EventProxy, TerminalEvent};
-pub use terminal::{GridColumn, GridLine, GridPoint, GridSide, Terminal};
+pub use terminal::{GridColumn, GridLine, GridPoint, GridSide, MouseProtocol, Terminal};
 
 // ── PtyWaker ──────────────────────────────────────────────────────────────────
 

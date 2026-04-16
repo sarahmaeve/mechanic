@@ -10,8 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mechanic_config::Config;
-use mechanic_core::{GridColumn, GridLine, GridPoint, GridSide, PtyWaker, Terminal, TerminalSize};
+use mechanic_core::{
+    GridColumn, GridLine, GridPoint, GridSide, MouseProtocol, PtyWaker, Terminal, TerminalSize,
+};
 use mechanic_renderer::{CellMetrics, Renderer};
+
+use crate::mouse as mouse_enc;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -91,6 +95,12 @@ struct AppState {
     /// mirrors [`ProcessOutcome::child_exit`] — `Some(None)` means the
     /// library-internal `Event::Exit` fired (no status available).
     exit_status: Option<Option<std::process::ExitStatus>>,
+    /// Last `(col, row)` we forwarded via a mouse-motion escape to
+    /// the PTY.  Used to deduplicate — winit delivers CursorMoved at
+    /// roughly display-refresh rate while dragging, but the program
+    /// running inside only cares about cell-level granularity.  Reset
+    /// to `None` when no forwarded drag is in progress.
+    last_mouse_report: Option<(u32, u32)>,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -115,6 +125,12 @@ pub struct App {
     /// for periodic redraws — the loop sleeps entirely until input
     /// or PTY output arrives.
     animate: bool,
+    /// Master switch for honouring programs' mouse-tracking requests.
+    /// `false` when the user passed `--no-mouse-tracking`.  When off,
+    /// DECSET 1000/1002/1003/1006 are silently ignored at the routing
+    /// layer — drag-select and middle-click-paste work the same way
+    /// whether or not the shell program asked for mouse events.
+    mouse_tracking: bool,
 }
 
 impl App {
@@ -123,10 +139,18 @@ impl App {
     /// `proxy` is the event-loop proxy used by PTY reader threads to
     /// wake the main loop.  `animate` controls time-based visual
     /// effects (`false` when `--no-animation` was passed).
+    /// `mouse_tracking` controls whether programs' DECSET mouse
+    /// requests are honoured (`false` when `--no-mouse-tracking` was
+    /// passed).
     ///
     /// The first window is created in [`Self::resumed`].
-    pub fn new(config: Config, proxy: EventLoopProxy<UserEvent>, animate: bool) -> Self {
-        Self { config, windows: HashMap::new(), proxy, animate }
+    pub fn new(
+        config: Config,
+        proxy: EventLoopProxy<UserEvent>,
+        animate: bool,
+        mouse_tracking: bool,
+    ) -> Self {
+        Self { config, windows: HashMap::new(), proxy, animate, mouse_tracking }
     }
 
     /// Build a [`PtyWaker`] for the given window using `self.proxy`.
@@ -272,6 +296,7 @@ impl App {
             focused: true,
             current_font_size: self.config.font.size,
             exit_status: None,
+            last_mouse_report: None,
         };
 
         self.windows.insert(window_id, state);
@@ -619,113 +644,155 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             // ── Mouse button press/release ────────────────────────────────────
-            WindowEvent::MouseInput { state: btn_state, button: MouseButton::Left, .. } => {
-                let (x, y) = state.mouse_position;
-                let cw = state.cell_metrics.cell_width;
-                let ch = state.cell_metrics.cell_height;
-                let cols = state.terminal.columns();
-                let rows = state.terminal.screen_lines();
-                let display_offset = state.terminal.grid().display_offset();
-                let (point, side) = pixel_to_grid_point(x, y, cw, ch, cols, rows, display_offset);
-
+            //
+            // Unified arm for Left/Middle/Right presses and releases.  The
+            // routing decision (forward to PTY vs. handle locally) is made
+            // once at the top of the arm by `route_mouse`, then each button
+            // / state combination takes the appropriate branch.
+            WindowEvent::MouseInput { state: btn_state, button: win_button, .. } => {
                 state.last_input_time = std::time::Instant::now();
-                match btn_state {
-                    ElementState::Pressed => {
-                        state.mouse_pressed = true;
-                        state.mouse_press_origin = Some((x, y));
-                        state.terminal.start_selection(point, side);
-                    }
-                    ElementState::Released => {
-                        state.mouse_pressed = false;
-                        // Distinguish a click from a drag by how far the
-                        // mouse moved while the button was held.  5 pixels
-                        // is the typical OS-level click-versus-drag
-                        // threshold — independent of font size, so small
-                        // selections aren't misclassified as clicks (which
-                        // was sending stray arrow-key escape sequences to
-                        // the shell when the drag fell below half a cell).
-                        const CLICK_DRAG_THRESHOLD_PX: f64 = 5.0;
-                        let was_drag = state
-                            .mouse_press_origin
-                            .map(|(ox, oy)| {
-                                let dx = x - ox;
-                                let dy = y - oy;
-                                (dx * dx + dy * dy).sqrt() > CLICK_DRAG_THRESHOLD_PX
-                            })
-                            .unwrap_or(false);
-                        state.mouse_press_origin = None;
 
-                        if !was_drag {
-                            // Pure click: interpret as "move the shell's
-                            // readline cursor here" when possible.  Only
-                            // works if the terminal is at the live view
-                            // (not scrolled back) and the click is on the
-                            // same row as the shell cursor — otherwise the
-                            // arrow-key trick would just wander into
-                            // arbitrary command history.
-                            state.terminal.clear_selection();
+                let route = route_mouse(
+                    state.terminal.mouse_protocol(),
+                    self.mouse_tracking,
+                    state.modifiers.shift_key(),
+                    state.exit_status.is_some(),
+                );
 
-                            let (cursor_row, cursor_col, scrolled) = {
-                                let grid = state.terminal.grid();
-                                let cp = grid.cursor.point;
-                                (cp.line.0, cp.column.0 as i32, grid.display_offset() != 0)
-                            };
-                            let click_row = point.line.0;
-                            let click_col = point.column.0 as i32;
-
-                            if !scrolled && click_row == cursor_row {
-                                let delta = click_col - cursor_col;
-                                if delta != 0 {
-                                    let seq: &[u8] = if delta > 0 { b"\x1b[C" } else { b"\x1b[D" };
-                                    let mut payload = Vec::with_capacity(
-                                        seq.len() * delta.unsigned_abs() as usize,
-                                    );
-                                    for _ in 0..delta.unsigned_abs() {
-                                        payload.extend_from_slice(seq);
-                                    }
-                                    if let Err(e) = state.terminal.write_to_pty(&payload) {
-                                        log::warn!("PTY cursor-move write failed: {e}");
-                                    }
-                                }
-                            }
-                        } else {
-                            // Drag completed.  Capture the selected text into
-                            // the X11-style "primary" buffer so middle-click
-                            // can paste it without an explicit Cmd+C.  The
-                            // macOS clipboard is left alone.
-                            state.primary_selection = state.terminal.selection_text();
+                // ── Forwarded path ────────────────────────────────────────
+                if let Some(sgr) = route {
+                    if let Some(btn) = winit_to_mouse_button(win_button) {
+                        let (col, row) = grid_coords_1based(
+                            state.mouse_position,
+                            &state.cell_metrics,
+                            state.terminal.columns(),
+                            state.terminal.screen_lines(),
+                        );
+                        let kind = match btn_state {
+                            ElementState::Pressed => mouse_enc::MouseEventKind::Press,
+                            ElementState::Released => mouse_enc::MouseEventKind::Release,
+                        };
+                        let bytes = mouse_enc::encode(sgr, btn, state.modifiers, kind, col, row);
+                        if let Err(e) = state.terminal.write_to_pty(&bytes) {
+                            log::warn!("PTY mouse write failed: {e}");
+                        }
+                        // Track button-down state locally so CursorMoved
+                        // knows whether to emit drag motion.  We only
+                        // track the left button — right/middle drag are
+                        // rare enough that their motion can be dropped
+                        // without visible regression.
+                        if matches!(win_button, MouseButton::Left) {
+                            state.mouse_pressed = matches!(btn_state, ElementState::Pressed);
                         }
                     }
-                }
-                state.window.request_redraw();
-            }
-
-            // ── Middle-click paste (X11 primary-selection model) ──────────────
-            //
-            // Pastes the most recently drag-selected text — captured into
-            // `primary_selection` automatically when a drag completes.  Does
-            // NOT touch the macOS clipboard, so Cmd+V / Cmd+C still work
-            // independently with their own buffer.
-            //
-            // Goes through the same `Terminal::paste` safety filter as
-            // Cmd+V: bracketed-paste markers stripped, line endings
-            // normalized, trailing newline stripped when the shell has
-            // not enabled DECSET 2004.  In practice the primary
-            // selection comes from the terminal's own grid (we wrote
-            // the glyphs ourselves), so markers shouldn't appear — but
-            // a drag across terminal-emitted escape sequences *could*
-            // pick one up, and we don't want that route either.
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Middle,
-                ..
-            } => {
-                if let Some(text) = state.primary_selection.as_ref() {
-                    if let Err(e) = state.terminal.paste(text) {
-                        log::warn!("PTY middle-click paste failed: {e}");
+                    // Reset motion-dedup on release so the next drag starts fresh.
+                    if matches!(btn_state, ElementState::Released) {
+                        state.last_mouse_report = None;
                     }
-                    state.last_input_time = std::time::Instant::now();
                     state.window.request_redraw();
+                    return;
+                }
+
+                // ── Local path ────────────────────────────────────────────
+                match (btn_state, win_button) {
+                    // ── Left button: selection + click-to-move-cursor ─────
+                    (btn_state, MouseButton::Left) => {
+                        let (x, y) = state.mouse_position;
+                        let cw = state.cell_metrics.cell_width;
+                        let ch = state.cell_metrics.cell_height;
+                        let cols = state.terminal.columns();
+                        let rows = state.terminal.screen_lines();
+                        let display_offset = state.terminal.grid().display_offset();
+                        let (point, side) =
+                            pixel_to_grid_point(x, y, cw, ch, cols, rows, display_offset);
+
+                        match btn_state {
+                            ElementState::Pressed => {
+                                state.mouse_pressed = true;
+                                state.mouse_press_origin = Some((x, y));
+                                state.terminal.start_selection(point, side);
+                            }
+                            ElementState::Released => {
+                                state.mouse_pressed = false;
+                                // Click-vs-drag threshold: 5px matches the OS
+                                // default.  Tiny motions shouldn't be treated
+                                // as selections — they misfire click-to-move.
+                                const CLICK_DRAG_THRESHOLD_PX: f64 = 5.0;
+                                let was_drag = state
+                                    .mouse_press_origin
+                                    .map(|(ox, oy)| {
+                                        let dx = x - ox;
+                                        let dy = y - oy;
+                                        (dx * dx + dy * dy).sqrt() > CLICK_DRAG_THRESHOLD_PX
+                                    })
+                                    .unwrap_or(false);
+                                state.mouse_press_origin = None;
+
+                                if !was_drag {
+                                    // Click-to-move: emit N arrow-keys equal
+                                    // to the column delta, only if the shell
+                                    // is at the live view and the click is on
+                                    // the same row as the cursor.  A naive
+                                    // heuristic (breaks on wide chars and
+                                    // TUIs) but useful for ASCII readline.
+                                    // TUIs that enable mouse tracking take
+                                    // the forwarded path above — so this
+                                    // only runs when the shell explicitly
+                                    // opted out of mouse input.
+                                    state.terminal.clear_selection();
+
+                                    let (cursor_row, cursor_col, scrolled) = {
+                                        let grid = state.terminal.grid();
+                                        let cp = grid.cursor.point;
+                                        (cp.line.0, cp.column.0 as i32, grid.display_offset() != 0)
+                                    };
+                                    let click_row = point.line.0;
+                                    let click_col = point.column.0 as i32;
+
+                                    if !scrolled && click_row == cursor_row {
+                                        let delta = click_col - cursor_col;
+                                        if delta != 0 {
+                                            let seq: &[u8] =
+                                                if delta > 0 { b"\x1b[C" } else { b"\x1b[D" };
+                                            let mut payload = Vec::with_capacity(
+                                                seq.len() * delta.unsigned_abs() as usize,
+                                            );
+                                            for _ in 0..delta.unsigned_abs() {
+                                                payload.extend_from_slice(seq);
+                                            }
+                                            if let Err(e) =
+                                                state.terminal.write_to_pty(&payload)
+                                            {
+                                                log::warn!("PTY cursor-move write failed: {e}");
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Drag completed — capture into the
+                                    // X11-style primary selection for
+                                    // middle-click paste.
+                                    state.primary_selection = state.terminal.selection_text();
+                                }
+                            }
+                        }
+                        state.window.request_redraw();
+                    }
+
+                    // ── Middle-click paste (primary selection) ────────────
+                    (ElementState::Pressed, MouseButton::Middle) => {
+                        if let Some(text) = state.primary_selection.as_ref() {
+                            if let Err(e) = state.terminal.paste(text) {
+                                log::warn!("PTY middle-click paste failed: {e}");
+                            }
+                            state.window.request_redraw();
+                        }
+                    }
+
+                    // Middle release / Right any / Back / Forward /
+                    // Other in local mode: ignored.  Terminal.app and
+                    // iTerm2 do the same — right-click opens a context
+                    // menu that we haven't built yet.
+                    _ => {}
                 }
             }
 
@@ -733,6 +800,57 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_position = (position.x, position.y);
 
+                let route = route_mouse(
+                    state.terminal.mouse_protocol(),
+                    self.mouse_tracking,
+                    state.modifiers.shift_key(),
+                    state.exit_status.is_some(),
+                );
+
+                // ── Forwarded path ────────────────────────────────────────
+                if let Some(sgr) = route {
+                    let proto = state.terminal.mouse_protocol();
+                    // DECSET 1002 = drag-only; DECSET 1003 = all motion.
+                    // Emit motion when either is active AND the program's
+                    // constraints are met:
+                    //   1003: always (firehose)
+                    //   1002: only when a button is held
+                    //   1000 alone: never (clicks only, no motion)
+                    let emit = proto.report_motion
+                        || (proto.report_drag && state.mouse_pressed);
+                    if emit {
+                        let (col, row) = grid_coords_1based(
+                            state.mouse_position,
+                            &state.cell_metrics,
+                            state.terminal.columns(),
+                            state.terminal.screen_lines(),
+                        );
+                        // Dedup at cell granularity — winit fires
+                        // CursorMoved every pixel, but the shell only
+                        // cares about cell-level grid coordinates.
+                        if state.last_mouse_report != Some((col, row)) {
+                            state.last_mouse_report = Some((col, row));
+                            // We only track left-button down locally;
+                            // encode motion as if it were left-button
+                            // drag (the common case for 1002).
+                            let btn = mouse_enc::MouseButton::Left;
+                            let bytes = mouse_enc::encode(
+                                sgr,
+                                btn,
+                                state.modifiers,
+                                mouse_enc::MouseEventKind::Motion,
+                                col,
+                                row,
+                            );
+                            if let Err(e) = state.terminal.write_to_pty(&bytes) {
+                                log::warn!("PTY mouse motion write failed: {e}");
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // ── Local path: update selection if dragging ──────────────
                 if state.mouse_pressed {
                     let cw = state.cell_metrics.cell_width;
                     let ch = state.cell_metrics.cell_height;
@@ -761,6 +879,50 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => y as i32,
                     MouseScrollDelta::PixelDelta(pos) => (pos.y / cell_height as f64) as i32,
                 };
+
+                let route = route_mouse(
+                    state.terminal.mouse_protocol(),
+                    self.mouse_tracking,
+                    state.modifiers.shift_key(),
+                    state.exit_status.is_some(),
+                );
+
+                // ── Forwarded path ────────────────────────────────────────
+                if let Some(sgr) = route {
+                    if lines != 0 {
+                        let (col, row) = grid_coords_1based(
+                            state.mouse_position,
+                            &state.cell_metrics,
+                            state.terminal.columns(),
+                            state.terminal.screen_lines(),
+                        );
+                        let btn = if lines > 0 {
+                            mouse_enc::MouseButton::WheelUp
+                        } else {
+                            mouse_enc::MouseButton::WheelDown
+                        };
+                        // Emit one wheel "click" per unit of scroll —
+                        // that's how vim/tmux expect it.
+                        for _ in 0..lines.unsigned_abs() {
+                            let bytes = mouse_enc::encode(
+                                sgr,
+                                btn,
+                                state.modifiers,
+                                mouse_enc::MouseEventKind::Press,
+                                col,
+                                row,
+                            );
+                            if let Err(e) = state.terminal.write_to_pty(&bytes) {
+                                log::warn!("PTY wheel write failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    state.window.request_redraw();
+                    return;
+                }
+
+                // ── Local path: scroll the viewport ───────────────────────
                 if lines > 0 {
                     state.terminal.scroll_up(lines as usize);
                 } else if lines < 0 {
@@ -924,6 +1086,84 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
     }
+}
+
+// ── Mouse routing ─────────────────────────────────────────────────────────────
+
+/// Decide whether a mouse event should be forwarded to the PTY (and
+/// if so, which encoding to use) or handled locally.
+///
+/// Returns `Some(sgr)` when forwarding, where `sgr` selects the wire
+/// format (`true` for DECSET 1006 SGR, `false` for legacy X10).
+/// Returns `None` when the event should fall through to the local
+/// selection / scrollback / click-to-move behaviour.
+///
+/// Precedence:
+/// 1. Frozen window → never forward.  Shell is dead; there's no one
+///    listening on the other end.
+/// 2. `--no-mouse-tracking` at the CLI → never forward, regardless of
+///    what the program asked for.  The user's meta-preference wins.
+/// 3. Shift held → never forward.  iTerm2/kitty convention: Shift is
+///    the "let the terminal handle this" override for users who want
+///    to select text in a program that's captured the mouse.
+/// 4. Program hasn't enabled any tracking mode → never forward.
+/// 5. Otherwise → forward, with `sgr` taken from the protocol.
+///
+/// Pure function; trivially unit-testable.
+fn route_mouse(
+    protocol: MouseProtocol,
+    mouse_tracking_enabled: bool,
+    shift_held: bool,
+    window_frozen: bool,
+) -> Option<bool> {
+    if window_frozen {
+        return None;
+    }
+    if !mouse_tracking_enabled {
+        return None;
+    }
+    if shift_held {
+        return None;
+    }
+    if !protocol.is_tracking() {
+        return None;
+    }
+    Some(protocol.sgr)
+}
+
+/// Translate a winit button identifier to the subset we can encode.
+///
+/// Back, Forward, and Other buttons are not yet forwarded — the wire
+/// protocol has numbers available for them (8-11 in the standard
+/// extension) but no widely-deployed TUI actually listens for those,
+/// so the added complexity hasn't been worth it.
+fn winit_to_mouse_button(b: MouseButton) -> Option<mouse_enc::MouseButton> {
+    match b {
+        MouseButton::Left => Some(mouse_enc::MouseButton::Left),
+        MouseButton::Middle => Some(mouse_enc::MouseButton::Middle),
+        MouseButton::Right => Some(mouse_enc::MouseButton::Right),
+        _ => None,
+    }
+}
+
+/// Convert a pixel position to 1-based grid coordinates for mouse
+/// encoding.  Clamps to the visible grid — clicks slightly outside
+/// the window report the edge cell rather than out-of-bounds.
+fn grid_coords_1based(
+    pos: (f64, f64),
+    metrics: &CellMetrics,
+    cols: usize,
+    rows: usize,
+) -> (u32, u32) {
+    let cw = (metrics.cell_width as f64).max(1.0);
+    let ch = (metrics.cell_height as f64).max(1.0);
+    // 0-based cell coordinates first so we can clamp, then +1 for the
+    // wire format's 1-based convention.
+    let col0 = (pos.0 / cw).max(0.0) as u32;
+    let row0 = (pos.1 / ch).max(0.0) as u32;
+    let col0 = col0.min(cols.saturating_sub(1) as u32);
+    let row0 = row0.min(rows.saturating_sub(1) as u32);
+    (col0 + 1, row0 + 1)
 }
 
 // ── Event-loop proxy wiring ───────────────────────────────────────────────────
@@ -1502,6 +1742,123 @@ mod tests {
             classify_animation(input, &cfg, true, now),
             AnimationState::Active { .. }
         ));
+    }
+
+    // ── Mouse routing ─────────────────────────────────────────────────────────
+
+    fn tracking_proto(sgr: bool) -> MouseProtocol {
+        MouseProtocol {
+            report_click: true,
+            report_drag: true,
+            report_motion: false,
+            sgr,
+        }
+    }
+
+    #[test]
+    fn route_mouse_forwards_when_program_tracks() {
+        // Canonical case: program enabled 1000/1002/1006, user is
+        // not holding Shift, window is alive, CLI flag is on.
+        let proto = tracking_proto(true);
+        assert_eq!(route_mouse(proto, true, false, false), Some(true));
+    }
+
+    #[test]
+    fn route_mouse_sgr_flag_passes_through() {
+        // Program enabled 1000/1002 but NOT 1006 — we should still
+        // forward, but with sgr=false so the caller uses X10 framing.
+        let proto = tracking_proto(false);
+        assert_eq!(route_mouse(proto, true, false, false), Some(false));
+    }
+
+    #[test]
+    fn route_mouse_no_tracking_returns_none() {
+        // Program didn't enable any DECSET tracking → local handling.
+        let proto = MouseProtocol::default();
+        assert_eq!(route_mouse(proto, true, false, false), None);
+    }
+
+    #[test]
+    fn route_mouse_frozen_window_returns_none() {
+        // Rule 1: frozen window never forwards.  Shell is dead.
+        let proto = tracking_proto(true);
+        assert_eq!(route_mouse(proto, true, false, true), None);
+    }
+
+    #[test]
+    fn route_mouse_cli_flag_off_returns_none() {
+        // Rule 2: --no-mouse-tracking overrides program request.
+        let proto = tracking_proto(true);
+        assert_eq!(route_mouse(proto, false, false, false), None);
+    }
+
+    #[test]
+    fn route_mouse_shift_override_returns_none() {
+        // Rule 3: Shift is "let terminal handle this" per iTerm2
+        // convention.  Forward path declines so local selection can run.
+        let proto = tracking_proto(true);
+        assert_eq!(route_mouse(proto, true, true, false), None);
+    }
+
+    #[test]
+    fn route_mouse_precedence_frozen_beats_cli_flag() {
+        // If both a frozen window and --no-mouse-tracking would both
+        // produce None anyway, but confirm neither produces a false-
+        // forward: frozen takes precedence (doesn't matter which wins,
+        // both return None).
+        let proto = tracking_proto(true);
+        assert_eq!(route_mouse(proto, false, false, true), None);
+    }
+
+    // ── grid_coords_1based ────────────────────────────────────────────────────
+
+    fn metrics(cw: f32, ch: f32) -> CellMetrics {
+        CellMetrics { cell_width: cw, cell_height: ch, ascent: ch * 0.8 }
+    }
+
+    #[test]
+    fn grid_coords_origin_maps_to_one_one() {
+        // Wire format is 1-based; (0,0) pixel should be (1,1) on wire.
+        assert_eq!(grid_coords_1based((0.0, 0.0), &metrics(8.0, 16.0), 80, 24), (1, 1));
+    }
+
+    #[test]
+    fn grid_coords_typical_click() {
+        // 8px wide cells, click at x=24 → col 3 (0-based) → wire col 4.
+        // 16px tall cells, y=48 → row 3 → wire row 4.
+        assert_eq!(grid_coords_1based((24.0, 48.0), &metrics(8.0, 16.0), 80, 24), (4, 4));
+    }
+
+    #[test]
+    fn grid_coords_clamps_right_edge() {
+        // Click past the right edge clamps to the last visible column.
+        // 80 cols × 8px = 640; click at x=9999.
+        let (col, _row) = grid_coords_1based((9999.0, 0.0), &metrics(8.0, 16.0), 80, 24);
+        assert_eq!(col, 80); // 79 (0-based last col) + 1
+    }
+
+    #[test]
+    fn grid_coords_clamps_bottom_edge() {
+        let (_col, row) = grid_coords_1based((0.0, 9999.0), &metrics(8.0, 16.0), 80, 24);
+        assert_eq!(row, 24); // 23 + 1
+    }
+
+    #[test]
+    fn grid_coords_negative_clamps_to_one() {
+        // Winit can deliver slightly negative coords during drags that
+        // leave the window.  Clamp to the top-left cell rather than
+        // letting a cast produce garbage.
+        assert_eq!(
+            grid_coords_1based((-10.0, -10.0), &metrics(8.0, 16.0), 80, 24),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn grid_coords_tolerates_tiny_cells() {
+        // A zero or sub-pixel cell_width shouldn't panic.  `.max(1.0)`
+        // inside the helper protects against div-by-zero.
+        let _ = grid_coords_1based((0.0, 0.0), &metrics(0.0, 0.0), 10, 10);
     }
 
     // ── merge_deadline ────────────────────────────────────────────────────────

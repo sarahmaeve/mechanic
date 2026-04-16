@@ -45,6 +45,44 @@ pub struct ProcessOutcome {
     pub child_exit: Option<Option<std::process::ExitStatus>>,
 }
 
+// ── MouseProtocol ─────────────────────────────────────────────────────────────
+
+/// Snapshot of the DECSET mouse-reporting flags the running program
+/// has enabled.
+///
+/// Programs subscribe to mouse events via DECSET sequences:
+///
+/// | DECSET | Flag           | Semantics                                         |
+/// |--------|----------------|---------------------------------------------------|
+/// | 1000   | `report_click` | Button press & release                            |
+/// | 1002   | `report_drag`  | Press/release + motion while a button is held     |
+/// | 1003   | `report_motion`| All motion (with or without buttons)              |
+/// | 1006   | `sgr`          | Use SGR encoding (`ESC [ < Cb ; Cx ; Cy M|m`)     |
+///
+/// When `sgr` is off and any `report_*` flag is set, the legacy X10
+/// encoding (`ESC [ M Cb Cx Cy` with each value offset by `0x20`) is
+/// expected.  Almost all modern programs set 1006 alongside 1000/1002.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MouseProtocol {
+    /// DECSET 1000 — press/release events.
+    pub report_click: bool,
+    /// DECSET 1002 — press/release + motion while a button is held.
+    pub report_drag: bool,
+    /// DECSET 1003 — all motion events.
+    pub report_motion: bool,
+    /// DECSET 1006 — SGR encoding.  When false and any `report_*` is
+    /// true, callers should fall back to the legacy X10 encoding.
+    pub sgr: bool,
+}
+
+impl MouseProtocol {
+    /// Returns `true` if any form of mouse reporting is active — i.e.
+    /// the running program wants mouse events forwarded via the PTY.
+    pub fn is_tracking(&self) -> bool {
+        self.report_click || self.report_drag || self.report_motion
+    }
+}
+
 // ── Bracketed-paste constants ─────────────────────────────────────────────────
 
 /// DECSET 2004 start-of-paste marker, written as a raw byte slice so
@@ -310,6 +348,24 @@ impl Terminal {
     pub fn cursor_app_mode(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// Mouse-reporting protocol currently negotiated with the shell.
+    ///
+    /// Read-only snapshot of the relevant DECSET flags.  Callers use
+    /// this to decide whether a mouse event should be forwarded to the
+    /// PTY as an escape sequence (when the running program has asked
+    /// for mouse input — vim, tmux, fzf, less, tig, …) or consumed
+    /// locally for selection / scrollback.
+    pub fn mouse_protocol(&self) -> MouseProtocol {
+        use alacritty_terminal::term::TermMode;
+        let m = self.term.mode();
+        MouseProtocol {
+            report_click: m.contains(TermMode::MOUSE_REPORT_CLICK),
+            report_drag: m.contains(TermMode::MOUSE_DRAG),
+            report_motion: m.contains(TermMode::MOUSE_MOTION),
+            sgr: m.contains(TermMode::SGR_MOUSE),
+        }
     }
 
     /// Number of columns in the grid.

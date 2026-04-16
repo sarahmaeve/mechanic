@@ -3,6 +3,7 @@
 mod app;
 mod convert;
 mod input;
+mod mouse;
 
 use app::UserEvent;
 
@@ -28,7 +29,7 @@ fn main() {
         .expect("failed to build event loop");
     let proxy = event_loop.create_proxy();
 
-    let mut app = app::App::new(config, proxy, cli.animate);
+    let mut app = app::App::new(config, proxy, cli.animate, cli.mouse_tracking);
     event_loop.run_app(&mut app).expect("event loop exited with error");
 }
 
@@ -42,11 +43,18 @@ struct Cli {
     /// corner-gradient pulse, electron animation, and opacity fade all
     /// run normally.
     animate: bool,
+    /// Whether to honour programs' mouse-reporting requests (DECSET
+    /// 1000/1002/1003/1006).  `--no-mouse-tracking` forces this to
+    /// `false`; absent the flag it's `true` and programs like vim,
+    /// tmux, fzf get their mouse events forwarded.  Users who'd
+    /// rather keep drag-select and middle-click-paste working
+    /// unconditionally pass the flag.
+    mouse_tracking: bool,
 }
 
 impl Default for Cli {
     fn default() -> Self {
-        Self { animate: true }
+        Self { animate: true, mouse_tracking: true }
     }
 }
 
@@ -63,6 +71,7 @@ where
     for arg in args {
         match arg.as_str() {
             "--no-animation" => cli.animate = false,
+            "--no-mouse-tracking" => cli.mouse_tracking = false,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -88,12 +97,16 @@ fn print_help() {
     println!("    mechanic [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    --no-animation    Disable all time-based visual effects");
-    println!("                      (opacity fade, corner gradient pulse,");
-    println!("                      electron traces).  Useful on battery,");
-    println!("                      on low-end GPUs, or for recording demos.");
-    println!("    -h, --help        Show this help and exit");
-    println!("    -V, --version     Show version and exit");
+    println!("    --no-animation         Disable all time-based visual effects");
+    println!("                           (opacity fade, corner gradient pulse,");
+    println!("                           electron traces).  Useful on battery,");
+    println!("                           on low-end GPUs, or for recording demos.");
+    println!("    --no-mouse-tracking    Ignore programs' DECSET 1000/1002/1003/1006");
+    println!("                           mouse-reporting requests.  Drag-select and");
+    println!("                           middle-click-paste always work locally, at");
+    println!("                           the cost of vim/tmux/fzf mouse support.");
+    println!("    -h, --help             Show this help and exit");
+    println!("    -V, --version          Show version and exit");
 }
 
 // ── Config path resolution ────────────────────────────────────────────────────
@@ -159,6 +172,26 @@ mod tests {
     fn cli_no_animation_disables() {
         let cli = parse_args(vec!["--no-animation".to_string()]);
         assert!(!cli.animate);
+        // --no-animation alone should NOT touch mouse tracking.
+        assert!(cli.mouse_tracking);
+    }
+
+    #[test]
+    fn cli_no_mouse_tracking_disables() {
+        let cli = parse_args(vec!["--no-mouse-tracking".to_string()]);
+        assert!(!cli.mouse_tracking);
+        // --no-mouse-tracking alone should NOT touch animation.
+        assert!(cli.animate);
+    }
+
+    #[test]
+    fn cli_both_flags_combine() {
+        let cli = parse_args(vec![
+            "--no-animation".to_string(),
+            "--no-mouse-tracking".to_string(),
+        ]);
+        assert!(!cli.animate);
+        assert!(!cli.mouse_tracking);
     }
 
     #[test]
