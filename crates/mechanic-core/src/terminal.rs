@@ -18,6 +18,7 @@ use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use mechanic_config::Config;
 
+use crate::PtyWaker;
 use crate::TerminalSize;
 use crate::error::TerminalError;
 use crate::event::{EventProxy, TerminalEvent};
@@ -91,7 +92,17 @@ impl Terminal {
     ///
     /// This spawns the shell configured in `config`, sets up the PTY with
     /// `size`, and initialises the `alacritty_terminal` state machine.
-    pub fn new(config: &Config, size: TerminalSize) -> Result<Self, TerminalError> {
+    ///
+    /// `waker` is a thread-safe callback invoked by the PTY reader
+    /// thread whenever new shell output lands in the channel.  The
+    /// application layer typically wires this to a winit event-loop
+    /// proxy so the main loop can sleep at idle and wake promptly on
+    /// PTY output.  Tests pass `Arc::new(|| {})`.
+    pub fn new(
+        config: &Config,
+        size: TerminalSize,
+        waker: PtyWaker,
+    ) -> Result<Self, TerminalError> {
         if size.columns == 0 || size.rows == 0 {
             return Err(TerminalError::InvalidSize { columns: size.columns, rows: size.rows });
         }
@@ -111,7 +122,7 @@ impl Terminal {
         let term = Term::new(term_config, &dimensions, event_proxy.clone());
 
         // Spawn the PTY.
-        let pty = PtyHandle::spawn(config, size)?;
+        let pty = PtyHandle::spawn(config, size, waker)?;
 
         Ok(Self { term, pty, event_proxy, parser: Processor::new(), title: String::new(), size })
     }
@@ -461,6 +472,14 @@ fn resize_pty_fd(pty: &PtyHandle, window_size: WindowSize) -> std::io::Result<()
 mod tests {
     use super::*;
 
+    /// No-op waker for tests that don't need to coordinate with an
+    /// event loop.  The PTY reader thread will call it when bytes
+    /// arrive; discarding the signal is safe because the test isn't
+    /// observing PTY output via the event loop.
+    fn noop_waker() -> crate::PtyWaker {
+        std::sync::Arc::new(|| {})
+    }
+
     #[test]
     fn term_dimensions_satisfies_trait() {
         let d = TermDimensions { columns: 80, screen_lines: 24 };
@@ -475,6 +494,7 @@ mod tests {
         let result = Terminal::new(
             &config,
             TerminalSize { columns: 0, rows: 24, cell_width: 8, cell_height: 16 },
+            noop_waker(),
         );
         assert!(matches!(result, Err(TerminalError::InvalidSize { .. })));
     }
@@ -483,7 +503,7 @@ mod tests {
     fn terminal_spawns_and_has_grid() {
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
-        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
         // Grid should have the requested dimensions.
         assert_eq!(term.columns(), 80);
@@ -500,7 +520,7 @@ mod tests {
     fn terminal_resize_updates_dimensions() {
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
-        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
         let new_size = TerminalSize { columns: 120, rows: 40, cell_width: 8, cell_height: 16 };
         term.resize(new_size);
@@ -512,7 +532,7 @@ mod tests {
     fn terminal_write_to_pty_succeeds() {
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
-        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
         // Writing bytes to the PTY should not fail.
         term.write_to_pty(b"echo hello\n").expect("PTY write should succeed");
@@ -522,7 +542,7 @@ mod tests {
     fn terminal_clear_history_does_not_panic() {
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
-        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
         // Clear on a fresh terminal (no history yet) should be a no-op that
         // doesn't panic.
@@ -537,7 +557,7 @@ mod tests {
         // `Terminal::paste` through the filter into the PTY works.
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
-        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
         term.paste("echo hello\n").expect("plain paste should succeed");
     }
@@ -555,7 +575,7 @@ mod tests {
         // already failed at compile/test time.
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
-        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
         let malicious = "safe\x1b[201~; rm -rf /";
         term.paste(malicious).expect("filtered paste should succeed");
@@ -569,7 +589,7 @@ mod tests {
         // a valid (if pointless) DECSET 2004 exchange.
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
-        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
         term.paste("").expect("empty paste should succeed");
     }
@@ -578,7 +598,7 @@ mod tests {
     fn terminal_select_all_populates_selection() {
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
-        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
         // Before select_all, no selection text.
         assert!(term.selection_text().is_none());

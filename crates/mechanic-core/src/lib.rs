@@ -7,12 +7,17 @@
 //! # Quick-start
 //!
 //! ```no_run
+//! use std::sync::Arc;
 //! use mechanic_config::Config;
 //! use mechanic_core::{Terminal, TerminalSize};
 //!
 //! let config = Config::default();
 //! let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
-//! let mut term = Terminal::new(&config, size).expect("failed to start terminal");
+//! // Production code passes a waker that drives its event loop.  This
+//! // example uses a no-op — fine because we don't actually run the
+//! // loop below (`no_run`).
+//! let waker = Arc::new(|| {});
+//! let mut term = Terminal::new(&config, size, waker).expect("failed to start terminal");
 //!
 //! loop {
 //!     term.process_input();
@@ -29,6 +34,23 @@ pub mod terminal;
 pub use error::TerminalError;
 pub use event::{EventProxy, TerminalEvent};
 pub use terminal::{GridColumn, GridLine, GridPoint, GridSide, Terminal};
+
+// ── PtyWaker ──────────────────────────────────────────────────────────────────
+
+/// Thread-safe hook the PTY reader thread invokes when new bytes land
+/// in the channel.
+///
+/// The application layer uses this to wake a sleeping main event loop
+/// (e.g. `winit::EventLoopProxy::send_event`) so the next frame
+/// renders the just-arrived shell output promptly — without needing
+/// the event loop to poll at display-refresh rate just to check.
+///
+/// Callers that don't need wake-up (e.g. tests) can pass
+/// `Arc::new(|| {})`.
+///
+/// Using `Arc<dyn Fn>` rather than a trait keeps `mechanic-core` free
+/// of any windowing dependency.
+pub type PtyWaker = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
 // ── TerminalSize ──────────────────────────────────────────────────────────────
 

@@ -15,6 +15,7 @@ use log::error;
 
 use mechanic_config::Config;
 
+use crate::PtyWaker;
 use crate::TerminalSize;
 use crate::error::TerminalError;
 
@@ -54,7 +55,16 @@ impl PtyHandle {
     /// This opens the pseudo-terminal device, forks the shell, and starts a
     /// background thread that continuously drains the PTY master file
     /// descriptor and sends byte chunks through an internal channel.
-    pub fn spawn(config: &Config, size: TerminalSize) -> Result<Self, TerminalError> {
+    ///
+    /// `waker` is invoked by the reader thread after every successful
+    /// chunk send.  The application layer wires this to its event-loop
+    /// proxy so the main loop can sleep at idle and wake promptly on
+    /// PTY output.  Tests can pass `Arc::new(|| {})`.
+    pub fn spawn(
+        config: &Config,
+        size: TerminalSize,
+        waker: PtyWaker,
+    ) -> Result<Self, TerminalError> {
         let window_size = size.to_window_size();
 
         // Build alacritty_terminal PTY options.
@@ -79,7 +89,7 @@ impl PtyHandle {
 
         let (tx, rx) = bounded::<Vec<u8>>(CHANNEL_CAPACITY);
 
-        let reader_thread = Self::start_reader(pty, tx);
+        let reader_thread = Self::start_reader(pty, tx, waker);
 
         Ok(Self { writer, rx, _reader_thread: reader_thread })
     }
@@ -98,7 +108,11 @@ impl PtyHandle {
     // ── Private ──────────────────────────────────────────────────────────────
 
     /// Spin up the background reader thread.
-    fn start_reader(mut pty: tty::Pty, tx: Sender<Vec<u8>>) -> JoinHandle<()> {
+    fn start_reader(
+        mut pty: tty::Pty,
+        tx: Sender<Vec<u8>>,
+        waker: PtyWaker,
+    ) -> JoinHandle<()> {
         let id = PTY_READER_ID.fetch_add(1, Ordering::Relaxed);
         thread::Builder::new()
             .name(format!("mechanic-pty-reader-{id}"))
@@ -107,7 +121,11 @@ impl PtyHandle {
                 loop {
                     match pty.reader().read(&mut buf) {
                         Ok(0) => {
-                            // EOF — the shell has exited.
+                            // EOF — the shell has exited.  Fire the waker
+                            // one last time so the main loop redraws and
+                            // observes the resulting Exit event this frame
+                            // rather than waiting for user input.
+                            waker();
                             break;
                         }
                         Ok(n) => {
@@ -116,6 +134,11 @@ impl PtyHandle {
                                 // Receiver dropped — terminal is shutting down.
                                 break;
                             }
+                            // Wake the main loop so it processes the bytes
+                            // promptly even if it was sleeping on `Wait`.
+                            // Coalesces naturally on the winit side: a burst
+                            // of sends results in one redraw, not N.
+                            waker();
                         }
                         Err(ref e)
                             if e.kind() == io::ErrorKind::WouldBlock

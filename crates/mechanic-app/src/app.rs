@@ -183,7 +183,13 @@ impl App {
         let terminal_size =
             Self::terminal_size_from_metrics(size.width, size.height, &cell_metrics);
 
-        let terminal = match Terminal::new(&self.config, terminal_size) {
+        // Placeholder waker — commit 2 of the #9 series wires the real
+        // EventLoopProxy-backed waker so the main loop can sleep at idle
+        // and wake promptly on PTY output.  For now the no-op keeps
+        // behaviour identical to pre-waker code (app still polls every
+        // frame via about_to_wait).
+        let waker: mechanic_core::PtyWaker = std::sync::Arc::new(|| {});
+        let terminal = match Terminal::new(&self.config, terminal_size, waker) {
             Ok(t) => t,
             Err(e) => {
                 log::error!("failed to create terminal: {e}");
@@ -820,7 +826,10 @@ fn is_dismissal_key(key: &Key) -> bool {
 /// user can Cmd+W to dismiss.
 fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId) {
     let size = state.terminal.size();
-    match Terminal::new(config, size) {
+    // Same placeholder as spawn_window — replaced with a real proxy
+    // waker in commit 2.
+    let waker: mechanic_core::PtyWaker = std::sync::Arc::new(|| {});
+    match Terminal::new(config, size, waker) {
         Ok(new_term) => {
             state.terminal = new_term;
             state.exit_status = None;
