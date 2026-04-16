@@ -81,8 +81,35 @@ impl PtyHandle {
         // non-X11/Wayland terminal.
         let pty = tty::new(&options, window_size, 0).map_err(TerminalError::PtySpawn)?;
 
+        // Clear O_NONBLOCK on the master fd.
+        //
+        // alacritty_terminal sets non-blocking I/O on the master (see
+        // tty/unix.rs in that crate) because its own event loop uses
+        // `mio` to poll the fd and wants `read()` to return immediately
+        // when no data is available.  We use a different architecture:
+        // a dedicated reader thread whose only job is to pump bytes
+        // into a channel.  That thread is happy to sleep in the kernel
+        // waiting for data — exactly what blocking reads give it.
+        //
+        // Without this fix the reader thread hits `WouldBlock` on every
+        // read against an idle shell, `continue`s, and spins a core at
+        // 100 %.  The cost was invisible while the main loop was also
+        // busy-polling at 60-120 FPS; once the main loop learned to
+        // sleep on `ControlFlow::Wait` (#9), the reader thread's spin
+        // became the dominant CPU draw.
+        unsafe {
+            use std::os::unix::io::AsRawFd as _;
+            let fd = pty.file().as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+            if flags >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+        }
+
         // Clone the master file for writing.  `Pty::file()` gives us a shared
-        // reference, so we use `try_clone` to get an owned `File`.
+        // reference, so we use `try_clone` to get an owned `File`.  The
+        // cleared O_NONBLOCK above is shared via the open file
+        // description, so the cloned writer is also blocking.
         let writer = pty.file().try_clone().map_err(|e| {
             TerminalError::Io(io::Error::new(e.kind(), format!("clone PTY fd: {e}")))
         })?;
@@ -140,11 +167,11 @@ impl PtyHandle {
                             // of sends results in one redraw, not N.
                             waker();
                         }
-                        Err(ref e)
-                            if e.kind() == io::ErrorKind::WouldBlock
-                                || e.kind() == io::ErrorKind::Interrupted =>
-                        {
-                            // Transient — try again.
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
+                            // A signal interrupted the read; retry.  This is
+                            // the only "transient" case we expect now that
+                            // the fd is blocking — WouldBlock can no longer
+                            // fire and was removed from this match.
                             continue;
                         }
                         Err(e) => {
