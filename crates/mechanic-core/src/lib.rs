@@ -27,7 +27,7 @@ pub mod terminal;
 
 pub use error::TerminalError;
 pub use event::{EventProxy, TerminalEvent};
-pub use terminal::Terminal;
+pub use terminal::{GridColumn, GridLine, GridPoint, GridSide, Terminal};
 
 // ── TerminalSize ──────────────────────────────────────────────────────────────
 

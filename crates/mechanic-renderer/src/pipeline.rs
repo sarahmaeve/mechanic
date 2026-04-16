@@ -6,7 +6,11 @@ use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use wgpu::util::DeviceExt as _;
 
-use crate::{background, grid::RenderGrid, text::TextRenderer};
+use crate::{
+    background,
+    grid::RenderGrid,
+    text::{CellMetrics, TextRenderer},
+};
 use mechanic_config::theme::Rgb;
 
 // ── GPU instance data ─────────────────────────────────────────────────────────
@@ -19,15 +23,19 @@ use mechanic_config::theme::Rgb;
 pub struct GpuInstance {
     /// Grid position: `(col, row)`.
     pub cell_pos: [u32; 2],
-    /// Atlas UV rect: `(u_min, v_min, u_max, v_max)`.
+    /// Atlas UV rect covering the actual glyph bitmap: `(u_min, v_min, u_max, v_max)`.
     pub atlas_uv: [f32; 4],
     /// Foreground color (r, g, b, a) in [0, 1].
     pub fg_color: [f32; 4],
     /// Background color (r, g, b, a) in [0, 1].
     pub bg_color: [f32; 4],
+    /// Pixel offset from cell origin to glyph quad origin.
+    pub glyph_offset: [f32; 2],
+    /// Pixel size of the glyph quad (0, 0 for background instances).
+    pub glyph_size: [f32; 2],
     /// 1 → sample atlas; 0 → solid background.
     pub use_atlas: u32,
-    /// Padding to keep the struct 16-byte aligned.
+    /// Padding to keep 16-byte alignment.
     pub _pad: [u32; 3],
 }
 
@@ -59,7 +67,7 @@ pub struct RenderState {
     instance_buf: wgpu::Buffer,
     instance_capacity: usize,
     sampler: wgpu::Sampler,
-    /// Cell dimensions in pixels.
+    /// Cell dimensions in pixels (from real font metrics).
     pub cell_size: (f32, f32),
     /// Current surface size in pixels.
     pub size: (u32, u32),
@@ -68,20 +76,10 @@ pub struct RenderState {
 }
 
 impl RenderState {
-    /// Estimate cell size from the font metrics in physical pixels.
-    ///
-    /// `scale_factor` is the window's DPI scale (e.g. 2.0 on Retina Macs).
-    /// For Phase 1 we use a fixed monospace approximation; a proper
-    /// implementation queries the font metrics from `TextRenderer`.
-    fn estimate_cell_size(font_size: f32, scale_factor: f32) -> (f32, f32) {
-        // Monospace width ≈ 0.6 × size; height = 1.3 × size (line height).
-        // Scale by the display factor so cells are sized in physical pixels.
-        let w = font_size * 0.6 * scale_factor;
-        let h = font_size * 1.3 * scale_factor;
-        (w, h)
-    }
-
     /// Create a new `RenderState` from a window.
+    ///
+    /// `cell_metrics` must come from `TextRenderer::cell_metrics()` — they
+    /// provide the real cell dimensions measured from the shaped font.
     ///
     /// # Safety
     ///
@@ -91,8 +89,7 @@ impl RenderState {
     pub async fn new<W>(
         window: W,
         size: (u32, u32),
-        font_size: f32,
-        scale_factor: f32,
+        cell_metrics: CellMetrics,
         bg: Rgb,
     ) -> Result<Self, Box<dyn std::error::Error>>
     where
@@ -204,7 +201,9 @@ impl RenderState {
                 1 => Float32x4,  // atlas_uv
                 2 => Float32x4,  // fg_color
                 3 => Float32x4,  // bg_color
-                4 => Uint32,     // use_atlas
+                4 => Float32x2,  // glyph_offset
+                5 => Float32x2,  // glyph_size
+                6 => Uint32,     // use_atlas
             ],
         };
 
@@ -244,7 +243,7 @@ impl RenderState {
 
         // ── Globals uniform buffer ────────────────────────────────────────────
 
-        let cell_size = Self::estimate_cell_size(font_size, scale_factor);
+        let cell_size = (cell_metrics.cell_width, cell_metrics.cell_height);
         let globals = Globals {
             viewport_size: [size.0 as f32, size.1 as f32],
             cell_size: [cell_size.0, cell_size.1],
@@ -405,6 +404,8 @@ impl RenderState {
                     atlas_uv: [0.0; 4],
                     fg_color: [0.0; 4],
                     bg_color: rgb_to_f32(bg),
+                    glyph_offset: [0.0; 2],
+                    glyph_size: [0.0; 2],
                     use_atlas: 0,
                     _pad: [0; 3],
                 });
@@ -430,6 +431,8 @@ impl RenderState {
                             atlas_uv: info.atlas_uv,
                             fg_color: rgb_to_f32(fg),
                             bg_color: rgb_to_f32(bg),
+                            glyph_offset: [info.offset_x, info.offset_y],
+                            glyph_size: [info.glyph_width, info.glyph_height],
                             use_atlas: 1,
                             _pad: [0; 3],
                         });
@@ -441,15 +444,32 @@ impl RenderState {
         // ── Draw cursor ───────────────────────────────────────────────────────
 
         {
+            use crate::grid::CursorStyle;
+            use mechanic_config::theme::palette;
+
             let (cx, cy) = grid.cursor_position;
             if let Some(cell) = grid.get(cx, cy) {
-                use mechanic_config::theme::palette;
                 let cursor_color = palette::CELESTE;
+                let cell_w = self.cell_size.0;
+                let cell_h = self.cell_size.1;
+
+                // Compute the glyph_offset and glyph_size for the cursor quad.
+                // For Block: full cell.
+                // For Bar: 2px wide vertical bar on the left edge.
+                // For Underline: full width, 2px tall at the bottom edge.
+                let (glyph_offset, glyph_size) = match grid.cursor_style {
+                    CursorStyle::Block => ([0.0f32, 0.0f32], [cell_w, cell_h]),
+                    CursorStyle::Bar => ([0.0f32, 0.0f32], [2.0f32, cell_h]),
+                    CursorStyle::Underline => ([0.0f32, cell_h - 2.0f32], [cell_w, 2.0f32]),
+                };
+
                 instances.push(GpuInstance {
                     cell_pos: [cx as u32, cy as u32],
                     atlas_uv: [0.0; 4],
                     fg_color: [0.0; 4],
                     bg_color: rgb_to_f32(cursor_color),
+                    glyph_offset,
+                    glyph_size,
                     use_atlas: 0,
                     _pad: [0; 3],
                 });

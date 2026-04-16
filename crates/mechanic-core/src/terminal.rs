@@ -10,9 +10,12 @@ use alacritty_terminal::Grid;
 use alacritty_terminal::Term;
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::grid::Dimensions as _;
+use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::index::{Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::cell::Cell;
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use mechanic_config::Config;
 
 use crate::TerminalSize;
@@ -172,7 +175,66 @@ impl Terminal {
     pub fn screen_lines(&self) -> usize {
         self.term.grid().screen_lines()
     }
+
+    // ── Scrollback ────────────────────────────────────────────────────────────
+
+    /// Scroll the viewport up by `lines` lines (shows older content).
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.term.scroll_display(Scroll::Delta(lines as i32));
+    }
+
+    /// Scroll the viewport down by `lines` lines (shows newer content).
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.term.scroll_display(Scroll::Delta(-(lines as i32)));
+    }
+
+    // ── Cursor shape ──────────────────────────────────────────────────────────
+
+    /// The current cursor shape as reported by the terminal state machine.
+    pub fn cursor_shape(&self) -> CursorShape {
+        self.term.cursor_style().shape
+    }
+
+    // ── Selection ─────────────────────────────────────────────────────────────
+
+    /// Start a new character-level text selection at the given grid point.
+    pub fn start_selection(&mut self, point: Point, side: Side) {
+        self.term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+    }
+
+    /// Extend the current selection to `point`.  No-op if no selection is active.
+    pub fn update_selection(&mut self, point: Point, side: Side) {
+        if let Some(sel) = self.term.selection.as_mut() {
+            sel.update(point, side);
+        }
+    }
+
+    /// Clear the current selection.
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    /// Get the selected text as a `String`, or `None` if there is no (non-empty) selection.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string()
+    }
+
+    /// Get the current selection range for rendering, if any.
+    pub fn selection_range(&self) -> Option<alacritty_terminal::selection::SelectionRange> {
+        self.term.selection.as_ref().and_then(|s| s.to_range(&self.term))
+    }
 }
+
+// ── Re-exports for callers ────────────────────────────────────────────────────
+
+/// Re-export `Column` for constructing grid points.
+pub use alacritty_terminal::index::Column as GridColumn;
+/// Re-export `Line` for constructing grid points.
+pub use alacritty_terminal::index::Line as GridLine;
+/// Re-export `Point` so callers don't need to depend on `alacritty_terminal` directly.
+pub use alacritty_terminal::index::Point as GridPoint;
+/// Re-export `Side` so callers don't need to depend on `alacritty_terminal` directly.
+pub use alacritty_terminal::index::Side as GridSide;
 
 // ── Dimensions adapter ────────────────────────────────────────────────────────
 

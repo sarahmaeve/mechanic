@@ -19,3 +19,4 @@ env_logger.workspace = true
 mechanic-core.workspace = true
 mechanic-renderer.workspace = true
 mechanic-config.workspace = true
+arboard.workspace = true

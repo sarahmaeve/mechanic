@@ -25,14 +25,18 @@ struct Globals {
 struct Instance {
     // Grid position (col, row) in cell coordinates.
     @location(0) cell_pos: vec2<u32>,
-    // Atlas UV rectangle: (u_min, v_min, u_max, v_max).
+    // Atlas UV rectangle covering the actual glyph bitmap: (u_min, v_min, u_max, v_max).
     @location(1) atlas_uv: vec4<f32>,
     // Foreground color (linear, premultiplied optional — we keep sRGB for now).
     @location(2) fg_color: vec4<f32>,
     // Background color.
     @location(3) bg_color: vec4<f32>,
+    // Pixel offset from cell origin to glyph quad origin.
+    @location(4) glyph_offset: vec2<f32>,
+    // Pixel size of the glyph quad (0, 0 for background instances).
+    @location(5) glyph_size: vec2<f32>,
     // 1u → sample atlas (text glyph); 0u → draw background solid.
-    @location(4) use_atlas: u32,
+    @location(6) use_atlas: u32,
 }
 
 // ── Vertex stage ──────────────────────────────────────────────────────────────
@@ -70,8 +74,23 @@ fn vs_main(
         f32(inst.cell_pos.y) * globals.cell_size.y,
     );
 
+    // Determine quad origin and size based on whether this is a glyph or background.
+    var quad_origin: vec2<f32>;
+    var quad_size: vec2<f32>;
+
+    if inst.use_atlas == 1u {
+        // Glyph: position at the bearing offset within the cell, sized to the
+        // actual glyph bitmap dimensions.
+        quad_origin = cell_origin + inst.glyph_offset;
+        quad_size = inst.glyph_size;
+    } else {
+        // Background: fill the entire cell.
+        quad_origin = cell_origin;
+        quad_size = globals.cell_size;
+    }
+
     // Pixel position of this vertex.
-    let px = cell_origin + lv * globals.cell_size;
+    let px = quad_origin + lv * quad_size;
 
     // Convert pixel coords to NDC.  wgpu uses Y-up NDC but pixel Y is Y-down,
     // so we flip Y: NDC_y = 1 - 2 * (px_y / viewport_h).

@@ -17,21 +17,37 @@ const ATLAS_INITIAL_ROWS: u32 = 8;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+/// Real font metrics extracted from cosmic-text after shaping.
+///
+/// These replace the rough `font_size * 0.6 / 1.3` estimates used previously.
+#[derive(Debug, Clone, Copy)]
+pub struct CellMetrics {
+    /// Advance width of a monospace cell in physical pixels (from the space
+    /// glyph's `x_advance`).
+    pub cell_width: f32,
+    /// Line height in physical pixels (from `Metrics::line_height`).
+    pub cell_height: f32,
+    /// Distance from the top of the cell to the baseline in physical pixels
+    /// (from `LayoutRun::max_ascent`).
+    pub ascent: f32,
+}
+
 /// Location and metrics of a rasterized glyph in the GPU atlas.
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphInfo {
-    /// UV rectangle in the atlas texture: `(u_min, v_min, u_max, v_max)`.
+    /// UV rectangle in the atlas texture covering *only* the glyph bitmap:
+    /// `(u_min, v_min, u_max, v_max)`.
     pub atlas_uv: [f32; 4],
-    /// Horizontal offset in pixels from the cell origin to the glyph's left
-    /// edge.
-    pub bearing_x: i32,
-    /// Vertical offset in pixels from the cell baseline to the glyph's top
-    /// edge (positive = up).
-    pub bearing_y: i32,
+    /// Horizontal offset in pixels from the cell left edge to the glyph's
+    /// left edge (bearing X).
+    pub offset_x: f32,
+    /// Vertical offset in pixels from the cell top to the glyph's top edge
+    /// (`ascent - placement.top`).
+    pub offset_y: f32,
     /// Width of the rasterized bitmap in pixels.
-    pub width: u32,
+    pub glyph_width: f32,
     /// Height of the rasterized bitmap in pixels.
-    pub height: u32,
+    pub glyph_height: f32,
 }
 
 // ── TextRenderer ──────────────────────────────────────────────────────────────
@@ -44,14 +60,16 @@ pub struct TextRenderer {
     pub atlas_texture: wgpu::Texture,
     /// A view into `atlas_texture`, kept alive alongside the texture.
     pub atlas_view: wgpu::TextureView,
-    /// Map from cosmic-text `CacheKey` to atlas slot index.
-    atlas_map: HashMap<CacheKey, u32>,
+    /// Map from cosmic-text `CacheKey` to cached `GlyphInfo`.
+    atlas_map: HashMap<CacheKey, GlyphInfo>,
     /// Next free slot index.
     atlas_next_slot: u32,
     /// Total number of slots currently allocated.
     atlas_capacity_slots: u32,
     /// Font metrics (size, line height).
     metrics: Metrics,
+    /// Real cell metrics derived from a shaped test character.
+    cell_metrics: CellMetrics,
 }
 
 impl TextRenderer {
@@ -77,19 +95,41 @@ impl TextRenderer {
         config: &FontConfig,
         scale_factor: f32,
     ) -> Self {
-        let font_system = FontSystem::new();
-
-        // Set the primary font family preference.  cosmic-text's FontSystem
-        // discovers system fonts automatically; we steer it with Attrs.
-        let _ = &config.family; // config family will be used below in rasterize_ascii_range
-
-        let swash_cache = SwashCache::new();
+        let mut font_system = FontSystem::new();
 
         // Font size in physical pixels — scale the point size by the display
         // factor so glyphs are rendered at native resolution.
         let px_size = config.size * scale_factor;
-        let line_height = px_size * 1.3; // a reasonable default
+        let line_height = px_size * 1.3; // initial estimate; overridden by real metrics below
         let metrics = Metrics::new(px_size, line_height);
+
+        // ── Extract real cell metrics ─────────────────────────────────────────
+        //
+        // Shape a space character to get the monospace advance width and the
+        // true line metrics (ascent, line_height).
+        let cell_metrics = {
+            let mut buffer = Buffer::new(&mut font_system, metrics);
+            let mut borrow = buffer.borrow_with(&mut font_system);
+            let attrs = Attrs::new().family(cosmic_text::Family::Name(&config.family));
+            borrow.set_text(" ", &attrs, Shaping::Advanced, None);
+            borrow.shape_until_scroll(false);
+
+            let mut cell_width = px_size * 0.6; // fallback
+            let mut cell_height = line_height; // fallback
+            let mut ascent = px_size * 0.8; // fallback
+
+            if let Some(run) = borrow.layout_runs().next() {
+                cell_height = run.line_height;
+                ascent = run.line_y - run.line_top;
+                if let Some(glyph) = run.glyphs.first() {
+                    cell_width = glyph.w;
+                }
+            }
+
+            CellMetrics { cell_width, cell_height, ascent }
+        };
+
+        let swash_cache = SwashCache::new();
 
         let capacity_slots = ATLAS_COLS * ATLAS_INITIAL_ROWS;
         let atlas_texture = Self::create_atlas_texture(device, capacity_slots);
@@ -104,12 +144,18 @@ impl TextRenderer {
             atlas_next_slot: 0,
             atlas_capacity_slots: capacity_slots,
             metrics,
+            cell_metrics,
         };
 
         // Pre-rasterize the printable ASCII range on startup.
         renderer.rasterize_ascii_range(device, queue, config);
 
         renderer
+    }
+
+    /// Return the real cell metrics extracted from the font.
+    pub fn cell_metrics(&self) -> CellMetrics {
+        self.cell_metrics
     }
 
     // ── Atlas texture management ──────────────────────────────────────────────
@@ -164,15 +210,16 @@ impl TextRenderer {
         (slot % ATLAS_COLS, slot / ATLAS_COLS)
     }
 
-    /// UV rectangle for a given slot.
-    fn slot_uv(slot: u32, capacity_slots: u32) -> [f32; 4] {
+    /// UV rectangle for a given slot covering only the actual glyph bitmap
+    /// (not the full 64×64 slot).
+    fn glyph_uv(slot: u32, glyph_w: u32, glyph_h: u32, capacity_slots: u32) -> [f32; 4] {
         let (col, row) = Self::slot_to_grid(slot);
         let atlas_w = Self::atlas_width() as f32;
         let atlas_h = Self::atlas_height(capacity_slots) as f32;
         let x0 = (col * ATLAS_SLOT_SIZE) as f32 / atlas_w;
         let y0 = (row * ATLAS_SLOT_SIZE) as f32 / atlas_h;
-        let x1 = x0 + ATLAS_SLOT_SIZE as f32 / atlas_w;
-        let y1 = y0 + ATLAS_SLOT_SIZE as f32 / atlas_h;
+        let x1 = x0 + glyph_w as f32 / atlas_w;
+        let y1 = y0 + glyph_h as f32 / atlas_h;
         [x0, y0, x1, y1]
     }
 
@@ -240,15 +287,8 @@ impl TextRenderer {
         let cache_key = cache_key?;
 
         // Return cached result if already rasterized.
-        if let Some(&slot) = self.atlas_map.get(&cache_key) {
-            let uv = Self::slot_uv(slot, self.atlas_capacity_slots);
-            return Some(GlyphInfo {
-                atlas_uv: uv,
-                bearing_x: 0,
-                bearing_y: 0,
-                width: ATLAS_SLOT_SIZE,
-                height: ATLAS_SLOT_SIZE,
-            });
+        if let Some(&info) = self.atlas_map.get(&cache_key) {
+            return Some(info);
         }
 
         // Rasterize via swash.
@@ -261,9 +301,14 @@ impl TextRenderer {
             return None;
         }
 
+        // Compute glyph placement within the cell.
+        // offset_x = bearing X (pixels from cell left to glyph left edge).
+        // offset_y = ascent - placement.top (pixels from cell top to glyph top).
+        let offset_x = image.placement.left as f32;
+        let offset_y = self.cell_metrics.ascent - image.placement.top as f32;
+
         // Allocate an atlas slot.
         let slot = self.alloc_slot(device, queue);
-        self.atlas_map.insert(cache_key, slot);
 
         let (col, row) = Self::slot_to_grid(slot);
         let dst_x = col * ATLAS_SLOT_SIZE;
@@ -290,13 +335,15 @@ impl TextRenderer {
             wgpu::Extent3d { width: upload_w, height: upload_h, depth_or_array_layers: 1 },
         );
 
-        let uv = Self::slot_uv(slot, self.atlas_capacity_slots);
-        Some(GlyphInfo {
+        let uv = Self::glyph_uv(slot, upload_w, upload_h, self.atlas_capacity_slots);
+        let info = GlyphInfo {
             atlas_uv: uv,
-            bearing_x: image.placement.left,
-            bearing_y: image.placement.top,
-            width: upload_w,
-            height: upload_h,
-        })
+            offset_x,
+            offset_y,
+            glyph_width: upload_w as f32,
+            glyph_height: upload_h as f32,
+        };
+        self.atlas_map.insert(cache_key, info);
+        Some(info)
     }
 }

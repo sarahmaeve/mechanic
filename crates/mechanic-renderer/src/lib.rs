@@ -10,6 +10,7 @@ pub mod text;
 
 // Re-export the public surface of the renderer.
 pub use grid::{CellFlags, CursorStyle, RenderCell, RenderGrid};
+pub use text::CellMetrics;
 
 use mechanic_config::{font::FontConfig, theme::Theme};
 use pipeline::RenderState;
@@ -38,13 +39,63 @@ impl Renderer {
     where
         W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
     {
-        let state =
-            RenderState::new(window, size, font_config.size, scale_factor, theme.background)
-                .await?;
+        // We need a temporary wgpu device to create the TextRenderer (for
+        // atlas texture creation) before we can create the full RenderState.
+        // Instead, create a temporary device just for font metric extraction,
+        // then create the full RenderState with real CellMetrics.
+        //
+        // Since RenderState creates its own device, we create TextRenderer
+        // after RenderState using its device/queue.
+        let state = RenderState::new(
+            window,
+            size,
+            Self::bootstrap_metrics(&font_config, scale_factor),
+            theme.background,
+        )
+        .await?;
 
         let text = TextRenderer::new(&state.device, &state.queue, &font_config, scale_factor);
 
         Ok(Self { state, text, font_config })
+    }
+
+    /// Compute a bootstrap `CellMetrics` without a GPU device.
+    ///
+    /// This runs cosmic-text font shaping on the CPU to get real metrics,
+    /// then those metrics are passed to `RenderState::new` so the globals
+    /// uniform is correct from the first frame.
+    fn bootstrap_metrics(config: &FontConfig, scale_factor: f32) -> CellMetrics {
+        use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
+
+        let mut font_system = FontSystem::new();
+        let px_size = config.size * scale_factor;
+        let line_height = px_size * 1.3;
+        let metrics = Metrics::new(px_size, line_height);
+
+        let mut buffer = Buffer::new(&mut font_system, metrics);
+        let mut borrow = buffer.borrow_with(&mut font_system);
+        let attrs = Attrs::new().family(cosmic_text::Family::Name(&config.family));
+        borrow.set_text(" ", &attrs, Shaping::Advanced, None);
+        borrow.shape_until_scroll(false);
+
+        let mut cell_width = px_size * 0.6;
+        let mut cell_height = line_height;
+        let mut ascent = px_size * 0.8;
+
+        if let Some(run) = borrow.layout_runs().next() {
+            cell_height = run.line_height;
+            ascent = run.line_y - run.line_top;
+            if let Some(glyph) = run.glyphs.first() {
+                cell_width = glyph.w;
+            }
+        }
+
+        CellMetrics { cell_width, cell_height, ascent }
+    }
+
+    /// Return the real cell metrics extracted from the font.
+    pub fn cell_metrics(&self) -> CellMetrics {
+        self.text.cell_metrics()
     }
 
     /// Notify the renderer that the window has been resized.

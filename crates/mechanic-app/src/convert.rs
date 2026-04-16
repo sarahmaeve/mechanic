@@ -5,11 +5,12 @@
 //! then consumes that snapshot without touching any alacritty-internal types.
 
 use alacritty_terminal::grid::Dimensions as _;
+use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 use mechanic_config::theme::{Rgb, Theme};
 use mechanic_core::Terminal;
-use mechanic_renderer::{CellFlags, RenderCell, RenderGrid};
+use mechanic_renderer::{CellFlags, CursorStyle, RenderCell, RenderGrid};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -96,7 +97,70 @@ pub fn convert_grid(terminal: &Terminal, theme: &Theme) -> RenderGrid {
     let cursor_col = grid.cursor.point.column.0.min(cols.saturating_sub(1));
     render_grid.cursor_position = (cursor_col, cursor_row);
 
+    // ── Cursor style ──────────────────────────────────────────────────────────
+
+    render_grid.cursor_style = match terminal.cursor_shape() {
+        CursorShape::Block | CursorShape::HollowBlock => CursorStyle::Block,
+        CursorShape::Underline => CursorStyle::Underline,
+        CursorShape::Beam => CursorStyle::Bar,
+        CursorShape::Hidden => CursorStyle::Block,
+    };
+
+    // ── Selection highlight ───────────────────────────────────────────────────
+
+    if let Some(sel_range) = terminal.selection_range() {
+        apply_selection_highlight(&mut render_grid, &sel_range, display_offset, cols, rows, theme);
+    }
+
     render_grid
+}
+
+/// Apply selection highlight colors to all cells within `sel_range`.
+///
+/// Cells inside the selection have their foreground and background colors
+/// replaced with the theme's selection colors.
+fn apply_selection_highlight(
+    render_grid: &mut RenderGrid,
+    sel_range: &SelectionRange,
+    display_offset: usize,
+    cols: usize,
+    rows: usize,
+    theme: &Theme,
+) {
+    let sel_bg = theme.selection.background;
+    let sel_fg = theme.selection.foreground;
+
+    let start = sel_range.start;
+    let end = sel_range.end;
+
+    // Walk every grid line that overlaps the selection.
+    let start_line = start.line.0;
+    let end_line = end.line.0;
+
+    for line_idx in start_line..=end_line {
+        // Convert grid line index to a viewport row.
+        let viewport_row = line_idx + display_offset as i32;
+        if viewport_row < 0 || viewport_row >= rows as i32 {
+            continue;
+        }
+        let row = viewport_row as usize;
+
+        // Determine the column range for this line.
+        let col_start = if line_idx == start_line { start.column.0 } else { 0 };
+
+        let col_end = if line_idx == end_line { end.column.0 } else { cols.saturating_sub(1) };
+
+        for col in col_start..=col_end.min(cols.saturating_sub(1)) {
+            let idx = row * cols + col;
+            if idx < render_grid.cells.len() {
+                let cell = &mut render_grid.cells[idx];
+                cell.bg = sel_bg;
+                if let Some(fg) = sel_fg {
+                    cell.fg = fg;
+                }
+            }
+        }
+    }
 }
 
 // ── Color resolution ──────────────────────────────────────────────────────────

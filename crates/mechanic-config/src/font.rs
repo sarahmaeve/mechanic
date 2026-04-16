@@ -26,7 +26,7 @@ pub struct FontConfig {
 
     /// Font size in points.
     ///
-    /// Defaults to `14.0`.
+    /// Defaults to `16.0`.
     pub size: f32,
 
     /// Ordered list of fallback font families tried when a glyph is absent
@@ -40,7 +40,7 @@ impl Default for FontConfig {
     fn default() -> Self {
         Self {
             family: "Berkeley Mono".to_string(),
-            size: 14.0,
+            size: 16.0,
             fallback_families: vec![
                 "SF Mono".to_string(),
                 "Menlo".to_string(),
@@ -64,9 +64,9 @@ mod tests {
     }
 
     #[test]
-    fn default_size_is_14() {
+    fn default_size_is_16() {
         let cfg = FontConfig::default();
-        assert!((cfg.size - 14.0).abs() < f32::EPSILON);
+        assert!((cfg.size - 16.0).abs() < f32::EPSILON);
     }
 
     #[test]
