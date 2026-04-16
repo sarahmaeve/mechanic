@@ -226,66 +226,155 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
 // ── Electron pulse helpers ────────────────────────────────────────────────────
 
-// Glow from a single electron moving along a SVG-space line segment.
-//
-// `logo_px` is the fragment's position inside the logo rect, in display pixels.
-// `logo_size` is the on-screen logo edge length (same in x and y).
-// `a_svg`/`b_svg` are the segment endpoints in SVG viewBox coords (0–256).
-// `t` is the electron's progress along the segment, in [0, 1).
-// `radius` is the glow radius in display pixels.
-fn electron_glow(
-    logo_px: vec2<f32>,
-    logo_size: f32,
-    a_svg: vec2<f32>,
-    b_svg: vec2<f32>,
+// Position at normalized parameter `t` ∈ [0, 1) along a 4-vertex polyline
+// (3 segments).  Length-weighted so the electron moves at constant speed
+// regardless of segment lengths — no visual acceleration at bends.
+fn poly4_pos(
     t: f32,
-    radius: f32,
-) -> f32 {
-    let e_svg = mix(a_svg, b_svg, t);
-    // SVG → logo pixel space.  SVG viewBox is 256 units per edge.
-    let e_px = e_svg * (logo_size / 256.0);
-    let d = distance(logo_px, e_px);
-    return exp(-d * d / (radius * radius));
+    p0: vec2<f32>,
+    p1: vec2<f32>,
+    p2: vec2<f32>,
+    p3: vec2<f32>,
+) -> vec2<f32> {
+    let l0 = distance(p0, p1);
+    let l1 = distance(p1, p2);
+    let l2 = distance(p2, p3);
+    let total = l0 + l1 + l2;
+    let target_len = t * total;
+    if target_len < l0 {
+        return mix(p0, p1, target_len / l0);
+    } else if target_len < l0 + l1 {
+        return mix(p1, p2, (target_len - l0) / l1);
+    } else {
+        return mix(p2, p3, (target_len - l0 - l1) / l2);
+    }
+}
+
+// Same idea for 5-vertex (4-segment) polylines.
+fn poly5_pos(
+    t: f32,
+    p0: vec2<f32>,
+    p1: vec2<f32>,
+    p2: vec2<f32>,
+    p3: vec2<f32>,
+    p4: vec2<f32>,
+) -> vec2<f32> {
+    let l0 = distance(p0, p1);
+    let l1 = distance(p1, p2);
+    let l2 = distance(p2, p3);
+    let l3 = distance(p3, p4);
+    let total = l0 + l1 + l2 + l3;
+    let target_len = t * total;
+    if target_len < l0 {
+        return mix(p0, p1, target_len / l0);
+    } else if target_len < l0 + l1 {
+        return mix(p1, p2, (target_len - l0) / l1);
+    } else if target_len < l0 + l1 + l2 {
+        return mix(p2, p3, (target_len - l0 - l1) / l2);
+    } else {
+        return mix(p3, p4, (target_len - l0 - l1 - l2) / l3);
+    }
+}
+
+// Look up the SVG-space position of path `id` at parameter `t`.
+//
+// Paths are hand-picked straight lines and polylines from assets/logo.svg.
+// Straight lines use `mix`; polylines use the poly{N}_pos helpers so
+// bends are traversed at constant speed.  Count: 9 paths.
+fn path_position(id: u32, t: f32) -> vec2<f32> {
+    switch id {
+        // 0. Origin meander: upper-left origin pad → capacitor C0.
+        //    Goes right, down, right with two 90° bends.
+        case 0u: {
+            return poly4_pos(t,
+                vec2<f32>( 25.0,  28.0),
+                vec2<f32>( 78.0,  28.0),
+                vec2<f32>( 78.0,  56.0),
+                vec2<f32>(142.0,  56.0));
+        }
+        // 1. R1's left lead dropping down to IC1's top.
+        case 1u: {
+            return mix(vec2<f32>(170.0, 34.0), vec2<f32>(170.0, 70.0), t);
+        }
+        // 2. IC1 bottom-left pin routing down, left, down, right into IC2.
+        case 2u: {
+            return poly5_pos(t,
+                vec2<f32>(158.0, 118.0),
+                vec2<f32>(158.0, 142.0),
+                vec2<f32>(130.0, 142.0),
+                vec2<f32>(130.0, 170.0),
+                vec2<f32>(140.0, 170.0));
+        }
+        // 3. IC1 → IC2 main vertical drop.
+        case 3u: {
+            return mix(vec2<f32>(186.0, 118.0), vec2<f32>(186.0, 155.0), t);
+        }
+        // 4. R2 vertical body, top pad down to the turn at the bottom.
+        case 4u: {
+            return mix(vec2<f32>(44.0, 124.0), vec2<f32>(44.0, 196.0), t);
+        }
+        // 5. R2 → C1 → IC2 horizontal feeder across the lower edge.
+        case 5u: {
+            return mix(vec2<f32>(44.0, 196.0), vec2<f32>(140.0, 196.0), t);
+        }
+        // 6. Upper-right bend: top pad → down the right edge → left → down
+        //    into IC2's top-right pin.
+        case 6u: {
+            return poly5_pos(t,
+                vec2<f32>(216.0,  78.0),
+                vec2<f32>(228.0,  78.0),
+                vec2<f32>(228.0, 120.0),
+                vec2<f32>(210.0, 120.0),
+                vec2<f32>(210.0, 130.0));
+        }
+        // 7. IC2 top-most right pin out to its pad.
+        case 7u: {
+            return mix(vec2<f32>(222.0, 165.0), vec2<f32>(244.0, 165.0), t);
+        }
+        // 8. IC2 middle-upper right pin out to its pad.
+        default: {
+            return mix(vec2<f32>(222.0, 192.0), vec2<f32>(244.0, 192.0), t);
+        }
+    }
 }
 
 // Sum of all electron glows for this fragment.
+//
+// Five concurrent electron slots.  Each slot has its own period (so they
+// drift out of phase naturally rather than marching in lockstep) and
+// rotates through the 9-path pool each cycle so the active traces
+// change over time.  Path selection uses a small coprime-modulo hash
+// of the cycle count and slot index — deterministic pseudo-randomness.
 fn electron_pulses(logo_px: vec2<f32>, logo_size: f32, time: f32) -> f32 {
-    let period: f32 = 3.0;   // seconds per full sweep of any given path
-    let radius: f32 = 5.0;   // glow radius in display pixels
+    let radius: f32 = 5.0;
+    let num_paths: u32 = 9u;
 
-    // Phase offsets stagger the pulses through a common cycle so you
-    // always see at least one mid-trace rather than all five starting
-    // or ending together.
-    let t0 = fract((time + 0.0) / period);
-    let t1 = fract((time + 0.6) / period);
-    let t2 = fract((time + 1.2) / period);
-    let t3 = fract((time + 1.8) / period);
-    let t4 = fract((time + 2.4) / period);
+    // Prime-ish periods in seconds, chosen to rarely share common
+    // multiples so the 5 electrons stay staggered.
+    var periods: array<f32, 5> = array<f32, 5>(2.3, 2.9, 3.4, 2.7, 3.1);
+    // Starting phase offsets — spread 5 pulses around a 3-second window.
+    var phases: array<f32, 5> = array<f32, 5>(0.0, 0.7, 1.3, 1.9, 2.5);
 
     var glow: f32 = 0.0;
+    let scale = logo_size / 256.0;
 
-    // 1. IC1 bottom-right pin down into IC2 — a prominent vertical trace
-    //    in the middle-upper area.
-    glow = glow + electron_glow(logo_px, logo_size,
-        vec2<f32>(186.0, 118.0), vec2<f32>(186.0, 155.0), t0, radius);
+    for (var i: u32 = 0u; i < 5u; i++) {
+        let period = periods[i];
+        let phase = phases[i];
+        let t_raw = (time + phase) / period;
+        let cycle = u32(t_raw);
+        let t = fract(t_raw);
 
-    // 2. R2 → C1 horizontal feeder on the lower-left.
-    glow = glow + electron_glow(logo_px, logo_size,
-        vec2<f32>(44.0, 196.0), vec2<f32>(140.0, 196.0), t1, radius);
+        // Rotate through paths: multiplier pair chosen coprime with 9
+        // so every (cycle, slot) combination reaches every path over
+        // enough cycles.
+        let path_id = (cycle * 5u + i * 11u) % num_paths;
 
-    // 3. Upper vertical trace on the right (travelling upward).
-    glow = glow + electron_glow(logo_px, logo_size,
-        vec2<f32>(228.0, 120.0), vec2<f32>(228.0, 78.0), t2, radius);
-
-    // 4. Top meander from upper-left origin pad rightward to the
-    //    capacitor C0.
-    glow = glow + electron_glow(logo_px, logo_size,
-        vec2<f32>(25.0, 28.0), vec2<f32>(100.0, 28.0), t3, radius);
-
-    // 5. Right side of IC2, top-most pin out to its pad — short but
-    //    close to the logo's visual anchor.
-    glow = glow + electron_glow(logo_px, logo_size,
-        vec2<f32>(222.0, 165.0), vec2<f32>(244.0, 165.0), t4, radius);
+        let e_svg = path_position(path_id, t);
+        let e_px = e_svg * scale;
+        let d = distance(logo_px, e_px);
+        glow = glow + exp(-d * d / (radius * radius));
+    }
 
     return glow;
 }
