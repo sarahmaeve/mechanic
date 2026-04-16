@@ -367,7 +367,22 @@ impl ApplicationHandler for App {
                                 let text =
                                     state.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
                                 if let Some(text) = text {
-                                    if let Err(e) = state.terminal.write_to_pty(text.as_bytes()) {
+                                    // When the shell has enabled bracketed
+                                    // paste (DECSET 2004), wrap the paste
+                                    // in \x1b[200~ … \x1b[201~ so readline
+                                    // treats the whole thing as one edit
+                                    // operation.  Without this, Cmd+Z only
+                                    // undoes one character at a time.
+                                    let payload: Vec<u8> = if state.terminal.bracketed_paste() {
+                                        let mut v = Vec::with_capacity(text.len() + 12);
+                                        v.extend_from_slice(b"\x1b[200~");
+                                        v.extend_from_slice(text.as_bytes());
+                                        v.extend_from_slice(b"\x1b[201~");
+                                        v
+                                    } else {
+                                        text.into_bytes()
+                                    };
+                                    if let Err(e) = state.terminal.write_to_pty(&payload) {
                                         log::warn!("PTY paste failed: {e}");
                                     }
                                 }

@@ -209,8 +209,12 @@ pub struct Theme {
     pub foreground: Rgb,
     /// Default background color.
     pub background: Rgb,
-    /// Cursor color.
+    /// Cursor color (the block, bar, or underline itself).
     pub cursor: Rgb,
+    /// Color of the character displayed *under* a block cursor.  A solid
+    /// block cursor in `cursor` would otherwise hide the glyph — this gives
+    /// it a contrasting color so the character stays readable.
+    pub cursor_text: Rgb,
     /// The 16 standard ANSI colors mapped to Stark palette equivalents.
     pub ansi: AnsiColors,
     /// Text-selection colors.
@@ -225,6 +229,9 @@ impl Default for Theme {
             foreground: palette::ELECTRIC,
             background: palette::BLACK,
             cursor: palette::CELESTE,
+            // Amber reads clearly against the bright celeste cursor block
+            // and matches the Stark palette's warm-accent hue.
+            cursor_text: palette::AMBER,
             ansi: AnsiColors::default(),
             selection: SelectionColors::default(),
             opacity: OpacityConfig::default(),

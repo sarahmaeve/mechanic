@@ -106,6 +106,23 @@ pub fn convert_grid(terminal: &Terminal, theme: &Theme) -> RenderGrid {
         CursorShape::Hidden => CursorStyle::Block,
     };
 
+    // ── Block-cursor cell recolor ─────────────────────────────────────────────
+    //
+    // For Block cursors, repaint the cell under the cursor directly rather
+    // than drawing an opaque block on top: set its background to the cursor
+    // color and its foreground to `theme.cursor_text`.  This keeps the
+    // character under the cursor visible (in amber, by default) instead of
+    // hiding it behind a solid celeste square.
+    //
+    // Bar and Underline cursors don't cover the character, so they remain
+    // rendered as separate quads by the pipeline's cursor pass.
+    if matches!(render_grid.cursor_style, CursorStyle::Block) {
+        if let Some(cell) = render_grid.get_mut(cursor_col, cursor_row) {
+            cell.bg = theme.cursor;
+            cell.fg = theme.cursor_text;
+        }
+    }
+
     // ── Selection highlight ───────────────────────────────────────────────────
 
     if let Some(sel_range) = terminal.selection_range() {

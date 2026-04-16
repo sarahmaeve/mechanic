@@ -166,6 +166,16 @@ impl Terminal {
         self.size
     }
 
+    /// Whether the shell has enabled bracketed-paste mode via `DECSET 2004`.
+    ///
+    /// When true, pastes should be wrapped in `\x1b[200~ ... \x1b[201~` so
+    /// readline sees the whole paste as one logical operation (relevant for
+    /// undo and for shells that disable history expansion on pastes).
+    pub fn bracketed_paste(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Number of columns in the grid.
     pub fn columns(&self) -> usize {
         self.term.grid().columns()

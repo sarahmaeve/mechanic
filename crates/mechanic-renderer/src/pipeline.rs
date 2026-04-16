@@ -493,33 +493,38 @@ impl RenderState {
             use crate::grid::CursorStyle;
             use mechanic_config::theme::palette;
 
-            let (cx, cy) = grid.cursor_position;
-            if let Some(cell) = grid.get(cx, cy) {
-                let cursor_color = palette::CELESTE;
-                let cell_w = self.cell_size.0;
-                let cell_h = self.cell_size.1;
+            // Block cursors are rendered by recoloring the cell itself in
+            // `convert.rs` (so the character stays visible), so nothing to
+            // draw here.  Bar and Underline don't overlap the glyph and are
+            // still drawn as separate quads on top.
+            let needs_quad = !matches!(grid.cursor_style, CursorStyle::Block);
 
-                // Compute the glyph_offset and glyph_size for the cursor quad.
-                // For Block: full cell.
-                // For Bar: 2px wide vertical bar on the left edge.
-                // For Underline: full width, 2px tall at the bottom edge.
-                let (glyph_offset, glyph_size) = match grid.cursor_style {
-                    CursorStyle::Block => ([0.0f32, 0.0f32], [cell_w, cell_h]),
-                    CursorStyle::Bar => ([0.0f32, 0.0f32], [2.0f32, cell_h]),
-                    CursorStyle::Underline => ([0.0f32, cell_h - 2.0f32], [cell_w, 2.0f32]),
-                };
+            if needs_quad {
+                let (cx, cy) = grid.cursor_position;
+                if grid.get(cx, cy).is_some() {
+                    let cursor_color = palette::CELESTE;
+                    let cell_w = self.cell_size.0;
+                    let cell_h = self.cell_size.1;
 
-                instances.push(GpuInstance {
-                    cell_pos: [cx as u32, cy as u32],
-                    atlas_uv: [0.0; 4],
-                    fg_color: [0.0; 4],
-                    bg_color: rgb_to_f32(cursor_color),
-                    glyph_offset,
-                    glyph_size,
-                    use_atlas: 0,
-                    _pad: [0; 3],
-                });
-                let _ = cell;
+                    // Bar: 2px wide on the left edge.
+                    // Underline: full width, 2px tall at the bottom edge.
+                    let (glyph_offset, glyph_size) = match grid.cursor_style {
+                        CursorStyle::Bar => ([0.0f32, 0.0f32], [2.0f32, cell_h]),
+                        CursorStyle::Underline => ([0.0f32, cell_h - 2.0f32], [cell_w, 2.0f32]),
+                        CursorStyle::Block => unreachable!(),
+                    };
+
+                    instances.push(GpuInstance {
+                        cell_pos: [cx as u32, cy as u32],
+                        atlas_uv: [0.0; 4],
+                        fg_color: [0.0; 4],
+                        bg_color: rgb_to_f32(cursor_color),
+                        glyph_offset,
+                        glyph_size,
+                        use_atlas: 0,
+                        _pad: [0; 3],
+                    });
+                }
             }
         }
 
