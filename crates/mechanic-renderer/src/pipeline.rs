@@ -132,6 +132,7 @@ impl RenderState {
         // Pick an alpha mode that supports transparency.  PreMultiplied is
         // ideal (the shader already outputs premultiplied colors), but not
         // every macOS GPU configuration advertises it.  Fall back gracefully.
+        log::info!("surface alpha modes available: {:?}", caps.alpha_modes);
         let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
             wgpu::CompositeAlphaMode::PreMultiplied
         } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
@@ -139,6 +140,7 @@ impl RenderState {
         } else {
             caps.alpha_modes[0]
         };
+        log::info!("selected surface alpha mode: {alpha_mode:?}");
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -236,7 +238,12 @@ impl RenderState {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // No blending: every pixel is fully written by exactly one
+                    // cell or glyph draw.  Alpha blending would corrupt the
+                    // alpha channel, breaking the PostMultiplied compositor on
+                    // macOS (pixels would end up near-opaque even when the
+                    // shader outputs partial alpha).
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -547,11 +554,14 @@ impl RenderState {
             label: Some("frame_encoder"),
         });
 
-        // Premultiplied alpha clear color: multiply RGB by alpha.
+        // Non-premultiplied clear color for the macOS PostMultiplied compositor.
+        // Every cell fully writes its pixels (blend: None), so this clear only
+        // shows through if the grid doesn't cover the entire surface (edge
+        // pixels from fractional cell sizing).
         let clear_color = wgpu::Color {
-            r: self.clear_color.r * content_opacity as f64,
-            g: self.clear_color.g * content_opacity as f64,
-            b: self.clear_color.b * content_opacity as f64,
+            r: self.clear_color.r,
+            g: self.clear_color.g,
+            b: self.clear_color.b,
             a: content_opacity as f64,
         };
 

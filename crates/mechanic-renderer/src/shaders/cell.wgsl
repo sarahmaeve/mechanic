@@ -123,47 +123,44 @@ fn vs_main(
 }
 
 // ── Fragment stage ────────────────────────────────────────────────────────────
+//
+// macOS Metal only exposes `CompositeAlphaMode::PostMultiplied` for
+// transparent surfaces, which expects non-premultiplied colors in the
+// surface texture.  The compositor then does:
+//
+//     screen = surface.rgb * surface.a + desktop * (1 - surface.a)
+//
+// So we output `(final_rgb, content_opacity)` directly — RGB is the final
+// color we want to appear, alpha is the window opacity that tells the
+// compositor how much of our pixel vs the desktop to show.
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if in.use_atlas == 1u {
         let alpha = textureSample(atlas_texture, atlas_sampler, in.uv).r;
-        var color = mix(in.bg_color, in.fg_color, alpha);
-        // Apply content opacity (premultiplied alpha).
-        color = vec4<f32>(color.rgb * globals.content_opacity, color.a * globals.content_opacity);
-        return color;
+        // Mix fg and bg based on glyph coverage — this gives us the final
+        // on-screen color for this pixel, before compositing with the desktop.
+        let color_rgb = mix(in.bg_color.rgb, in.fg_color.rgb, alpha);
+        return vec4<f32>(color_rgb, globals.content_opacity);
     } else {
-        // Background cell — apply gradient and opacity.
-        var bg = in.bg_color;
+        // Background cell — apply gradient.
+        var bg_rgb = in.bg_color.rgb;
 
         // Animated gradient glow in the lower-right corner.
-        // Normalized position in the viewport.
         let uv_pos = in.pixel_pos / globals.viewport_size;
-
-        // Distance from lower-right corner (1.0, 1.0).
         let dist = length(uv_pos - vec2<f32>(1.0, 1.0));
-
-        // Gradient intensity: strong near corner, fading out.
-        // The `0.08` controls the radius of the glow.
         let gradient_strength = exp(-dist * dist / 0.08) * 0.15;
 
         // Animated color: slowly rotating between electric cyan (#52E8FF)
         // and azure (#007FFF) over time.
-        let phase: f32 = globals.time * 0.3;  // slow rotation
+        let phase: f32 = globals.time * 0.3;
         let t: f32 = sin(phase) * 0.5 + 0.5;
         let gradient_r: f32 = mix(0.322, 0.0, t) * gradient_strength;
         let gradient_g: f32 = mix(0.910, 0.498, t) * gradient_strength;
         let gradient_b: f32 = gradient_strength;
 
-        bg = vec4<f32>(
-            bg.r + gradient_r,
-            bg.g + gradient_g,
-            bg.b + gradient_b,
-            bg.a,
-        );
+        bg_rgb = bg_rgb + vec3<f32>(gradient_r, gradient_g, gradient_b);
 
-        // Apply content opacity (premultiplied alpha).
-        bg = vec4<f32>(bg.rgb * globals.content_opacity, bg.a * globals.content_opacity);
-        return bg;
+        return vec4<f32>(bg_rgb, globals.content_opacity);
     }
 }
