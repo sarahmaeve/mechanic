@@ -57,6 +57,13 @@ struct AppState {
     /// Current font size in points, tracked so Cmd++/Cmd+-/Cmd+0 can step
     /// relative to the live value (not the config default).
     current_font_size: f32,
+    /// Populated once the child shell has exited and the window is in
+    /// "frozen" state — no further PTY I/O, awaiting user dismissal
+    /// (any printable key, Enter, Esc, Space, or Cmd+W) or respawn
+    /// (Cmd+R).  `None` while the shell is alive.  The inner `Option`
+    /// mirrors [`ProcessOutcome::child_exit`] — `Some(None)` means the
+    /// library-internal `Event::Exit` fired (no status available).
+    exit_status: Option<Option<std::process::ExitStatus>>,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -208,6 +215,7 @@ impl App {
             start_time: now,
             focused: true,
             current_font_size: self.config.font.size,
+            exit_status: None,
         };
 
         self.windows.insert(window_id, state);
@@ -658,7 +666,44 @@ impl ApplicationHandler for App {
 
             // ── Redraw ────────────────────────────────────────────────────────
             WindowEvent::RedrawRequested => {
-                state.terminal.process_input();
+                // Drain PTY bytes, update grid, collect outcome events.
+                let outcome = state.terminal.process_input();
+
+                // If the shell exited this frame, decide close-vs-freeze
+                // and (on freeze) write a banner line the user can read.
+                if let Some(status) = outcome.child_exit {
+                    if state.exit_status.is_none() {
+                        let should_close = match self.config.terminal.close_on_exit {
+                            mechanic_config::CloseOnExitPolicy::Always => true,
+                            // Treat "no status available" (library-internal
+                            // Event::Exit, very rare) as success — nothing
+                            // actually failed, we were just told to leave.
+                            mechanic_config::CloseOnExitPolicy::Success => {
+                                status.is_none_or(|s| s.success())
+                            }
+                            mechanic_config::CloseOnExitPolicy::Never => false,
+                        };
+
+                        log::info!(
+                            "window {id:?} shell exited with {} — {}",
+                            format_exit_status(status),
+                            if should_close { "closing" } else { "freezing" },
+                        );
+
+                        if should_close {
+                            self.close_window(id, event_loop);
+                            return;
+                        }
+
+                        // Frozen path: inject an amber banner line the
+                        // user can read in-grid, and remember the status
+                        // so the keyboard handler can switch to the
+                        // dismissal-key policy.
+                        inject_exit_banner(&mut state.terminal, status);
+                        state.exit_status = Some(status);
+                        state.window.request_redraw();
+                    }
+                }
 
                 let grid = crate::convert::convert_grid(&state.terminal, &self.config.theme);
 
@@ -669,12 +714,17 @@ impl ApplicationHandler for App {
 
                 state.renderer.render(&grid, opacity, time, state.focused);
 
-                let title = state.terminal.title();
-                if !title.is_empty() {
-                    state.window.set_title(title);
-                } else {
-                    state.window.set_title("Mechanic");
-                }
+                // Title: base from the shell's OSC-set title (or "Mechanic"
+                // when unset), suffixed with exit info when the window is
+                // frozen so the user can see exit status at a glance even
+                // when the grid has scrolled past the banner line.
+                let base_title = state.terminal.title();
+                let base = if base_title.is_empty() { "Mechanic" } else { base_title };
+                let title_string = match state.exit_status {
+                    Some(status) => format!("{base} — {}", format_title_suffix(status)),
+                    None => base.to_string(),
+                };
+                state.window.set_title(&title_string);
             }
 
             _ => {}
@@ -684,10 +734,107 @@ impl ApplicationHandler for App {
     /// Called just before the event loop sleeps.
     ///
     /// Request a redraw on every open window so the opacity fade continues
-    /// to animate even when no input events are arriving.
+    /// to animate even when no input events are arriving.  Frozen windows
+    /// (shell has exited, waiting for user dismissal) are skipped — their
+    /// grid is static and the fade animation is meaningless, so rendering
+    /// at 60 fps would burn battery for no visible change.
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         for state in self.windows.values() {
+            if state.exit_status.is_some() {
+                continue;
+            }
             state.window.request_redraw();
+        }
+    }
+}
+
+// ── Exit-banner helpers ───────────────────────────────────────────────────────
+
+/// Write an amber "shell exited" banner into the terminal grid.
+///
+/// Uses [`Terminal::inject_local`] to feed the bytes through the VTE
+/// parser so SGR colour codes render normally and the line ends up in
+/// scrollback like any other shell output.
+///
+/// Sequence breakdown:
+/// - `\r\n` — move to column 0 on a fresh line so we don't overwrite
+///   whatever the shell's last partial line was.
+/// - `\x1b[33m` — amber foreground (SGR 33 = yellow; rendered as
+///   `theme.ansi.yellow` which maps to our `AMBER` constant).
+/// - `\x1b[0m` — reset so subsequent content (if any, e.g. on respawn)
+///   isn't tinted.
+/// - Trailing `\r\n` — cursor lands on the line below for a tidy visual.
+fn inject_exit_banner(terminal: &mut Terminal, status: Option<std::process::ExitStatus>) {
+    let msg = format_banner_message(status);
+    let bytes = format!("\r\n\x1b[33m{msg}\x1b[0m\r\n");
+    terminal.inject_local(bytes.as_bytes());
+}
+
+/// Human-readable banner line shown in the grid on freeze.
+fn format_banner_message(status: Option<std::process::ExitStatus>) -> String {
+    match status {
+        None => "[shell exited — press any key to close, Cmd+R to respawn]".to_string(),
+        Some(s) => {
+            if let Some(code) = s.code() {
+                format!(
+                    "[shell exited with code {code} — press any key to close, Cmd+R to respawn]"
+                )
+            } else {
+                // Unix: the child was killed by a signal rather than exiting normally.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    if let Some(sig) = s.signal() {
+                        return format!(
+                            "[shell killed by signal {sig} — press any key to close, Cmd+R to respawn]"
+                        );
+                    }
+                }
+                "[shell exited abnormally — press any key to close, Cmd+R to respawn]".to_string()
+            }
+        }
+    }
+}
+
+/// Compact title-bar suffix, e.g. `[exit 137]` or `[signal 9]`.
+fn format_title_suffix(status: Option<std::process::ExitStatus>) -> String {
+    match status {
+        None => "[exited]".to_string(),
+        Some(s) => {
+            if let Some(code) = s.code() {
+                format!("[exit {code}]")
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    if let Some(sig) = s.signal() {
+                        return format!("[signal {sig}]");
+                    }
+                }
+                "[exited]".to_string()
+            }
+        }
+    }
+}
+
+/// Long-form exit-status string for the `log::info!` telemetry line —
+/// e.g. `"code 0"`, `"code 137"`, `"signal 9 (SIGKILL)"`, `"no status"`.
+fn format_exit_status(status: Option<std::process::ExitStatus>) -> String {
+    match status {
+        None => "no status".to_string(),
+        Some(s) => {
+            if let Some(code) = s.code() {
+                format!("code {code}")
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    if let Some(sig) = s.signal() {
+                        return format!("signal {sig}");
+                    }
+                }
+                "no code or signal".to_string()
+            }
         }
     }
 }
@@ -766,6 +913,86 @@ mod tests {
         assert!(opacity < 0.95);
         assert!(opacity > 0.80);
     }
+
+    // ── Exit-status formatting ────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    fn status_from_code(code: i32) -> std::process::ExitStatus {
+        // On Unix, a normal exit with code N encodes as the high byte
+        // of the raw status: (code & 0xff) << 8.  wait(2)'s W_EXITCODE
+        // macro.  This matches what ExitStatus::code() will return.
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw((code & 0xff) << 8)
+    }
+
+    #[cfg(unix)]
+    fn status_from_signal(sig: i32) -> std::process::ExitStatus {
+        // Signal-kill encoding: low 7 bits hold the signal number.
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(sig & 0x7f)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn banner_message_for_clean_exit() {
+        let msg = format_banner_message(Some(status_from_code(0)));
+        assert!(msg.contains("code 0"));
+        assert!(msg.contains("press any key"));
+        assert!(msg.contains("Cmd+R"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn banner_message_for_nonzero_exit() {
+        let msg = format_banner_message(Some(status_from_code(137)));
+        assert!(msg.contains("code 137"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn banner_message_for_signal() {
+        // SIGKILL = 9.
+        let msg = format_banner_message(Some(status_from_signal(9)));
+        assert!(msg.contains("signal 9"));
+    }
+
+    #[test]
+    fn banner_message_for_no_status() {
+        // None payload = library-internal Event::Exit, no info available.
+        let msg = format_banner_message(None);
+        assert!(msg.contains("shell exited"));
+        assert!(!msg.contains("code"));
+        assert!(!msg.contains("signal"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn title_suffix_exit_code() {
+        assert_eq!(format_title_suffix(Some(status_from_code(0))), "[exit 0]");
+        assert_eq!(format_title_suffix(Some(status_from_code(1))), "[exit 1]");
+        assert_eq!(format_title_suffix(Some(status_from_code(137))), "[exit 137]");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn title_suffix_signal() {
+        assert_eq!(format_title_suffix(Some(status_from_signal(15))), "[signal 15]");
+    }
+
+    #[test]
+    fn title_suffix_no_status() {
+        assert_eq!(format_title_suffix(None), "[exited]");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn telemetry_exit_status_shapes() {
+        assert_eq!(format_exit_status(Some(status_from_code(0))), "code 0");
+        assert_eq!(format_exit_status(Some(status_from_signal(9))), "signal 9");
+        assert_eq!(format_exit_status(None), "no status");
+    }
+
+    // ── Opacity ───────────────────────────────────────────────────────────────
 
     #[test]
     fn opacity_monotonically_decreases_during_fade() {
