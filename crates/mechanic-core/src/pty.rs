@@ -5,6 +5,7 @@
 //! can read output bytes and write keyboard input.
 
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
 use alacritty_terminal::event::WindowSize;
@@ -21,6 +22,11 @@ use crate::error::TerminalError;
 
 /// Capacity of the channel that carries PTY output bytes to the main thread.
 const CHANNEL_CAPACITY: usize = 256;
+
+/// Counter used to give each PTY reader thread a unique name for debuggers /
+/// Activity Monitor.  `Relaxed` ordering is sufficient — this is purely for
+/// human-readable thread naming, not synchronisation.
+static PTY_READER_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum bytes read from the PTY per iteration.
 const READ_BUF_SIZE: usize = 0x10_0000; // 1 MiB
@@ -93,8 +99,9 @@ impl PtyHandle {
 
     /// Spin up the background reader thread.
     fn start_reader(mut pty: tty::Pty, tx: Sender<Vec<u8>>) -> JoinHandle<()> {
+        let id = PTY_READER_ID.fetch_add(1, Ordering::Relaxed);
         thread::Builder::new()
-            .name("mechanic-pty-reader".to_string())
+            .name(format!("mechanic-pty-reader-{id}"))
             .spawn(move || {
                 let mut buf = vec![0u8; READ_BUF_SIZE];
                 loop {

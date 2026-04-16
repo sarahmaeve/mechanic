@@ -48,13 +48,16 @@ impl EventProxy {
 
     /// Drain all pending events, returning them in arrival order.
     pub fn drain(&self) -> Vec<TerminalEvent> {
-        let mut guard = self.events.lock().expect("EventProxy lock poisoned");
+        // Recovery via `into_inner` is safe: the queue is a plain `Vec` with no
+        // partial-state invariants — the only mutations are `push` and `take`, both
+        // of which leave it in a consistent (possibly empty) state.
+        let mut guard = self.events.lock().unwrap_or_else(|p| p.into_inner());
         std::mem::take(&mut *guard)
     }
 
     /// Push a single event onto the queue.
     fn push(&self, event: TerminalEvent) {
-        let mut guard = self.events.lock().expect("EventProxy lock poisoned");
+        let mut guard = self.events.lock().unwrap_or_else(|p| p.into_inner());
         guard.push(event);
     }
 }
@@ -141,5 +144,30 @@ mod tests {
         proxy.push(TerminalEvent::Bell);
         let events = clone.drain();
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn drain_recovers_after_lock_poison() {
+        use std::sync::Arc;
+
+        let proxy = Arc::new(EventProxy::new());
+
+        // Seed an event before poisoning so we can verify recovery returns it.
+        proxy.push(TerminalEvent::Wakeup);
+
+        // Poison the mutex: spawn a thread that panics while holding the lock.
+        let proxy_clone = Arc::clone(&proxy);
+        let handle = std::thread::spawn(move || {
+            let _guard = proxy_clone.events.lock().unwrap();
+            panic!("intentional poison");
+        });
+        // The join will return an Err because the thread panicked — that's expected.
+        let _ = handle.join();
+
+        // `drain` must not panic even though the lock is poisoned, and must
+        // return the event that was pushed before the poison occurred.
+        let events = proxy.drain();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], TerminalEvent::Wakeup));
     }
 }
