@@ -52,6 +52,15 @@ pub struct GlyphInfo {
 
 // ── TextRenderer ──────────────────────────────────────────────────────────────
 
+/// Key for the fast-path glyph cache, avoiding cosmic-text shaping on every
+/// frame for characters we have already rasterized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CharStyleKey {
+    ch: char,
+    bold: bool,
+    italic: bool,
+}
+
 /// Manages font shaping and GPU glyph atlas upload.
 pub struct TextRenderer {
     font_system: FontSystem,
@@ -62,6 +71,12 @@ pub struct TextRenderer {
     pub atlas_view: wgpu::TextureView,
     /// Map from cosmic-text `CacheKey` to cached `GlyphInfo`.
     atlas_map: HashMap<CacheKey, GlyphInfo>,
+    /// Fast-path cache: `(char, bold, italic)` → `GlyphInfo`.
+    ///
+    /// This lets us skip cosmic-text shaping entirely for characters that
+    /// have already been rasterized.  The shaping step (Buffer + shape) is
+    /// the most expensive part of the per-character path.
+    char_cache: HashMap<CharStyleKey, Option<GlyphInfo>>,
     /// Next free slot index.
     atlas_next_slot: u32,
     /// Total number of slots currently allocated.
@@ -141,6 +156,7 @@ impl TextRenderer {
             atlas_texture,
             atlas_view,
             atlas_map: HashMap::new(),
+            char_cache: HashMap::new(),
             atlas_next_slot: 0,
             atlas_capacity_slots: capacity_slots,
             metrics,
@@ -193,9 +209,10 @@ impl TextRenderer {
                 new_capacity / ATLAS_COLS
             );
             // Re-upload all cached glyphs to the new texture.
-            // In a real renderer you might keep a CPU-side copy; for Phase 1
-            // we simply clear the cache and let glyphs be re-rasterized lazily.
+            // In a real renderer you might keep a CPU-side copy; for now
+            // we simply clear both caches and let glyphs be re-rasterized lazily.
             self.atlas_map.clear();
+            self.char_cache.clear();
             self.atlas_next_slot = 0;
             let _ = queue; // queue not needed for clear
         }
@@ -256,6 +273,12 @@ impl TextRenderer {
             return None;
         }
 
+        // ── Fast-path: return cached result without shaping ──────────────
+        let style_key = CharStyleKey { ch, bold, italic };
+        if let Some(cached) = self.char_cache.get(&style_key) {
+            return *cached;
+        }
+
         // Build a one-character buffer to let cosmic-text shape it and give us
         // the CacheKey.
         //
@@ -284,10 +307,15 @@ impl TextRenderer {
                 run.glyphs.iter().next().map(|glyph| glyph.physical((0.0, 0.0), 1.0).cache_key)
             })
         };
-        let cache_key = cache_key?;
+        let Some(cache_key) = cache_key else {
+            // No glyph found for this character — cache the miss.
+            self.char_cache.insert(style_key, None);
+            return None;
+        };
 
         // Return cached result if already rasterized.
         if let Some(&info) = self.atlas_map.get(&cache_key) {
+            self.char_cache.insert(style_key, Some(info));
             return Some(info);
         }
 
@@ -344,6 +372,7 @@ impl TextRenderer {
             glyph_height: upload_h as f32,
         };
         self.atlas_map.insert(cache_key, info);
+        self.char_cache.insert(style_key, Some(info));
         Some(info)
     }
 }

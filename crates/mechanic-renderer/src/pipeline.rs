@@ -423,9 +423,6 @@ impl RenderState {
                         &self.queue,
                         font_config,
                     ) {
-                        // Re-create bind group if the atlas texture was swapped.
-                        self.update_atlas_bind_group(&text_renderer.atlas_view);
-
                         instances.push(GpuInstance {
                             cell_pos: [col as u32, row as u32],
                             atlas_uv: info.atlas_uv,
@@ -476,6 +473,10 @@ impl RenderState {
                 let _ = cell;
             }
         }
+
+        // ── Update bind group once (atlas may have grown during rasterization) ─
+
+        self.update_atlas_bind_group(&text_renderer.atlas_view);
 
         // ── Upload instances ──────────────────────────────────────────────────
 
