@@ -16,12 +16,8 @@ struct Globals {
     time: f32,
     // Content opacity (activity-based fade).
     content_opacity: f32,
-    // Rotation angle around the vertical axis in radians.  Zero = flat.
-    // Positive tilts the right edge away from the viewer (card-flipping).
-    // Used for the Cmd+` window-cycle animation.
-    tilt_angle: f32,
     // Padding to maintain 16-byte alignment.
-    _pad: f32,
+    _pad: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -110,26 +106,7 @@ fn vs_main(
         -2.0 * px.y / globals.viewport_size.y + 1.0,
     );
 
-    // ── 3D tilt transform ────────────────────────────────────────────────
-    //
-    // Rotate around the vertical (Y) axis through the screen center, then
-    // apply a perspective projection with the camera at z = -focal.  When
-    // tilt_angle is 0 the math reduces to the identity, so the normal
-    // (untilted) rendering path pays no visible cost.
-    //
-    // Used for the Cmd+` window-cycle animation — the window rotates 45°
-    // like a card flipping as focus transitions between Mechanic windows.
-    let c = cos(globals.tilt_angle);
-    let s = sin(globals.tilt_angle);
-    let rotated_x = ndc.x * c;
-    let rotated_z = ndc.x * s;  // +x recedes as tilt grows
-
-    let focal: f32 = 3.0;
-    let persp_w: f32 = focal / (focal + rotated_z);
-    let final_x = rotated_x * persp_w;
-    let final_y = ndc.y * persp_w;
-
-    out.clip_pos = vec4<f32>(final_x, final_y, 0.0, 1.0);
+    out.clip_pos = vec4<f32>(ndc, 0.0, 1.0);
 
     // Map local [0,1]^2 UV → atlas sub-rect UV.
     out.uv = vec2<f32>(

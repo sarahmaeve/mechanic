@@ -52,10 +52,7 @@ struct Globals {
     cell_size: [f32; 2],
     time: f32,
     content_opacity: f32,
-    /// Rotation around the vertical Y-axis in radians; 0 = flat.  Positive
-    /// tilts the right edge away from the viewer (used for Cmd+` animation).
-    tilt_angle: f32,
-    _pad: f32, // keep 16-byte aligned
+    _pad: [f32; 2], // keep 16-byte aligned
 }
 
 // ── RenderState ───────────────────────────────────────────────────────────────
@@ -273,8 +270,7 @@ impl RenderState {
             cell_size: [cell_size.0, cell_size.1],
             time: 0.0,
             content_opacity: 1.0,
-            tilt_angle: 0.0,
-            _pad: 0.0,
+            _pad: [0.0; 2],
         };
 
         let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -398,8 +394,7 @@ impl RenderState {
             cell_size: [self.cell_size.0, self.cell_size.1],
             time: 0.0,
             content_opacity: 1.0,
-            tilt_angle: 0.0,
-            _pad: 0.0,
+            _pad: [0.0; 2],
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
     }
@@ -421,7 +416,6 @@ impl RenderState {
         font_config: &mechanic_config::font::FontConfig,
         content_opacity: f32,
         time: f32,
-        tilt_angle: f32,
     ) {
         // ── Update globals uniform ────────────────────────────────────────────
 
@@ -430,8 +424,7 @@ impl RenderState {
             cell_size: [self.cell_size.0, self.cell_size.1],
             time,
             content_opacity,
-            tilt_angle,
-            _pad: 0.0,
+            _pad: [0.0; 2],
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
