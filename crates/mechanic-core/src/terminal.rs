@@ -23,6 +23,27 @@ use crate::error::TerminalError;
 use crate::event::{EventProxy, TerminalEvent};
 use crate::pty::PtyHandle;
 
+// ── ProcessOutcome ────────────────────────────────────────────────────────────
+
+/// Result of one [`Terminal::process_input`] call.
+///
+/// Summarizes the events that occurred while bytes were being drained
+/// from the PTY and fed to the VTE parser.  The caller uses this to
+/// react to things `process_input` shouldn't decide on its own — such
+/// as whether to close the window on shell exit.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessOutcome {
+    /// `Some(status)` if the child shell process exited during this
+    /// call.  `None` means the shell is still alive (or was already
+    /// dead and the exit event was delivered on a previous call).
+    ///
+    /// The outer `Option` is "did the shell exit during this call".
+    /// The inner `Option<ExitStatus>` mirrors the [`TerminalEvent::Exit`]
+    /// payload — `Some(status)` for a real child exit, `None` for the
+    /// library-internal `AlacrittyEvent::Exit` which carries no status.
+    pub child_exit: Option<Option<std::process::ExitStatus>>,
+}
+
 // ── Bracketed-paste constants ─────────────────────────────────────────────────
 
 /// DECSET 2004 start-of-paste marker, written as a raw byte slice so
@@ -77,8 +98,11 @@ impl Terminal {
 
         let event_proxy = EventProxy::new();
 
-        // Build a `Term` config. We use defaults and can extend later.
-        let term_config = TermConfig::default();
+        // Build a `Term` config, threading the scrollback-lines knob
+        // through from our user-facing `TerminalConfig` into alacritty's
+        // internal config.  Other fields keep alacritty's defaults.
+        let term_config =
+            TermConfig { scrolling_history: config.terminal.scrollback_lines, ..TermConfig::default() };
 
         // Create the alacritty_terminal Term.  It needs a `Dimensions`
         // implementor; we use `alacritty_terminal::event::WindowSize` directly
@@ -94,36 +118,57 @@ impl Terminal {
 
     // ── Input / output ────────────────────────────────────────────────────────
 
-    /// Drain available PTY output and update the terminal grid.
+    /// Drain available PTY output, update the terminal grid, and return
+    /// a [`ProcessOutcome`] summarizing noteworthy events that fired.
     ///
-    /// Should be called from the main thread whenever the render loop wakes
-    /// up.  Processes all bytes currently in the channel, then drains any
-    /// [`TerminalEvent`]s produced (updating the title cache, etc.).
-    pub fn process_input(&mut self) {
+    /// Should be called from the main thread whenever the render loop
+    /// wakes up.  Processes all bytes currently in the channel, then
+    /// drains [`TerminalEvent`]s produced by the parser:
+    ///
+    /// - Title events update the cached title (exposed via [`Terminal::title`]).
+    /// - `Exit` events populate [`ProcessOutcome::child_exit`] so the
+    ///   caller can decide whether to close or freeze the window.
+    /// - `Bell`, `Wakeup`, and `PtyWrite` are currently ignored (they
+    ///   can be surfaced here when the app needs them — wire into
+    ///   `ProcessOutcome`).
+    pub fn process_input(&mut self) -> ProcessOutcome {
         // Drain all pending byte chunks from the reader thread.
         while let Ok(chunk) = self.pty.rx.try_recv() {
             self.parser.advance(&mut self.term, &chunk);
         }
 
-        // Drain terminal events and update our cached title.
+        let mut outcome = ProcessOutcome::default();
+
+        // Drain terminal events and update our cached title.  Exit
+        // events are returned via `outcome` so the caller decides
+        // close-vs-freeze policy.  Multiple Exit events in one call
+        // collapse to the last one seen — a shell can only exit once.
         for event in self.event_proxy.drain() {
             match event {
                 TerminalEvent::TitleChanged(t) => self.title = t,
                 TerminalEvent::TitleReset => self.title.clear(),
-                // Other events (Bell, Wakeup, Exit, PtyWrite) are surfaced to
-                // callers via `poll_events`; we don't need to act on them here.
+                TerminalEvent::Exit(status) => outcome.child_exit = Some(status),
+                // Bell / Wakeup / PtyWrite — not yet plumbed.  Dropping
+                // them here matches previous behaviour.
                 _ => {}
             }
         }
+
+        outcome
     }
 
-    /// Collect and return all pending [`TerminalEvent`]s.
+    /// Feed `data` directly to the VTE parser without writing to the PTY.
     ///
-    /// This includes events that `process_input` did **not** consume
-    /// internally (Bell, Wakeup, Exit, PtyWrite).  Call this after
-    /// `process_input` each frame.
-    pub fn poll_events(&self) -> Vec<TerminalEvent> {
-        self.event_proxy.drain()
+    /// Use this when the terminal emulator itself — not the child shell
+    /// — is the source of bytes to display.  Current callers:
+    ///
+    /// - Exit banners ("[shell exited — press any key to close]")
+    /// - Future: inline preedit display for IME composition
+    ///
+    /// The input is subject to the same ANSI/VTE parsing as PTY output,
+    /// so colours (SGR sequences) and cursor-motion escapes work.
+    pub fn inject_local(&mut self, data: &[u8]) {
+        self.parser.advance(&mut self.term, data);
     }
 
     /// Send keyboard / paste `data` to the PTY.

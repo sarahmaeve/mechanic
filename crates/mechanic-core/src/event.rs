@@ -21,8 +21,14 @@ pub enum TerminalEvent {
     Bell,
     /// New content is ready to render.
     Wakeup,
-    /// The child process has exited.
-    Exit,
+    /// The child shell process has exited.
+    ///
+    /// The payload carries the real exit status when we have one — the
+    /// common case, from `AlacrittyEvent::ChildExit`.  A `None` payload
+    /// corresponds to `AlacrittyEvent::Exit`, a library-internal "please
+    /// exit" signal that carries no status of its own and is rarely seen
+    /// in practice.  Callers usually treat `None` as a successful exit.
+    Exit(Option<std::process::ExitStatus>),
     /// Bytes that the terminal wants written back to the PTY
     /// (e.g. responses to OSC colour queries).
     PtyWrite(Vec<u8>),
@@ -77,12 +83,16 @@ impl AlacrittyEventListener for EventProxy {
             AlacrittyEvent::ResetTitle => self.push(TerminalEvent::TitleReset),
             AlacrittyEvent::Bell => self.push(TerminalEvent::Bell),
             AlacrittyEvent::Wakeup => self.push(TerminalEvent::Wakeup),
-            AlacrittyEvent::Exit => self.push(TerminalEvent::Exit),
+            // `Exit` is a library-internal "please exit" request — no
+            // exit code is available.  `ChildExit(status)` is the real
+            // shell-exited event and carries the status we need for
+            // close-on-zero policy.
+            AlacrittyEvent::Exit => self.push(TerminalEvent::Exit(None)),
+            AlacrittyEvent::ChildExit(status) => self.push(TerminalEvent::Exit(Some(status))),
             AlacrittyEvent::PtyWrite(text) => self.push(TerminalEvent::PtyWrite(text.into_bytes())),
             // Mouse cursor shape changes, clipboard, colour requests, text-area
             // size requests, and cursor-blink changes are currently ignored.
             // They can be wired up when the renderer needs them.
-            AlacrittyEvent::ChildExit(_) => self.push(TerminalEvent::Exit),
             _ => {}
         }
     }
@@ -135,6 +145,34 @@ mod tests {
         let events = proxy.drain();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], TerminalEvent::PtyWrite(b) if b == b"hi"));
+    }
+
+    #[test]
+    fn send_event_library_exit_is_none_payload() {
+        // AlacrittyEvent::Exit is a library-internal request without a
+        // status — we surface it as Exit(None) so callers can tell it
+        // apart from a real child exit.
+        let proxy = EventProxy::new();
+        proxy.send_event(AlacrittyEvent::Exit);
+        let events = proxy.drain();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], TerminalEvent::Exit(None)));
+    }
+
+    #[test]
+    fn send_event_child_exit_carries_status() {
+        // ChildExit(status) must propagate the status so the app layer
+        // can decide whether to close or freeze based on the exit code.
+        use std::os::unix::process::ExitStatusExt as _;
+        let proxy = EventProxy::new();
+        let status = std::process::ExitStatus::from_raw(0);
+        proxy.send_event(AlacrittyEvent::ChildExit(status));
+        let events = proxy.drain();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            TerminalEvent::Exit(Some(s)) => assert!(s.success()),
+            other => panic!("expected Exit(Some(..)), got {other:?}"),
+        }
     }
 
     #[test]
