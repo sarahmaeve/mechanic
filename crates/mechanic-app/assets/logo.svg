@@ -1,62 +1,216 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Mechanic corner logo — stylized arc-reactor / circuit-diagram mark.
+  Mechanic corner logo — busier integrated-circuit style, asymmetric
+  toward the lower-right to match its intended position inside the
+  bottom-right corner gradient of the window.
 
-  Design:
-    • Concentric octagons forming an "arc reactor" core with a filled centre.
-    • 8 traces radiating out at 45° intervals.
-    • Celeste terminal pads at each trace endpoint.
-    • Amber via / junction marks perpendicular to the cardinal traces for
-      a bit of warm-accent contrast against the cyan palette.
+  Composition (density increases toward lower-right):
+    • Upper-left:  sparse — single trace meandering through a capacitor
+    • Upper-right: small secondary IC (IC1) with resistor R1 nearby
+    • Lower-left:  resistor R2 and capacitor C1 on feeder traces
+    • Lower-right: main IC (IC2) with pins on all four sides, connection
+                   pads along the right edge, ground symbol, status LED
+
+  Routing uses Manhattan-style 90° bends (real PCB traces) rather than
+  diagonals, which reads more like a circuit schematic and leaves the
+  diagonal feel for the animated electron pulses in the shader pass.
 
   Colors match mechanic-config/src/theme.rs:
-    electric = #52E8FF, celeste = #ADFFFF, amber = #FFB300
-
-  Rotationally symmetric (8-fold), so it reads correctly in any window corner.
+    electric = #52E8FF   (main outlines, traces)
+    celeste  = #ADFFFF   (highlights, pads, R/C bodies)
+    azure    = #007FFF   (chip internals, secondary detail)
+    amber    = #FFB300   (via dots, warm accents)
+    alert    = #FF4500   (single status LED)
 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"
      fill="none" stroke-linecap="round" stroke-linejoin="round">
 
-  <!-- Outer octagonal ring (arc-reactor shell) -->
-  <polygon points="128,92 153,103 164,128 153,153 128,164 103,153 92,128 103,103"
-           stroke="#52E8FF" stroke-width="3"/>
+  <!-- ── Upper-left: sparse meandering trace ─────────────────────────── -->
 
-  <!-- Inner octagonal ring -->
-  <polygon points="128,106 144,112 150,128 144,144 128,150 112,144 106,128 112,112"
-           stroke="#ADFFFF" stroke-width="2"/>
+  <!-- Solitary origin pad in the far corner -->
+  <circle cx="22" cy="28" r="3" fill="#ADFFFF"/>
 
-  <!-- Central core -->
-  <circle cx="128" cy="128" r="6" fill="#52E8FF"/>
+  <!-- Trace meandering down-right through a capacitor on its way in -->
+  <path d="M 25 28 L 78 28 L 78 56 L 100 56"
+        stroke="#52E8FF" stroke-width="2"/>
 
-  <!-- 8 radiating traces from the outer ring to terminal pads -->
+  <!-- Capacitor C0 (vertical parallel lines) -->
+  <g stroke="#ADFFFF" stroke-width="2">
+    <line x1="100" y1="48" x2="100" y2="64"/>
+    <line x1="106" y1="48" x2="106" y2="64"/>
+  </g>
+  <path d="M 106 56 L 142 56" stroke="#52E8FF" stroke-width="2"/>
+
+  <!-- Via at junction with IC1 feeder -->
+  <circle cx="142" cy="56" r="3" fill="none" stroke="#FFB300" stroke-width="1.5"/>
+  <circle cx="142" cy="56" r="1.5" fill="#FFB300"/>
+
+  <!-- ── Upper-right: secondary IC (IC1) and resistor R1 ─────────────── -->
+
+  <!-- Resistor R1 at top edge -->
+  <rect x="186" y="28" width="40" height="12"
+        stroke="#ADFFFF" stroke-width="2"/>
+  <!-- R1 leads -->
+  <line x1="170" y1="34" x2="186" y2="34" stroke="#52E8FF" stroke-width="2"/>
+  <line x1="226" y1="34" x2="244" y2="34" stroke="#52E8FF" stroke-width="2"/>
+  <!-- R1 right lead terminates in a pad -->
+  <rect x="244" y="31" width="6" height="6" fill="#ADFFFF"/>
+  <!-- R1 left lead drops to IC1 -->
+  <path d="M 170 34 L 170 70" stroke="#52E8FF" stroke-width="2"/>
+
+  <!-- Secondary IC (IC1) -->
+  <rect x="148" y="70" width="48" height="36"
+        stroke="#52E8FF" stroke-width="2"/>
+  <!-- IC1 inner detail -->
+  <rect x="154" y="76" width="36" height="24"
+        stroke="#007FFF" stroke-width="1"/>
+  <line x1="154" y1="88" x2="190" y2="88" stroke="#007FFF" stroke-width="1"/>
+  <!-- IC1 pin-1 indicator dot -->
+  <circle cx="153" cy="75" r="1.5" fill="#52E8FF"/>
+
+  <!-- IC1 pins -->
   <g stroke="#52E8FF" stroke-width="2">
-    <line x1="128" y1="92"  x2="128" y2="28"/>
-    <line x1="153" y1="103" x2="199" y2="57"/>
-    <line x1="164" y1="128" x2="228" y2="128"/>
-    <line x1="153" y1="153" x2="199" y2="199"/>
-    <line x1="128" y1="164" x2="128" y2="228"/>
-    <line x1="103" y1="153" x2="57"  y2="199"/>
-    <line x1="92"  y1="128" x2="28"  y2="128"/>
-    <line x1="103" y1="103" x2="57"  y2="57"/>
+    <!-- top -->
+    <line x1="158" y1="70" x2="158" y2="60"/>
+    <line x1="170" y1="70" x2="170" y2="60"/>
+    <line x1="186" y1="70" x2="186" y2="60"/>
+    <!-- right -->
+    <line x1="196" y1="78" x2="210" y2="78"/>
+    <line x1="196" y1="96" x2="210" y2="96"/>
+    <!-- bottom -->
+    <line x1="158" y1="106" x2="158" y2="118"/>
+    <line x1="186" y1="106" x2="186" y2="118"/>
+    <!-- left -->
+    <line x1="148" y1="88" x2="142" y2="88"/>
   </g>
 
-  <!-- Terminal pads -->
+  <!-- IC1 right pins terminate in pads -->
   <g fill="#ADFFFF">
-    <circle cx="128" cy="28"  r="5"/>
-    <circle cx="199" cy="57"  r="5"/>
-    <circle cx="228" cy="128" r="5"/>
-    <circle cx="199" cy="199" r="5"/>
-    <circle cx="128" cy="228" r="5"/>
-    <circle cx="57"  cy="199" r="5"/>
-    <circle cx="28"  cy="128" r="5"/>
-    <circle cx="57"  cy="57"  r="5"/>
+    <rect x="210" y="75" width="6" height="6"/>
+    <rect x="210" y="93" width="6" height="6"/>
   </g>
 
-  <!-- Amber via marks on the four cardinal traces -->
-  <g stroke="#FFB300" stroke-width="2">
-    <line x1="122" y1="60"  x2="134" y2="60"/>
-    <line x1="196" y1="122" x2="196" y2="134"/>
-    <line x1="122" y1="196" x2="134" y2="196"/>
-    <line x1="60"  y1="122" x2="60"  y2="134"/>
+  <!-- Trace from IC1 left pin connecting up to the capacitor via -->
+  <path d="M 142 88 L 142 56" stroke="#52E8FF" stroke-width="2"/>
+
+  <!-- Trace from IC1 bottom-left pin down into the main-IC area -->
+  <path d="M 158 118 L 158 142 L 130 142"
+        stroke="#52E8FF" stroke-width="2"/>
+  <!-- Amber via on that trace -->
+  <rect x="128" y="140" width="4" height="4" fill="#FFB300"/>
+
+  <!-- Trace from IC1 bottom-right pin down to main IC top -->
+  <path d="M 186 118 L 186 155" stroke="#52E8FF" stroke-width="2"/>
+
+  <!-- ── Lower-left: resistor R2 and capacitor C1 on feeder traces ──── -->
+
+  <!-- Resistor R2 (vertical) -->
+  <rect x="38" y="134" width="12" height="36"
+        stroke="#ADFFFF" stroke-width="2"/>
+  <line x1="44" y1="124" x2="44" y2="134" stroke="#52E8FF" stroke-width="2"/>
+  <line x1="44" y1="170" x2="44" y2="196" stroke="#52E8FF" stroke-width="2"/>
+  <!-- R2 top terminates in a small pad at the top-left edge -->
+  <rect x="41" y="118" width="6" height="6" fill="#ADFFFF"/>
+  <!-- R2 bottom trace turns right toward main IC -->
+  <path d="M 44 196 L 92 196" stroke="#52E8FF" stroke-width="2"/>
+
+  <!-- Capacitor C1 (horizontal parallel lines) on the feeder -->
+  <g stroke="#ADFFFF" stroke-width="2">
+    <line x1="92" y1="189" x2="108" y2="189"/>
+    <line x1="92" y1="203" x2="108" y2="203"/>
   </g>
+  <line x1="92" y1="196" x2="92" y2="189" stroke="#52E8FF" stroke-width="2"/>
+  <line x1="92" y1="196" x2="92" y2="203" stroke="#52E8FF" stroke-width="2"/>
+  <path d="M 108 196 L 140 196" stroke="#52E8FF" stroke-width="2"/>
+
+  <!-- Amber via at feeder-to-IC junction -->
+  <circle cx="140" cy="196" r="3" fill="#FFB300"/>
+
+  <!-- ── Lower-right: main IC cluster ────────────────────────────────── -->
+
+  <!-- Main IC body -->
+  <rect x="150" y="155" width="72" height="62"
+        stroke="#52E8FF" stroke-width="2.5"/>
+
+  <!-- Inner die / core detail -->
+  <rect x="158" y="163" width="56" height="46"
+        stroke="#007FFF" stroke-width="1"/>
+  <line x1="158" y1="186" x2="214" y2="186" stroke="#007FFF" stroke-width="1"/>
+  <line x1="186" y1="163" x2="186" y2="209" stroke="#007FFF" stroke-width="1"/>
+
+  <!-- Pin-1 indicator (upper-left corner dot) -->
+  <circle cx="156" cy="161" r="2" fill="#ADFFFF"/>
+
+  <!-- IC2 pins -->
+  <g stroke="#52E8FF" stroke-width="2">
+    <!-- top pins -->
+    <line x1="164" y1="155" x2="164" y2="142"/>
+    <line x1="180" y1="155" x2="180" y2="130"/>
+    <line x1="196" y1="155" x2="196" y2="142"/>
+    <line x1="210" y1="155" x2="210" y2="130"/>
+    <!-- right pins -->
+    <line x1="222" y1="165" x2="238" y2="165"/>
+    <line x1="222" y1="178" x2="238" y2="178"/>
+    <line x1="222" y1="192" x2="238" y2="192"/>
+    <line x1="222" y1="206" x2="238" y2="206"/>
+    <!-- bottom pins -->
+    <line x1="164" y1="217" x2="164" y2="232"/>
+    <line x1="186" y1="217" x2="186" y2="236"/>
+    <line x1="210" y1="217" x2="210" y2="232"/>
+    <!-- left pins -->
+    <line x1="150" y1="170" x2="140" y2="170"/>
+    <line x1="150" y1="196" x2="140" y2="196"/>
+  </g>
+
+  <!-- Right-edge connection pads (at end of every right pin) -->
+  <g fill="#ADFFFF">
+    <rect x="238" y="162" width="6" height="6"/>
+    <rect x="238" y="175" width="6" height="6"/>
+    <rect x="238" y="189" width="6" height="6"/>
+    <rect x="238" y="203" width="6" height="6"/>
+  </g>
+
+  <!-- Ground symbol on the middle bottom pin -->
+  <g stroke="#ADFFFF" stroke-width="2">
+    <line x1="176" y1="238" x2="196" y2="238"/>
+    <line x1="180" y1="242" x2="192" y2="242"/>
+    <line x1="184" y1="246" x2="188" y2="246"/>
+  </g>
+
+  <!-- Amber status via on one of the right pins -->
+  <rect x="228" y="190" width="4" height="4" fill="#FFB300"/>
+
+  <!-- Red status LED on lower-right of the IC -->
+  <circle cx="210" cy="237" r="3.5" fill="#FF4500"/>
+  <circle cx="210" cy="237" r="3.5" fill="none"
+          stroke="#FF4500" stroke-width="1" opacity="0.5"/>
+
+  <!-- Extra vias along IC internal routing for detail -->
+  <g fill="#ADFFFF">
+    <rect x="171" y="172" width="3" height="3"/>
+    <rect x="199" y="172" width="3" height="3"/>
+    <rect x="171" y="196" width="3" height="3"/>
+    <rect x="199" y="196" width="3" height="3"/>
+  </g>
+
+  <!-- Short stubs on the two short top pins of IC2 ending in tiny pads -->
+  <g fill="#ADFFFF">
+    <rect x="161" y="138" width="6" height="5"/>
+    <rect x="193" y="138" width="6" height="5"/>
+  </g>
+
+  <!-- ── Connecting traces across the board ──────────────────────────── -->
+
+  <!-- Long trace from top-right pad of IC1 over to the top-right pin of IC2 -->
+  <path d="M 216 78 L 228 78 L 228 120 L 210 120 L 210 130"
+        stroke="#52E8FF" stroke-width="2"/>
+
+  <!-- Trace from lower-left IC1 pin already routed above meets IC2 left pin -->
+  <!-- (continuation of the earlier 158,142 → 130,142 stub) -->
+  <path d="M 130 142 L 130 170 L 140 170" stroke="#52E8FF" stroke-width="2"/>
+
+  <!-- Crossing-over bridge marker (small semi-circle) where two traces cross -->
+  <path d="M 125 142 A 4 4 0 0 0 135 142" stroke="#52E8FF"
+        stroke-width="1.5" fill="none"/>
+
 </svg>
