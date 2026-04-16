@@ -1,20 +1,18 @@
 //! Main application state and winit event-loop integration.
 //!
-//! [`App`] implements [`winit::application::ApplicationHandler`] and drives
-//! the entire lifecycle of a Mechanic terminal window:
-//!
-//! - Window creation (on `resumed`)
-//! - Input forwarding to the PTY (on `KeyboardInput`)
-//! - Terminal grid conversion and GPU rendering (on `RedrawRequested`)
-//! - Clean shutdown (on `CloseRequested`)
+//! [`App`] implements [`winit::application::ApplicationHandler`] and owns one
+//! or more terminal windows keyed by [`WindowId`].  Each window has its own
+//! PTY, renderer, and input state.  New windows are spawned via Cmd+N; when
+//! the last window is closed the event loop exits.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use mechanic_config::Config;
 use mechanic_core::{GridColumn, GridLine, GridPoint, GridSide, Terminal, TerminalSize};
 use mechanic_renderer::{CellMetrics, Renderer};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, ModifiersState};
@@ -22,9 +20,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 // ── AppState ──────────────────────────────────────────────────────────────────
 
-/// Per-window state created once the OS has given us a surface.
-///
-/// This is `None` until [`App::resumed`] fires for the first time.
+/// Per-window state — one instance per open Mechanic window.
 struct AppState {
     /// The OS window, shared with the wgpu surface via `Arc`.
     window: Arc<Window>,
@@ -44,7 +40,7 @@ struct AppState {
     clipboard: Option<arboard::Clipboard>,
     /// Instant of the last user interaction (key press, mouse click, etc.).
     last_input_time: std::time::Instant,
-    /// Instant when the application started (used to compute the `time` uniform).
+    /// Instant when this window was created (used to compute the `time` uniform).
     start_time: std::time::Instant,
     /// Whether the window currently has keyboard focus.  When unfocused the
     /// window fades toward `content_idle_opacity`.
@@ -55,21 +51,23 @@ struct AppState {
 
 /// Top-level application struct.
 ///
-/// Constructed before the event loop starts and passed to
-/// [`winit::event_loop::EventLoop::run_app`].
+/// Owns the shared configuration and a map of currently open windows.
 pub struct App {
-    /// User configuration (theme, font, shell).
+    /// User configuration (theme, font, shell) shared by all windows.
     config: Config,
-    /// Present only after the first `resumed` event.
-    state: Option<AppState>,
+    /// All currently open windows, keyed by winit's [`WindowId`].
+    windows: HashMap<WindowId, AppState>,
+    /// Counter used to offset subsequent windows so they don't stack exactly
+    /// on top of the first one.
+    window_count: u32,
 }
 
 impl App {
     /// Create a new `App` with the given configuration.
     ///
-    /// Window and terminal initialisation happen lazily in [`Self::resumed`].
+    /// The first window is created in [`Self::resumed`].
     pub fn new(config: Config) -> Self {
-        Self { config, state: None }
+        Self { config, windows: HashMap::new(), window_count: 0 }
     }
 
     // ── Cell-size helpers ─────────────────────────────────────────────────────
@@ -83,7 +81,6 @@ impl App {
         let columns = ((width as f32) / cw).floor() as usize;
         let rows = ((height as f32) / ch).floor() as usize;
 
-        // Guard against zero sizes which the terminal rejects.
         TerminalSize {
             columns: columns.max(1),
             rows: rows.max(1),
@@ -91,67 +88,33 @@ impl App {
             cell_height: ch as usize,
         }
     }
-}
 
-// ── Grid coordinate helpers ───────────────────────────────────────────────────
+    // ── Window spawning ───────────────────────────────────────────────────────
 
-/// Convert a physical pixel position `(x, y)` to a terminal grid [`GridPoint`]
-/// and the [`GridSide`] within that cell (left or right half).
-///
-/// The side is used by alacritty's selection logic to determine whether the
-/// click is closer to the start or end of the cell.
-fn pixel_to_grid_point(
-    x: f64,
-    y: f64,
-    cell_width: f32,
-    cell_height: f32,
-    cols: usize,
-    rows: usize,
-) -> (GridPoint, GridSide) {
-    let col = (x / cell_width as f64) as usize;
-    let row = (y / cell_height as f64) as usize;
-    let col = col.min(cols.saturating_sub(1));
-    let row = row.min(rows.saturating_sub(1));
-
-    // Side is Left if cursor is in the left half of the cell, Right otherwise.
-    let frac = (x / cell_width as f64).fract();
-    let side = if frac < 0.5 { GridSide::Left } else { GridSide::Right };
-
-    (GridPoint::new(GridLine(row as i32), GridColumn(col)), side)
-}
-
-// ── ApplicationHandler ────────────────────────────────────────────────────────
-
-impl ApplicationHandler for App {
-    /// Called when the application is first started (and on iOS/Android resume).
+    /// Spawn a new Mechanic window with its own PTY, terminal, and renderer.
     ///
-    /// Creates the OS window, spawns the terminal PTY, and initialises the GPU
-    /// renderer.  Skips initialisation if already done (safe re-entry).
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
-            // Already initialised — nothing to do on a spurious resume.
-            return;
-        }
-
-        // ── Create window ─────────────────────────────────────────────────────
-        let attrs = WindowAttributes::default()
+    /// Returns the new window's [`WindowId`] on success.  Logs and returns
+    /// `None` on failure so the caller can decide whether to exit or continue.
+    fn spawn_window(&mut self, event_loop: &ActiveEventLoop) -> Option<WindowId> {
+        // Offset subsequent windows diagonally so new ones are visible behind
+        // the spawning one.  First window (count == 0) uses the default position.
+        let offset = self.window_count.saturating_mul(24) as i32;
+        let mut attrs = WindowAttributes::default()
             .with_title("Mechanic")
             .with_inner_size(LogicalSize::new(1024u32, 768u32))
             .with_transparent(true);
+        if offset > 0 {
+            attrs = attrs.with_position(PhysicalPosition::new(offset, offset));
+        }
 
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
                 log::error!("failed to create window: {e}");
-                event_loop.exit();
-                return;
+                return None;
             }
         };
 
-        // ── Renderer ─────────────────────────────────────────────────────────
-        // `Renderer::new` is async (wgpu adapter/device requests).
-        // Use `pollster::block_on` to drive the future to completion on the
-        // current thread without spawning a runtime.
         let size = window.inner_size();
         let scale_factor = window.scale_factor() as f32;
 
@@ -165,16 +128,11 @@ impl ApplicationHandler for App {
             Ok(r) => r,
             Err(e) => {
                 log::error!("failed to create renderer: {e}");
-                event_loop.exit();
-                return;
+                return None;
             }
         };
 
-        // Query real cell metrics from the renderer so terminal sizing and
-        // resize calculations use the actual font dimensions.
         let cell_metrics = renderer.cell_metrics();
-
-        // ── Terminal ──────────────────────────────────────────────────────────
         let terminal_size =
             Self::terminal_size_from_metrics(size.width, size.height, &cell_metrics);
 
@@ -182,23 +140,18 @@ impl ApplicationHandler for App {
             Ok(t) => t,
             Err(e) => {
                 log::error!("failed to create terminal: {e}");
-                event_loop.exit();
-                return;
+                return None;
             }
         };
 
-        // ── Clipboard ─────────────────────────────────────────────────────────
         let clipboard =
             arboard::Clipboard::new().map_err(|e| log::warn!("clipboard unavailable: {e}")).ok();
 
-        // ── Enable IME ────────────────────────────────────────────────────────
-        // This tells the OS to send Ime::Preedit / Ime::Commit events for
-        // composed characters (accented Latin, CJK input, etc.).
         window.set_ime_allowed(true);
 
-        // ── Store state and request first frame ───────────────────────────────
+        let window_id = window.id();
         let now = std::time::Instant::now();
-        self.state = Some(AppState {
+        let state = AppState {
             window: window.clone(),
             terminal,
             renderer,
@@ -210,27 +163,99 @@ impl ApplicationHandler for App {
             last_input_time: now,
             start_time: now,
             focused: true,
-        });
+        };
+
+        self.windows.insert(window_id, state);
+        self.window_count += 1;
+        window.request_redraw();
+
+        log::info!("spawned window {window_id:?} (total: {})", self.windows.len());
+        Some(window_id)
+    }
+}
+
+// ── Grid coordinate helpers ───────────────────────────────────────────────────
+
+/// Convert a physical pixel position `(x, y)` to a terminal grid [`GridPoint`]
+/// and the [`GridSide`] within that cell (left or right half).
+fn pixel_to_grid_point(
+    x: f64,
+    y: f64,
+    cell_width: f32,
+    cell_height: f32,
+    cols: usize,
+    rows: usize,
+) -> (GridPoint, GridSide) {
+    let col = (x / cell_width as f64) as usize;
+    let row = (y / cell_height as f64) as usize;
+    let col = col.min(cols.saturating_sub(1));
+    let row = row.min(rows.saturating_sub(1));
+
+    let frac = (x / cell_width as f64).fract();
+    let side = if frac < 0.5 { GridSide::Left } else { GridSide::Right };
+
+    (GridPoint::new(GridLine(row as i32), GridColumn(col)), side)
+}
+
+// ── ApplicationHandler ────────────────────────────────────────────────────────
+
+impl ApplicationHandler for App {
+    /// Called when the application is first started (and on iOS/Android resume).
+    ///
+    /// Spawns the initial window the first time it fires.  Later resumes are
+    /// no-ops (we don't want to spawn an extra window every time).
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.windows.is_empty() {
+            return;
+        }
+
+        if self.spawn_window(event_loop).is_none() {
+            event_loop.exit();
+            return;
+        }
 
         // Continuous polling so the fade animation renders smoothly.  With
         // ControlFlow::Wait the event loop can sleep indefinitely when no
         // events arrive, which makes the opacity fade jerky or frozen.
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-
-        window.request_redraw();
     }
 
     /// Handles all windowing events for a single window.
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(state) = self.state.as_mut() else {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Intercept Cmd+N before the per-window state lookup so we can mutate
+        // `self.windows`.  The key event state read doesn't need a window
+        // reference for this shortcut.
+        if let WindowEvent::KeyboardInput { event: ref key_event, .. } = event {
+            if key_event.state == ElementState::Pressed {
+                let modifiers_snapshot = self.windows.get(&id).map(|s| s.modifiers);
+                if let (Some(modifiers), Key::Character(c)) =
+                    (modifiers_snapshot, &key_event.logical_key)
+                {
+                    if modifiers.super_key() && c.as_str() == "n" {
+                        let _ = self.spawn_window(event_loop);
+                        return;
+                    }
+                }
+            }
+        }
+
+        let Some(state) = self.windows.get_mut(&id) else {
             return;
         };
 
         match event {
             // ── Close ─────────────────────────────────────────────────────────
+            //
+            // Remove this window from the map.  When the last window closes
+            // we exit the event loop — Terminal.app and iTerm2 both behave
+            // this way on macOS (closing the last window quits the app).
             WindowEvent::CloseRequested => {
-                log::info!("window close requested — exiting");
-                event_loop.exit();
+                log::info!("window {id:?} close requested");
+                self.windows.remove(&id);
+                if self.windows.is_empty() {
+                    log::info!("all windows closed — exiting");
+                    event_loop.exit();
+                }
             }
 
             // ── Resize ────────────────────────────────────────────────────────
@@ -252,12 +277,7 @@ impl ApplicationHandler for App {
             // ── Window focus changes ──────────────────────────────────────────
             //
             // On blur, kickstart the fade to idle by pretending the last input
-            // happened `fade_begin_secs` ago.  The smoothstep in `compute_opacity`
-            // then takes the window from active down to idle over the remaining
-            // `(fade_end - fade_begin)` seconds.
-            //
-            // On focus, reset the timer so the window snaps back and any
-            // subsequent period of inactivity restarts the fade.
+            // happened `fade_begin_secs` ago.  On focus, reset the timer.
             WindowEvent::Focused(focused) => {
                 state.focused = focused;
                 if focused {
@@ -275,11 +295,11 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 // Handle Cmd+C (copy) and Cmd+V (paste) before the normal
                 // key translation, so these shortcuts are not forwarded to the PTY.
+                // (Cmd+N was handled above, before the state lookup.)
                 if key_event.state == ElementState::Pressed && state.modifiers.super_key() {
                     if let Key::Character(c) = &key_event.logical_key {
                         match c.as_str() {
                             "c" => {
-                                // Copy selected text to the macOS clipboard.
                                 if let Some(text) = state.terminal.selection_text() {
                                     if let Some(cb) = state.clipboard.as_mut() {
                                         if let Err(e) = cb.set_text(text) {
@@ -291,7 +311,6 @@ impl ApplicationHandler for App {
                                 return;
                             }
                             "v" => {
-                                // Paste from the macOS clipboard into the PTY.
                                 let text =
                                     state.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
                                 if let Some(text) = text {
@@ -320,15 +339,11 @@ impl ApplicationHandler for App {
             WindowEvent::Ime(ime_event) => {
                 match ime_event {
                     Ime::Commit(text) => {
-                        // The IME has finalised a composed character (e.g. é, ü, 你好).
-                        // Write the committed text directly to the PTY.
                         if let Err(e) = state.terminal.write_to_pty(text.as_bytes()) {
                             log::warn!("PTY IME commit failed: {e}");
                         }
                     }
                     Ime::Preedit(text, cursor) => {
-                        // Update the IME cursor area so the candidate window
-                        // appears near the terminal cursor, not at (0, 0).
                         let (cx, cy) = {
                             let grid = state.terminal.grid();
                             let cp = grid.cursor.point;
@@ -342,11 +357,6 @@ impl ApplicationHandler for App {
                             LogicalPosition::new(px, py),
                             LogicalSize::new(cw as f64, ch as f64),
                         );
-
-                        // Preedit text display (the inline composition indicator)
-                        // is deferred — for now we just position the candidate
-                        // window.  A full implementation would overlay the preedit
-                        // string at the cursor.
                         let _ = (text, cursor);
                     }
                     Ime::Enabled | Ime::Disabled => {}
@@ -371,7 +381,6 @@ impl ApplicationHandler for App {
                     }
                     ElementState::Released => {
                         state.mouse_pressed = false;
-                        // Selection stays until cleared by a new click or keyboard input.
                     }
                 }
                 state.window.request_redraw();
@@ -411,23 +420,17 @@ impl ApplicationHandler for App {
 
             // ── Redraw ────────────────────────────────────────────────────────
             WindowEvent::RedrawRequested => {
-                // 1. Drain PTY output and update the terminal grid.
                 state.terminal.process_input();
 
-                // 2. Convert the grid to a renderer-friendly snapshot.
                 let grid = crate::convert::convert_grid(&state.terminal, &self.config.theme);
 
-                // 3. Compute activity-based opacity.
                 let elapsed_secs = state.last_input_time.elapsed().as_secs_f32();
                 let opacity = compute_opacity(elapsed_secs, &self.config.theme.opacity);
 
-                // 4. Compute elapsed time since app start for animation.
                 let time = state.start_time.elapsed().as_secs_f32();
 
-                // 5. Submit the frame to the GPU.
                 state.renderer.render(&grid, opacity, time);
 
-                // 6. Update the window title if the terminal has set one.
                 let title = state.terminal.title();
                 if !title.is_empty() {
                     state.window.set_title(title);
@@ -442,10 +445,10 @@ impl ApplicationHandler for App {
 
     /// Called just before the event loop sleeps.
     ///
-    /// For Phase 1 we request continuous redraws so the terminal output is
-    /// always reflected without additional wakeup logic.
+    /// Request a redraw on every open window so the opacity fade continues
+    /// to animate even when no input events are arriving.
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = self.state.as_ref() {
+        for state in self.windows.values() {
             state.window.request_redraw();
         }
     }
@@ -466,9 +469,7 @@ fn compute_opacity(elapsed_secs: f32, config: &mechanic_config::OpacityConfig) -
     } else if elapsed_secs >= end {
         config.content_idle_opacity
     } else {
-        // Smooth ease-in-out interpolation between active and idle.
         let t = (elapsed_secs - begin) / (end - begin);
-        // Smoothstep: 3t² - 2t³
         let smooth_t = t * t * (3.0 - 2.0 * t);
         config.content_active_opacity
             + (config.content_idle_opacity - config.content_active_opacity) * smooth_t
@@ -523,7 +524,6 @@ mod tests {
     #[test]
     fn opacity_midpoint_is_between_active_and_idle() {
         let config = default_opacity();
-        // Halfway through the fade period (45 seconds).
         let opacity = compute_opacity(45.0, &config);
         assert!(opacity < 0.95);
         assert!(opacity > 0.80);
