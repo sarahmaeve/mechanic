@@ -523,15 +523,19 @@ impl ApplicationHandler for App {
                     ElementState::Released => {
                         state.mouse_pressed = false;
                         // Distinguish a click from a drag by how far the
-                        // mouse moved while the button was held.  Anything
-                        // less than half a cell is treated as a pure click.
+                        // mouse moved while the button was held.  5 pixels
+                        // is the typical OS-level click-versus-drag
+                        // threshold — independent of font size, so small
+                        // selections aren't misclassified as clicks (which
+                        // was sending stray arrow-key escape sequences to
+                        // the shell when the drag fell below half a cell).
+                        const CLICK_DRAG_THRESHOLD_PX: f64 = 5.0;
                         let was_drag = state
                             .mouse_press_origin
                             .map(|(ox, oy)| {
                                 let dx = x - ox;
                                 let dy = y - oy;
-                                let threshold = (cw as f64) * 0.5;
-                                (dx * dx + dy * dy).sqrt() > threshold
+                                (dx * dx + dy * dy).sqrt() > CLICK_DRAG_THRESHOLD_PX
                             })
                             .unwrap_or(false);
                         state.mouse_press_origin = None;

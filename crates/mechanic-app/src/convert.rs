@@ -111,8 +111,9 @@ pub fn convert_grid(terminal: &Terminal, theme: &Theme) -> RenderGrid {
     // Applied before the block-cursor recolor so the cursor cell always wins
     // visually — otherwise a selection passing over the cursor cell would
     // paint it with the selection colors and make the cursor disappear.
-    if let Some(sel_range) = terminal.selection_range() {
-        apply_selection_highlight(&mut render_grid, &sel_range, display_offset, cols, rows, theme);
+    let sel_range = terminal.selection_range();
+    if let Some(range) = sel_range.as_ref() {
+        apply_selection_highlight(&mut render_grid, range, display_offset, cols, rows, theme);
     }
 
     // ── Block-cursor cell recolor ─────────────────────────────────────────────
@@ -123,11 +124,23 @@ pub fn convert_grid(terminal: &Terminal, theme: &Theme) -> RenderGrid {
     // character under the cursor visible through the cursor block instead of
     // hiding it behind a solid square.
     //
+    // When the cursor sits *inside* a selection, the celeste cursor color
+    // blends visually with the bright cyan selection highlight.  Switch to
+    // amber in that case so the cursor stays clearly distinguishable.
+    //
     // Bar and Underline cursors don't cover the character, so they remain
     // rendered as separate quads by the pipeline's cursor pass.
     if matches!(render_grid.cursor_style, CursorStyle::Block) {
+        let cursor_in_selection = sel_range.as_ref().is_some_and(|r| {
+            let p = grid.cursor.point;
+            p >= r.start && p <= r.end
+        });
         if let Some(cell) = render_grid.get_mut(cursor_col, cursor_row) {
-            cell.bg = theme.cursor;
+            cell.bg = if cursor_in_selection {
+                mechanic_config::theme::palette::AMBER
+            } else {
+                theme.cursor
+            };
             cell.fg = theme.cursor_text;
         }
     }
