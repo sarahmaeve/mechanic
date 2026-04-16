@@ -12,9 +12,11 @@
 //! specify what they want to override.
 
 pub mod font;
+pub mod terminal;
 pub mod theme;
 
 pub use font::FontConfig;
+pub use terminal::{CloseOnExitPolicy, TerminalConfig};
 pub use theme::{AnsiColors, OpacityConfig, Rgb, SelectionColors, Theme};
 
 use serde::{Deserialize, Serialize};
@@ -65,6 +67,8 @@ pub struct Config {
     pub font: FontConfig,
     /// Shell program to launch.
     pub shell: ShellConfig,
+    /// Terminal behaviour — scrollback, close-on-exit policy, etc.
+    pub terminal: TerminalConfig,
 }
 
 impl Config {
