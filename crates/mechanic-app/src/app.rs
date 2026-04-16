@@ -97,17 +97,70 @@ pub struct App {
     config: Config,
     /// All currently open windows, keyed by winit's [`WindowId`].
     windows: HashMap<WindowId, AppState>,
+    /// Creation order of windows, used by Cmd+[1-9] to pick the Nth window.
+    /// Kept in sync with `windows`: push on spawn, remove on close.
+    window_order: Vec<WindowId>,
     /// Counter used to offset subsequent windows so they don't stack exactly
     /// on top of the first one.
     window_count: u32,
+    /// Instant of the most recent `Focused(false)` event from any Mechanic
+    /// window.  If another Mechanic window receives `Focused(true)` within
+    /// `WINDOW_CYCLE_WINDOW_MS` of this, we treat the pair as a window-to-
+    /// window cycle (Cmd+`, Cmd+[1-9], or a direct click on another window)
+    /// and play the tilt animation on both.
+    last_our_unfocus: Option<std::time::Instant>,
 }
+
+/// How recent the previous Mechanic-window blur must be to count a Focused
+/// event as a window-to-window cycle.
+const WINDOW_CYCLE_WINDOW_MS: u128 = 150;
 
 impl App {
     /// Create a new `App` with the given configuration.
     ///
     /// The first window is created in [`Self::resumed`].
     pub fn new(config: Config) -> Self {
-        Self { config, windows: HashMap::new(), window_count: 0 }
+        Self {
+            config,
+            windows: HashMap::new(),
+            window_order: Vec::new(),
+            window_count: 0,
+            last_our_unfocus: None,
+        }
+    }
+
+    // ── Window management helpers ─────────────────────────────────────────────
+
+    /// Remove a window from both the map and the creation-order list, and
+    /// exit the event loop if no windows remain.
+    fn close_window(&mut self, id: WindowId, event_loop: &ActiveEventLoop) {
+        self.windows.remove(&id);
+        self.window_order.retain(|w| *w != id);
+        if self.windows.is_empty() {
+            log::info!("all windows closed — exiting");
+            event_loop.exit();
+        }
+    }
+
+    /// Focus the Nth Mechanic window (1-indexed) and kick off tilt animations
+    /// on both the outgoing and incoming windows.
+    ///
+    /// Does nothing if `n` is out of range or the target is already focused.
+    fn focus_nth_window(&mut self, current: WindowId, n: usize) {
+        let Some(&target) = self.window_order.get(n.saturating_sub(1)) else {
+            return;
+        };
+        if target == current {
+            return;
+        }
+
+        // Request focus on the target window; macOS will deliver the
+        // Focused(false)/Focused(true) pair that our handler uses to drive
+        // the tilt animations.
+        if let Some(state) = self.windows.get(&target) {
+            state.window.focus_window();
+            state.window.request_redraw();
+        }
     }
 
     // ── Cell-size helpers ─────────────────────────────────────────────────────
@@ -230,6 +283,7 @@ impl App {
         };
 
         self.windows.insert(window_id, state);
+        self.window_order.push(window_id);
         self.window_count += 1;
         window.request_redraw();
 
@@ -286,6 +340,8 @@ impl ApplicationHandler for App {
 
     /// Handles all windowing events for a single window.
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Snapshot values we need while also borrowing `state` mutably later.
+        let total_windows = self.windows.len();
         // Intercept window-management shortcuts (Cmd+N, Cmd+W) before the
         // per-window state lookup so we can mutate `self.windows`.  Both
         // need `&mut self`, which would conflict with a borrowed AppState.
@@ -303,10 +359,19 @@ impl ApplicationHandler for App {
                             }
                             "w" => {
                                 // Close the window that received the event.
-                                self.windows.remove(&id);
-                                if self.windows.is_empty() {
-                                    log::info!("all windows closed — exiting");
-                                    event_loop.exit();
+                                self.close_window(id, event_loop);
+                                return;
+                            }
+                            // Cmd+[1-9] focuses the Nth Mechanic window in
+                            // creation order.  Unlike Cmd+`, which macOS
+                            // intercepts at the NSApplication level before
+                            // we see it, Cmd+digit reaches us reliably and
+                            // gives us a deterministic animation trigger.
+                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+                                if c.chars().all(|ch| ch.is_ascii_digit()) =>
+                            {
+                                if let Ok(n) = c.parse::<usize>() {
+                                    self.focus_nth_window(id, n);
                                 }
                                 return;
                             }
@@ -329,11 +394,7 @@ impl ApplicationHandler for App {
             // this way on macOS (closing the last window quits the app).
             WindowEvent::CloseRequested => {
                 log::info!("window {id:?} close requested");
-                self.windows.remove(&id);
-                if self.windows.is_empty() {
-                    log::info!("all windows closed — exiting");
-                    event_loop.exit();
-                }
+                self.close_window(id, event_loop);
             }
 
             // ── Resize ────────────────────────────────────────────────────────
@@ -358,36 +419,56 @@ impl ApplicationHandler for App {
             // happened `fade_begin_secs` ago.  On focus, reset the timer.
             WindowEvent::Focused(focused) => {
                 state.focused = focused;
-                // If Cmd is held during the focus change, the user is
-                // Cmd+`-cycling between Mechanic windows.  Trigger a 3D
-                // tilt animation — the exiting window tilts away, the
-                // incoming window tilts in from the opposite direction.
-                let cmd_held = state.modifiers.super_key();
                 let tilt_dur = std::time::Duration::from_millis(250);
                 let tilt_target = std::f32::consts::FRAC_PI_4; // 45°
+                let now = std::time::Instant::now();
+
+                // Detect Mechanic-to-Mechanic window cycles by timing.  Relying
+                // on modifier state at the time of the Focused event is
+                // unreliable — by the time macOS delivers the focus event,
+                // the modifier state has often been cleared or the original
+                // Cmd+` keypress never reached our NSView in the first place
+                // (NSApplication handles it before the key event propagates).
+                //
+                // Instead, remember the last instant that any Mechanic window
+                // lost focus.  If another Mechanic window gains focus within
+                // WINDOW_CYCLE_WINDOW_MS of that, treat it as a cycle and
+                // animate the tilt-in.  Always animate the tilt-out — if the
+                // user was switching to another app the animation just plays
+                // as the window loses focus, which is fine.
                 if focused {
-                    state.last_input_time = std::time::Instant::now();
-                    if cmd_held {
+                    state.last_input_time = now;
+
+                    let is_cycle = self
+                        .last_our_unfocus
+                        .is_some_and(|t| t.elapsed().as_millis() < WINDOW_CYCLE_WINDOW_MS);
+                    if is_cycle {
                         state.tilt_animation = Some(TiltAnimation {
-                            start: std::time::Instant::now(),
+                            start: now,
                             duration: tilt_dur,
                             from: -tilt_target, // tilt in from the other side
                             to: 0.0,
                         });
+                        self.last_our_unfocus = None; // consume
                     }
                 } else {
                     let fade_begin = self.config.theme.opacity.fade_begin_secs;
-                    state.last_input_time = std::time::Instant::now()
+                    state.last_input_time = now
                         .checked_sub(std::time::Duration::from_secs(fade_begin as u64))
-                        .unwrap_or_else(std::time::Instant::now);
-                    if cmd_held {
+                        .unwrap_or(now);
+
+                    // Only animate the tilt-out when there's another Mechanic
+                    // window to potentially cycle to.  A single window
+                    // switching focus to another app shouldn't tilt.
+                    if total_windows > 1 {
                         state.tilt_animation = Some(TiltAnimation {
-                            start: std::time::Instant::now(),
+                            start: now,
                             duration: tilt_dur,
                             from: 0.0,
                             to: tilt_target, // tilt the exiting window away
                         });
                     }
+                    self.last_our_unfocus = Some(now);
                 }
                 state.window.request_redraw();
             }
