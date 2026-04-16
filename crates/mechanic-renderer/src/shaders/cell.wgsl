@@ -155,13 +155,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Animated gradient glow in the lower-right corner.
         let uv_pos = in.pixel_pos / globals.viewport_size;
         let dist = length(uv_pos - vec2<f32>(1.0, 1.0));
-        let gradient_strength = exp(-dist * dist / 0.08) * 0.15;
 
-        // Animated color: slowly rotating between electric cyan (#52E8FF)
-        // and azure (#007FFF) over time.  Phase is multiplied by `focused`
-        // so unfocused windows stay at phase = 0 (static color) — avoids
-        // distracting pulses on background / fading windows.
-        let phase: f32 = globals.time * 0.3 * globals.focused;
+        // Breathing brightness oscillation — ±18% around the peak on a
+        // ~3 second cycle.  Gated by `focused` so unfocused windows hold
+        // a constant brightness rather than quietly pulsing in the
+        // background.
+        let breath: f32 = 1.0 + sin(globals.time * 2.1) * 0.18 * globals.focused;
+        let gradient_strength = exp(-dist * dist / 0.08) * 0.22 * breath;
+
+        // Animated color: rotating between electric cyan (#52E8FF) and
+        // azure (#007FFF).  Phase multiplied by `focused` so unfocused
+        // windows freeze at phase = 0 (static midpoint color).
+        let phase: f32 = globals.time * 0.5 * globals.focused;
         let t: f32 = sin(phase) * 0.5 + 0.5;
         let gradient_r: f32 = mix(0.322, 0.0, t) * gradient_strength;
         let gradient_g: f32 = mix(0.910, 0.498, t) * gradient_strength;
@@ -179,9 +184,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         //
         // `logo_opacity` controls how prominent the logo reads against
         // the gradient — 1.0 is full strength, lower values blend in.
-        let logo_size: f32 = 180.0;   // display size in physical pixels
+        let logo_size: f32 = 270.0;   // display size in physical pixels
         let logo_margin: f32 = 16.0;  // inset from the corner
-        let logo_opacity: f32 = 0.85;
+        let logo_opacity: f32 = 0.60;
 
         let logo_br = globals.viewport_size - vec2<f32>(logo_margin, logo_margin);
         let logo_tl = logo_br - vec2<f32>(logo_size, logo_size);
