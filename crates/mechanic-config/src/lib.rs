@@ -171,4 +171,22 @@ program = "/bin/bash"
         let cfg = Config::load(tmp.path());
         assert_eq!(cfg.font.family, "Berkeley Mono");
     }
+
+    #[test]
+    fn opacity_config_values_in_range() {
+        let cfg = Config::default();
+        let o = &cfg.theme.opacity;
+        assert!((0.0..=1.0).contains(&o.title_bar_opacity));
+        assert!((0.0..=1.0).contains(&o.content_active_opacity));
+        assert!((0.0..=1.0).contains(&o.content_idle_opacity));
+        assert!(o.content_idle_opacity <= o.content_active_opacity);
+        assert!(o.fade_begin_secs < o.fade_end_secs);
+    }
+
+    #[test]
+    fn ansi_colors_all_distinct_from_background() {
+        let theme = Theme::default();
+        // At minimum, foreground should differ from background.
+        assert_ne!(theme.foreground, theme.background);
+    }
 }

@@ -129,6 +129,17 @@ impl RenderState {
         let surface_format =
             caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
 
+        // Pick an alpha mode that supports transparency.  PreMultiplied is
+        // ideal (the shader already outputs premultiplied colors), but not
+        // every macOS GPU configuration advertises it.  Fall back gracefully.
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+            wgpu::CompositeAlphaMode::PostMultiplied
+        } else {
+            caps.alpha_modes[0]
+        };
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -136,7 +147,7 @@ impl RenderState {
             height: size.1,
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
-            alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+            alpha_mode,
             view_formats: vec![],
         };
         surface.configure(&device, &surface_config);

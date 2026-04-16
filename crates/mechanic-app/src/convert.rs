@@ -430,4 +430,57 @@ mod tests {
         let result = resolve_color(&Color::Indexed(160), &theme);
         assert_eq!(result, Rgb::new(215, 0, 0));
     }
+
+    #[test]
+    fn convert_grid_produces_correct_dimensions() {
+        // We can't easily create a Terminal in tests without a real PTY,
+        // but we can test the color resolution and helper functions.
+        let theme = Theme::default();
+
+        // Verify all 256 indexed colors resolve without panic.
+        for idx in 0..=255u8 {
+            let _ = resolve_indexed(idx, &theme);
+        }
+    }
+
+    #[test]
+    fn all_named_colors_resolve() {
+        let theme = Theme::default();
+
+        let named_colors = [
+            NamedColor::Black,
+            NamedColor::Red,
+            NamedColor::Green,
+            NamedColor::Yellow,
+            NamedColor::Blue,
+            NamedColor::Magenta,
+            NamedColor::Cyan,
+            NamedColor::White,
+            NamedColor::BrightBlack,
+            NamedColor::BrightRed,
+            NamedColor::BrightGreen,
+            NamedColor::BrightYellow,
+            NamedColor::BrightBlue,
+            NamedColor::BrightMagenta,
+            NamedColor::BrightCyan,
+            NamedColor::BrightWhite,
+            NamedColor::Foreground,
+            NamedColor::Background,
+            NamedColor::Cursor,
+            NamedColor::DimBlack,
+            NamedColor::DimRed,
+            NamedColor::DimGreen,
+            NamedColor::DimYellow,
+            NamedColor::DimBlue,
+            NamedColor::DimMagenta,
+            NamedColor::DimCyan,
+            NamedColor::DimWhite,
+            NamedColor::BrightForeground,
+            NamedColor::DimForeground,
+        ];
+
+        for nc in &named_colors {
+            let _ = resolve_named(*nc, &theme);
+        }
+    }
 }

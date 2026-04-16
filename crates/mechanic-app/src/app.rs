@@ -442,3 +442,69 @@ fn compute_opacity(elapsed_secs: f32, config: &mechanic_config::OpacityConfig) -
             + (config.content_idle_opacity - config.content_active_opacity) * smooth_t
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mechanic_config::OpacityConfig;
+
+    fn default_opacity() -> OpacityConfig {
+        OpacityConfig {
+            title_bar_opacity: 0.95,
+            content_active_opacity: 0.95,
+            content_idle_opacity: 0.80,
+            fade_begin_secs: 30,
+            fade_end_secs: 60,
+        }
+    }
+
+    #[test]
+    fn opacity_active_during_interaction() {
+        let config = default_opacity();
+        let opacity = compute_opacity(0.0, &config);
+        assert!((opacity - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn opacity_still_active_at_fade_begin() {
+        let config = default_opacity();
+        let opacity = compute_opacity(30.0, &config);
+        assert!((opacity - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn opacity_idle_after_fade_end() {
+        let config = default_opacity();
+        let opacity = compute_opacity(60.0, &config);
+        assert!((opacity - 0.80).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn opacity_idle_well_past_fade_end() {
+        let config = default_opacity();
+        let opacity = compute_opacity(300.0, &config);
+        assert!((opacity - 0.80).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn opacity_midpoint_is_between_active_and_idle() {
+        let config = default_opacity();
+        // Halfway through the fade period (45 seconds).
+        let opacity = compute_opacity(45.0, &config);
+        assert!(opacity < 0.95);
+        assert!(opacity > 0.80);
+    }
+
+    #[test]
+    fn opacity_monotonically_decreases_during_fade() {
+        let config = default_opacity();
+        let mut prev = compute_opacity(30.0, &config);
+        for secs in 31..=60 {
+            let current = compute_opacity(secs as f32, &config);
+            assert!(current <= prev, "opacity should decrease: {prev} -> {current} at {secs}s");
+            prev = current;
+        }
+    }
+}

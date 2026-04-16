@@ -301,4 +301,43 @@ mod tests {
         );
         assert!(matches!(result, Err(TerminalError::InvalidSize { .. })));
     }
+
+    #[test]
+    fn terminal_spawns_and_has_grid() {
+        let config = Config::default();
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+
+        // Grid should have the requested dimensions.
+        assert_eq!(term.columns(), 80);
+        assert_eq!(term.screen_lines(), 24);
+
+        // Title starts empty.
+        assert!(term.title().is_empty());
+
+        // Process input should not panic even with no PTY output yet.
+        term.process_input();
+    }
+
+    #[test]
+    fn terminal_resize_updates_dimensions() {
+        let config = Config::default();
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+
+        let new_size = TerminalSize { columns: 120, rows: 40, cell_width: 8, cell_height: 16 };
+        term.resize(new_size);
+        assert_eq!(term.columns(), 120);
+        assert_eq!(term.screen_lines(), 40);
+    }
+
+    #[test]
+    fn terminal_write_to_pty_succeeds() {
+        let config = Config::default();
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+
+        // Writing bytes to the PTY should not fail.
+        term.write_to_pty(b"echo hello\n").expect("PTY write should succeed");
+    }
 }

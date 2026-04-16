@@ -363,4 +363,71 @@ mod tests {
         let bytes: Vec<u8> = s.as_bytes().to_vec();
         assert_eq!(bytes, b"z");
     }
+
+    #[test]
+    fn all_named_keys_do_not_panic() {
+        // Smoke test: calling named_key_bytes with every NamedKey variant
+        // should never panic, even for unhandled keys.
+        let keys = [
+            NamedKey::Space,
+            NamedKey::Enter,
+            NamedKey::Backspace,
+            NamedKey::Tab,
+            NamedKey::Escape,
+            NamedKey::ArrowUp,
+            NamedKey::ArrowDown,
+            NamedKey::ArrowLeft,
+            NamedKey::ArrowRight,
+            NamedKey::Home,
+            NamedKey::End,
+            NamedKey::PageUp,
+            NamedKey::PageDown,
+            NamedKey::Delete,
+            NamedKey::Insert,
+            NamedKey::F1,
+            NamedKey::F2,
+            NamedKey::F3,
+            NamedKey::F4,
+            NamedKey::F5,
+            NamedKey::F6,
+            NamedKey::F7,
+            NamedKey::F8,
+            NamedKey::F9,
+            NamedKey::F10,
+            NamedKey::F11,
+            NamedKey::F12,
+            NamedKey::Shift,
+            NamedKey::Control,
+            NamedKey::Alt,
+            NamedKey::Super,
+            NamedKey::CapsLock,
+            NamedKey::NumLock,
+            NamedKey::ScrollLock,
+            NamedKey::PrintScreen,
+            NamedKey::Pause,
+            NamedKey::ContextMenu,
+        ];
+        for key in &keys {
+            let _ = named_key_bytes(key);
+        }
+    }
+
+    #[test]
+    fn ctrl_char_covers_full_alphabet() {
+        // Every letter a-z should produce a valid control character.
+        for c in 'a'..='z' {
+            let s = c.to_string();
+            let byte = ctrl_char(&s).unwrap_or_else(|| panic!("ctrl_char should handle '{c}'"));
+            assert_eq!(byte, c as u8 - b'a' + 1);
+        }
+    }
+
+    #[test]
+    fn ctrl_char_uppercase_matches_lowercase() {
+        for (lower, upper) in ('a'..='z').zip('A'..='Z') {
+            let lower_s = lower.to_string();
+            let upper_s = upper.to_string();
+            assert_eq!(ctrl_char(&lower_s), ctrl_char(&upper_s));
+        }
+    }
 }
