@@ -14,7 +14,7 @@ pub use grid::{CellFlags, CursorStyle, RenderCell, RenderGrid};
 pub use text::CellMetrics;
 
 use mechanic_config::{font::FontConfig, theme::Theme};
-use pipeline::RenderState;
+use pipeline::{RenderState, init_surface};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use text::TextRenderer;
 
@@ -43,58 +43,32 @@ impl Renderer {
     where
         W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
     {
-        // We need a temporary wgpu device to create the TextRenderer (for
-        // atlas texture creation) before we can create the full RenderState.
-        // Instead, create a temporary device just for font metric extraction,
-        // then create the full RenderState with real CellMetrics.
-        //
-        // Since RenderState creates its own device, we create TextRenderer
-        // after RenderState using its device/queue.
-        let state = RenderState::new(
-            window,
-            size,
-            Self::bootstrap_metrics(&font_config, scale_factor),
-            theme.background,
-        )
-        .await?;
+        // Phase 1: initialise the wgpu device/queue/surface without building
+        // any pipelines — we need the device to create the TextRenderer first.
+        let surface_init = init_surface(window, size).await?;
 
-        let text = TextRenderer::new(&state.device, &state.queue, &font_config, scale_factor);
+        // Phase 2: build the TextRenderer (and its atlas texture) using the
+        // device/queue from phase 1.
+        let text = TextRenderer::new(
+            &surface_init.device,
+            &surface_init.queue,
+            &font_config,
+            scale_factor,
+        );
+
+        // Phase 3: build the full pipeline using the real atlas view.
+        // No dummy texture needed — the bind group is correct from frame 0.
+        let cell_metrics = text.cell_metrics();
+        let atlas_gen = text.atlas_generation();
+        let state = RenderState::new_with_atlas(
+            surface_init,
+            &text.atlas_view,
+            atlas_gen,
+            cell_metrics,
+            theme.background,
+        )?;
 
         Ok(Self { state, text, font_config, scale_factor })
-    }
-
-    /// Compute a bootstrap `CellMetrics` without a GPU device.
-    ///
-    /// This runs cosmic-text font shaping on the CPU to get real metrics,
-    /// then those metrics are passed to `RenderState::new` so the globals
-    /// uniform is correct from the first frame.
-    fn bootstrap_metrics(config: &FontConfig, scale_factor: f32) -> CellMetrics {
-        use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
-
-        let mut font_system = FontSystem::new();
-        let px_size = config.size * scale_factor;
-        let line_height = px_size * 1.3;
-        let metrics = Metrics::new(px_size, line_height);
-
-        let mut buffer = Buffer::new(&mut font_system, metrics);
-        let mut borrow = buffer.borrow_with(&mut font_system);
-        let attrs = Attrs::new().family(cosmic_text::Family::Name(&config.family));
-        borrow.set_text(" ", &attrs, Shaping::Advanced, None);
-        borrow.shape_until_scroll(false);
-
-        let mut cell_width = px_size * 0.6;
-        let mut cell_height = line_height;
-        let mut ascent = px_size * 0.8;
-
-        if let Some(run) = borrow.layout_runs().next() {
-            cell_height = run.line_height;
-            ascent = run.line_y - run.line_top;
-            if let Some(glyph) = run.glyphs.first() {
-                cell_width = glyph.w;
-            }
-        }
-
-        CellMetrics { cell_width, cell_height, ascent }
     }
 
     /// Return the real cell metrics extracted from the font.
@@ -136,6 +110,13 @@ impl Renderer {
             &self.font_config,
             self.scale_factor,
         );
+
+        // The new TextRenderer has a fresh atlas texture — unconditionally
+        // rebuild the bind group so the pipeline points at it, and sync the
+        // stored generation so the per-frame check won't trigger again
+        // immediately.
+        self.state.update_atlas_bind_group(&self.text.atlas_view);
+        self.state.sync_atlas_generation(self.text.atlas_generation());
 
         let metrics = self.text.cell_metrics();
         self.state.set_cell_size((metrics.cell_width, metrics.cell_height));

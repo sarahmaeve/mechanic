@@ -20,4 +20,6 @@ raw-window-handle = "0.6"
 resvg = { version = "0.47", default-features = false }
 
 [dev-dependencies]
+# wgpu 29 does not re-export naga in its public API (no `wgpu::naga` path),
+# so we depend on it directly for the WGSL shader validation test in lib.rs.
 naga = { version = "29", features = ["wgsl-in"] }

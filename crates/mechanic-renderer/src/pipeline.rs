@@ -61,6 +61,15 @@ struct Globals {
 
 // ── RenderState ───────────────────────────────────────────────────────────────
 
+/// Intermediate result of `init_surface`: device/queue/surface ready, but no
+/// pipeline or atlas yet.
+pub struct SurfaceInit {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub surface: wgpu::Surface<'static>,
+    pub surface_config: wgpu::SurfaceConfiguration,
+}
+
 /// Holds all wgpu objects needed to render terminal frames.
 pub struct RenderState {
     pub device: wgpu::Device,
@@ -83,83 +92,106 @@ pub struct RenderState {
     pub size: (u32, u32),
     /// Background clear color.
     pub clear_color: wgpu::Color,
+    /// Atlas generation at the time the bind group was last built.
+    /// When this diverges from `TextRenderer::atlas_generation()` the bind
+    /// group is rebuilt to point at the new atlas texture.
+    last_atlas_generation: u64,
+}
+
+/// Initialise the wgpu instance, adapter, device, queue, and configured
+/// surface — without building any pipelines or textures.
+///
+/// The returned `SurfaceInit` can be used to construct a `TextRenderer` first
+/// (so its atlas view is available), then passed to
+/// `RenderState::new_with_atlas` along with that atlas view.
+///
+/// # Safety
+///
+/// `window` must remain valid for the entire lifetime of the returned
+/// `SurfaceInit::surface` (the `'static` surface lifetime is achieved by
+/// taking ownership of the window handle via `SurfaceTarget::Window`).
+pub async fn init_surface<W>(
+    window: W,
+    size: (u32, u32),
+) -> Result<SurfaceInit, Box<dyn std::error::Error>>
+where
+    W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+{
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::METAL,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+
+    let surface = instance.create_surface(window)?;
+
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        })
+        .await
+        .map_err(|e| format!("no adapter found: {e}"))?;
+
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("mechanic_device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+        })
+        .await?;
+
+    let caps = surface.get_capabilities(&adapter);
+    let surface_format =
+        caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+
+    // Invariant: the fragment shader emits non-premultiplied colors.
+    // PostMultiplied matches that; PreMultiplied would cause double
+    // darkening on drivers that advertise it.  If cell.wgsl is ever
+    // changed to premultiply, flip this preference.
+    log::info!("surface alpha modes available: {:?}", caps.alpha_modes);
+    let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+        wgpu::CompositeAlphaMode::PostMultiplied
+    } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+        wgpu::CompositeAlphaMode::PreMultiplied
+    } else {
+        caps.alpha_modes[0]
+    };
+    log::info!("selected surface alpha mode: {alpha_mode:?}");
+
+    let surface_config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: surface_format,
+        width: size.0,
+        height: size.1,
+        present_mode: wgpu::PresentMode::Fifo,
+        desired_maximum_frame_latency: 2,
+        alpha_mode,
+        view_formats: vec![],
+    };
+    surface.configure(&device, &surface_config);
+
+    Ok(SurfaceInit { device, queue, surface, surface_config })
 }
 
 impl RenderState {
-    /// Create a new `RenderState` from a window.
+    /// Build the wgpu pipeline and initial bind group using the *real* atlas
+    /// view from `TextRenderer`.
     ///
-    /// `cell_metrics` must come from `TextRenderer::cell_metrics()` — they
-    /// provide the real cell dimensions measured from the shaped font.
-    ///
-    /// # Safety
-    ///
-    /// `window` must remain valid for the entire lifetime of the returned
-    /// `RenderState` (the `'static` surface lifetime is achieved by taking
-    /// ownership of the window handle via `SurfaceTarget::Window`).
-    pub async fn new<W>(
-        window: W,
-        size: (u32, u32),
+    /// Call `init_surface` first to obtain a `SurfaceInit`, construct a
+    /// `TextRenderer` with the device/queue it provides, then call this.
+    pub fn new_with_atlas(
+        SurfaceInit { device, queue, surface, surface_config }: SurfaceInit,
+        atlas_view: &wgpu::TextureView,
+        atlas_generation: u64,
         cell_metrics: CellMetrics,
         bg: Rgb,
-    ) -> Result<Self, Box<dyn std::error::Error>>
-    where
-        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
-    {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-
-        let surface = instance.create_surface(window)?;
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|e| format!("no adapter found: {e}"))?;
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("mechanic_device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::default(),
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::default(),
-            })
-            .await?;
-
-        let caps = surface.get_capabilities(&adapter);
-        let surface_format =
-            caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
-
-        // Pick an alpha mode that supports transparency.  PreMultiplied is
-        // ideal (the shader already outputs premultiplied colors), but not
-        // every macOS GPU configuration advertises it.  Fall back gracefully.
-        log::info!("surface alpha modes available: {:?}", caps.alpha_modes);
-        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
-            wgpu::CompositeAlphaMode::PreMultiplied
-        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-            wgpu::CompositeAlphaMode::PostMultiplied
-        } else {
-            caps.alpha_modes[0]
-        };
-        log::info!("selected surface alpha mode: {alpha_mode:?}");
-
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.0,
-            height: size.1,
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
-            alpha_mode,
-            view_formats: vec![],
-        };
-        surface.configure(&device, &surface_config);
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let size = (surface_config.width, surface_config.height);
+        let surface_format = surface_config.format;
 
         // ── Shader ───────────────────────────────────────────────────────────
 
@@ -321,30 +353,15 @@ impl RenderState {
             mapped_at_creation: false,
         });
 
-        // ── Placeholder bind group (atlas filled in later) ────────────────────
-        //
-        // We create a 1×1 dummy texture so the bind group is valid from the
-        // start; it gets replaced by `update_atlas_bind_group`.
-        let dummy_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dummy_atlas"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
         // Rasterize the corner logo SVG once at startup.
         let logo = Logo::new(&device, &queue);
 
+        // Bind group uses the real atlas view — no dummy texture needed.
         let bind_group = Self::make_bind_group(
             &device,
             &bind_group_layout,
             &globals_buf,
-            &dummy_view,
+            atlas_view,
             &sampler,
             &logo.view,
         );
@@ -365,6 +382,7 @@ impl RenderState {
             cell_size,
             size,
             clear_color: background::clear_color(bg),
+            last_atlas_generation: atlas_generation,
         })
     }
 
@@ -413,6 +431,16 @@ impl RenderState {
             &self.sampler,
             &self.logo.view,
         );
+    }
+
+    /// Sync the stored atlas generation to `gen`.
+    ///
+    /// Call this after `update_atlas_bind_group` in contexts where the
+    /// TextRenderer is rebuilt entirely (e.g. `set_font_size`), so the
+    /// per-frame generation check in `render` doesn't trigger a redundant
+    /// bind-group rebuild on the very next frame.
+    pub fn sync_atlas_generation(&mut self, generation: u64) {
+        self.last_atlas_generation = generation;
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -570,9 +598,15 @@ impl RenderState {
             }
         }
 
-        // ── Update bind group once (atlas may have grown during rasterization) ─
-
-        self.update_atlas_bind_group(&text_renderer.atlas_view);
+        // ── Rebuild bind group only when the atlas texture was recreated ─────
+        //
+        // atlas_generation increments each time alloc_slot grows the texture.
+        // Checking here avoids the per-frame bind-group rebuild cost.
+        let current_gen = text_renderer.atlas_generation();
+        if current_gen != self.last_atlas_generation {
+            self.update_atlas_bind_group(&text_renderer.atlas_view);
+            self.last_atlas_generation = current_gen;
+        }
 
         // ── Upload instances ──────────────────────────────────────────────────
 

@@ -8,12 +8,22 @@ use mechanic_config::font::FontConfig;
 
 // ── Atlas constants ───────────────────────────────────────────────────────────
 
-/// Width / height of each glyph slot in the atlas texture (pixels).
-const ATLAS_SLOT_SIZE: u32 = 64;
 /// Number of slots per row in the atlas.
 const ATLAS_COLS: u32 = 16;
 /// Initial number of rows in the atlas (grows on demand).
 const ATLAS_INITIAL_ROWS: u32 = 8;
+
+/// Compute the atlas slot size from the cell dimensions.
+///
+/// Slot must fit the tallest/widest glyph plus italic overhang and
+/// descender margin. 1.5× the max cell dimension is a comfortable
+/// headroom; next_power_of_two for texture-friendly alignment;
+/// floor at 32 so tiny fonts still have a reasonable slot.
+pub fn compute_slot_size(cell_width: f32, cell_height: f32) -> u32 {
+    let max_dim = cell_width.max(cell_height);
+    let padded = (max_dim * 1.5).ceil() as u32;
+    padded.next_power_of_two().max(32)
+}
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -81,6 +91,13 @@ pub struct TextRenderer {
     atlas_next_slot: u32,
     /// Total number of slots currently allocated.
     atlas_capacity_slots: u32,
+    /// Width and height of each glyph slot in the atlas (pixels).
+    /// Computed from cell metrics so large fonts aren't cropped.
+    slot_size: u32,
+    /// Monotonically increasing counter; incremented whenever the atlas
+    /// texture is recreated (i.e., when it grows).  Consumers can compare
+    /// against a stored value to know when to rebuild bind groups.
+    atlas_generation: u64,
     /// Font metrics (size, line height).
     metrics: Metrics,
     /// Real cell metrics derived from a shaped test character.
@@ -89,14 +106,14 @@ pub struct TextRenderer {
 
 impl TextRenderer {
     /// Width of the atlas texture in pixels.
-    pub fn atlas_width() -> u32 {
-        ATLAS_SLOT_SIZE * ATLAS_COLS
+    fn atlas_width(slot_size: u32) -> u32 {
+        slot_size * ATLAS_COLS
     }
 
     /// Current height of the atlas texture in pixels.
-    fn atlas_height(capacity_slots: u32) -> u32 {
+    fn atlas_height(slot_size: u32, capacity_slots: u32) -> u32 {
         let rows = capacity_slots.div_ceil(ATLAS_COLS);
-        rows * ATLAS_SLOT_SIZE
+        rows * slot_size
     }
 
     /// Construct a new `TextRenderer`, loading fonts from `config`.
@@ -179,10 +196,16 @@ impl TextRenderer {
             CellMetrics { cell_width, cell_height, ascent }
         };
 
+        // Slot must fit the tallest/widest glyph plus italic overhang and
+        // descender margin. 1.5× the max cell dimension is a comfortable
+        // headroom; next_power_of_two for texture-friendly alignment;
+        // floor at 32 so tiny fonts still have a reasonable slot.
+        let slot_size = compute_slot_size(cell_metrics.cell_width, cell_metrics.cell_height);
+
         let swash_cache = SwashCache::new();
 
         let capacity_slots = ATLAS_COLS * ATLAS_INITIAL_ROWS;
-        let atlas_texture = Self::create_atlas_texture(device, capacity_slots);
+        let atlas_texture = Self::create_atlas_texture(device, slot_size, capacity_slots);
         let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut renderer = Self {
@@ -194,6 +217,8 @@ impl TextRenderer {
             char_cache: HashMap::new(),
             atlas_next_slot: 0,
             atlas_capacity_slots: capacity_slots,
+            slot_size,
+            atlas_generation: 0,
             metrics,
             cell_metrics,
         };
@@ -209,11 +234,20 @@ impl TextRenderer {
         self.cell_metrics
     }
 
+    /// Return the current atlas generation counter.
+    ///
+    /// This is incremented each time the atlas texture is recreated (grows).
+    /// Consumers can compare against a stored value to know when to rebuild
+    /// bind groups.
+    pub fn atlas_generation(&self) -> u64 {
+        self.atlas_generation
+    }
+
     // ── Atlas texture management ──────────────────────────────────────────────
 
-    fn create_atlas_texture(device: &wgpu::Device, capacity_slots: u32) -> wgpu::Texture {
-        let width = Self::atlas_width();
-        let height = Self::atlas_height(capacity_slots);
+    fn create_atlas_texture(device: &wgpu::Device, slot_size: u32, capacity_slots: u32) -> wgpu::Texture {
+        let width = Self::atlas_width(slot_size);
+        let height = Self::atlas_height(slot_size, capacity_slots);
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph_atlas"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -233,15 +267,17 @@ impl TextRenderer {
         if self.atlas_next_slot >= self.atlas_capacity_slots {
             // Double the capacity.
             let new_capacity = self.atlas_capacity_slots * 2;
-            let new_texture = Self::create_atlas_texture(device, new_capacity);
+            let new_texture = Self::create_atlas_texture(device, self.slot_size, new_capacity);
             let new_view = new_texture.create_view(&wgpu::TextureViewDescriptor::default());
             self.atlas_texture = new_texture;
             self.atlas_view = new_view;
             self.atlas_capacity_slots = new_capacity;
+            self.atlas_generation += 1;
             log::debug!(
-                "Glyph atlas grown to {} slots ({} rows)",
+                "Glyph atlas grown to {} slots ({} rows), generation {}",
                 new_capacity,
-                new_capacity / ATLAS_COLS
+                new_capacity / ATLAS_COLS,
+                self.atlas_generation
             );
             // Re-upload all cached glyphs to the new texture.
             // In a real renderer you might keep a CPU-side copy; for now
@@ -263,13 +299,13 @@ impl TextRenderer {
     }
 
     /// UV rectangle for a given slot covering only the actual glyph bitmap
-    /// (not the full 64×64 slot).
-    fn glyph_uv(slot: u32, glyph_w: u32, glyph_h: u32, capacity_slots: u32) -> [f32; 4] {
+    /// (not the full slot).
+    fn glyph_uv(slot: u32, glyph_w: u32, glyph_h: u32, slot_size: u32, capacity_slots: u32) -> [f32; 4] {
         let (col, row) = Self::slot_to_grid(slot);
-        let atlas_w = Self::atlas_width() as f32;
-        let atlas_h = Self::atlas_height(capacity_slots) as f32;
-        let x0 = (col * ATLAS_SLOT_SIZE) as f32 / atlas_w;
-        let y0 = (row * ATLAS_SLOT_SIZE) as f32 / atlas_h;
+        let atlas_w = Self::atlas_width(slot_size) as f32;
+        let atlas_h = Self::atlas_height(slot_size, capacity_slots) as f32;
+        let x0 = (col * slot_size) as f32 / atlas_w;
+        let y0 = (row * slot_size) as f32 / atlas_h;
         let x1 = x0 + glyph_w as f32 / atlas_w;
         let y1 = y0 + glyph_h as f32 / atlas_h;
         [x0, y0, x1, y1]
@@ -372,15 +408,16 @@ impl TextRenderer {
 
         // Allocate an atlas slot.
         let slot = self.alloc_slot(device, queue);
+        let slot_size = self.slot_size;
 
         let (col, row) = Self::slot_to_grid(slot);
-        let dst_x = col * ATLAS_SLOT_SIZE;
-        let dst_y = row * ATLAS_SLOT_SIZE;
+        let dst_x = col * slot_size;
+        let dst_y = row * slot_size;
 
         // Upload the glyph bitmap.  The data from swash for a Mask glyph is
         // one byte per pixel (alpha).
-        let upload_w = glyph_w.min(ATLAS_SLOT_SIZE);
-        let upload_h = glyph_h.min(ATLAS_SLOT_SIZE);
+        let upload_w = glyph_w.min(slot_size);
+        let upload_h = glyph_h.min(slot_size);
 
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -398,7 +435,7 @@ impl TextRenderer {
             wgpu::Extent3d { width: upload_w, height: upload_h, depth_or_array_layers: 1 },
         );
 
-        let uv = Self::glyph_uv(slot, upload_w, upload_h, self.atlas_capacity_slots);
+        let uv = Self::glyph_uv(slot, upload_w, upload_h, slot_size, self.atlas_capacity_slots);
         let info = GlyphInfo {
             atlas_uv: uv,
             offset_x,
@@ -409,5 +446,39 @@ impl TextRenderer {
         self.atlas_map.insert(cache_key, info);
         self.char_cache.insert(style_key, Some(info));
         Some(info)
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::compute_slot_size;
+
+    #[test]
+    fn slot_size_basic() {
+        // A typical 8×16 cell (narrow/tall monospace): slot must be at least 16.
+        assert!(compute_slot_size(8.0, 16.0) >= 16);
+    }
+
+    #[test]
+    fn slot_size_floor_at_32() {
+        // Even for a small cell, the slot size must be at least 32.
+        assert!(compute_slot_size(8.0, 16.0) >= 32);
+    }
+
+    #[test]
+    fn slot_size_large_font_fits() {
+        // 72pt at 2× = 100px cell_height → slot must accommodate 1.5×.
+        // compute_slot_size(50.0, 100.0): max=100, padded=150 → next_pow2=256.
+        assert!(compute_slot_size(50.0, 100.0) >= 150);
+    }
+
+    #[test]
+    fn slot_size_is_power_of_two() {
+        for &(w, h) in &[(8.0f32, 16.0f32), (10.0, 20.0), (50.0, 100.0), (1.0, 1.0)] {
+            let s = compute_slot_size(w, h);
+            assert_eq!(s & (s - 1), 0, "slot_size({w}, {h}) = {s} is not a power of two");
+        }
     }
 }
