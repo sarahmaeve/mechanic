@@ -151,8 +151,9 @@ pub struct SelectionColors {
 impl Default for SelectionColors {
     fn default() -> Self {
         Self {
-            // A semi-saturated azure at full opacity — distinct yet on-palette.
-            background: palette::AZURE,
+            // Electric cyan background with black text — bright and readable,
+            // same hue family as the foreground so it stays on-palette.
+            background: palette::ELECTRIC,
             foreground: Some(palette::BLACK),
         }
     }

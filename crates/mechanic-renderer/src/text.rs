@@ -123,22 +123,57 @@ impl TextRenderer {
         // Shape a space character to get the monospace advance width and the
         // true line metrics (ascent, line_height).
         let cell_metrics = {
-            let mut buffer = Buffer::new(&mut font_system, metrics);
-            let mut borrow = buffer.borrow_with(&mut font_system);
-            let attrs = Attrs::new().family(cosmic_text::Family::Name(&config.family));
-            borrow.set_text(" ", &attrs, Shaping::Advanced, None);
-            borrow.shape_until_scroll(false);
-
             let mut cell_width = px_size * 0.6; // fallback
             let mut cell_height = line_height; // fallback
             let mut ascent = px_size * 0.8; // fallback
 
-            if let Some(run) = borrow.layout_runs().next() {
-                cell_height = run.line_height;
-                ascent = run.line_y - run.line_top;
-                if let Some(glyph) = run.glyphs.first() {
-                    cell_width = glyph.w;
+            // Shape a single space in a nested scope so the cosmic-text
+            // buffer/borrow release their mutable lease on font_system
+            // before we query fontdb for the resolved face name below.
+            let resolved_font_id: Option<cosmic_text::fontdb::ID> = {
+                let mut buffer = Buffer::new(&mut font_system, metrics);
+                let mut borrow = buffer.borrow_with(&mut font_system);
+                let attrs = Attrs::new().family(cosmic_text::Family::Name(&config.family));
+                borrow.set_text(" ", &attrs, Shaping::Advanced, None);
+                borrow.shape_until_scroll(false);
+
+                let mut found_id = None;
+                if let Some(run) = borrow.layout_runs().next() {
+                    cell_height = run.line_height;
+                    ascent = run.line_y - run.line_top;
+                    if let Some(glyph) = run.glyphs.first() {
+                        cell_width = glyph.w;
+                        found_id = Some(glyph.font_id);
+                    }
                 }
+                found_id
+            };
+
+            // Log which font cosmic-text actually resolved — the requested
+            // family may not be installed, in which case it silently falls
+            // back to another face.  Users see this at RUST_LOG=info.
+            if let Some(id) = resolved_font_id {
+                match font_system.db().face(id) {
+                    Some(face) => {
+                        let resolved_name =
+                            face.families.first().map(|(n, _)| n.as_str()).unwrap_or("<unknown>");
+                        if resolved_name.eq_ignore_ascii_case(&config.family) {
+                            log::info!("font resolved: '{resolved_name}' (matches request)");
+                        } else {
+                            log::warn!(
+                                "font '{}' not found — fell back to '{resolved_name}'",
+                                config.family
+                            );
+                        }
+                    }
+                    None => {
+                        log::warn!(
+                            "font resolution returned id {id:?} but fontdb has no matching face"
+                        );
+                    }
+                }
+            } else {
+                log::warn!("no glyph produced for test character — font loading may have failed");
             }
 
             CellMetrics { cell_width, cell_height, ascent }

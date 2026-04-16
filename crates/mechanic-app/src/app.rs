@@ -34,6 +34,11 @@ struct AppState {
     mouse_position: (f64, f64),
     /// Whether the left mouse button is currently held down.
     mouse_pressed: bool,
+    /// Where the left mouse button was pressed (physical pixels).  Used to
+    /// distinguish a click (no drag) from a click-and-drag when the button
+    /// is released, so a pure click can move the shell cursor instead of
+    /// leaving a single-character selection.
+    mouse_press_origin: Option<(f64, f64)>,
     /// Current keyboard modifier state (updated via `ModifiersChanged`).
     modifiers: ModifiersState,
     /// Clipboard handle for copy/paste operations.
@@ -194,6 +199,7 @@ impl App {
             cell_metrics,
             mouse_position: (0.0, 0.0),
             mouse_pressed: false,
+            mouse_press_origin: None,
             modifiers: ModifiersState::empty(),
             clipboard,
             last_input_time: now,
@@ -399,6 +405,19 @@ impl ApplicationHandler for App {
                                 Self::apply_font_size(state, self.config.font.size);
                                 return;
                             }
+                            "z" => {
+                                // Cmd+Z — undo last edit on the current shell
+                                // input line.  Maps to readline's undo
+                                // (Ctrl+_ = 0x1F), which unwinds recent
+                                // insertions, deletions, pastes, etc.  Only
+                                // affects the line being edited; doesn't
+                                // touch executed commands or scrollback.
+                                if let Err(e) = state.terminal.write_to_pty(b"\x1f") {
+                                    log::warn!("PTY undo write failed: {e}");
+                                }
+                                state.window.request_redraw();
+                                return;
+                            }
                             _ => {}
                         }
                     }
@@ -461,12 +480,59 @@ impl ApplicationHandler for App {
                 match btn_state {
                     ElementState::Pressed => {
                         state.mouse_pressed = true;
+                        state.mouse_press_origin = Some((x, y));
                         state.terminal.start_selection(point, side);
                     }
                     ElementState::Released => {
-                        // Selection persists after release until cleared by a
-                        // new click or keyboard input — matches iTerm2.
                         state.mouse_pressed = false;
+                        // Distinguish a click from a drag by how far the
+                        // mouse moved while the button was held.  Anything
+                        // less than half a cell is treated as a pure click.
+                        let was_drag = state
+                            .mouse_press_origin
+                            .map(|(ox, oy)| {
+                                let dx = x - ox;
+                                let dy = y - oy;
+                                let threshold = (cw as f64) * 0.5;
+                                (dx * dx + dy * dy).sqrt() > threshold
+                            })
+                            .unwrap_or(false);
+                        state.mouse_press_origin = None;
+
+                        if !was_drag {
+                            // Pure click: interpret as "move the shell's
+                            // readline cursor here" when possible.  Only
+                            // works if the terminal is at the live view
+                            // (not scrolled back) and the click is on the
+                            // same row as the shell cursor — otherwise the
+                            // arrow-key trick would just wander into
+                            // arbitrary command history.
+                            state.terminal.clear_selection();
+
+                            let (cursor_row, cursor_col, scrolled) = {
+                                let grid = state.terminal.grid();
+                                let cp = grid.cursor.point;
+                                (cp.line.0, cp.column.0 as i32, grid.display_offset() != 0)
+                            };
+                            let click_row = point.line.0;
+                            let click_col = point.column.0 as i32;
+
+                            if !scrolled && click_row == cursor_row {
+                                let delta = click_col - cursor_col;
+                                if delta != 0 {
+                                    let seq: &[u8] = if delta > 0 { b"\x1b[C" } else { b"\x1b[D" };
+                                    let mut payload = Vec::with_capacity(
+                                        seq.len() * delta.unsigned_abs() as usize,
+                                    );
+                                    for _ in 0..delta.unsigned_abs() {
+                                        payload.extend_from_slice(seq);
+                                    }
+                                    if let Err(e) = state.terminal.write_to_pty(&payload) {
+                                        log::warn!("PTY cursor-move write failed: {e}");
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 state.window.request_redraw();
