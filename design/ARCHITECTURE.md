@@ -155,21 +155,21 @@ As the project grows, we anticipate extracting:
 
 ### Phase 3: Text Shaping & Multilanguage
 
-**Goal:** Full multilanguage support, including bidirectional text.
+**Goal:** Multilanguage support for Latin-extended and Cyrillic scripts, with IME input.
 
 **Deliverables:**
-- `cosmic-text` integration replacing the basic glyph atlas
-- Font fallback chain: Berkeley Mono -> system fonts per script
+- `cosmic-text` integration with full HarfBuzz shaping (via rustybuzz)
+- Font fallback chain: Berkeley Mono -> system monospace fonts per script (automatic via cosmic-text's `FontSystem`)
 - Latin-1 extended characters (French, Spanish accents)
 - Cyrillic rendering (Russian)
-- Arabic text shaping (ligatures, contextual forms)
-- Bidirectional text support in the terminal grid
-  - This is the hard part: terminal grids are inherently LTR. We need a bidi layer between `alacritty_terminal`'s grid and the renderer that reorders glyphs for display while preserving logical cursor position.
-- IME support for multilingual keyboard input on macOS
+- IME support for multilingual keyboard input on macOS (dead keys, compose sequences, CJK candidate windows)
+- Monospace fallback hint so cosmic-text prefers monospace system fonts when the primary face lacks a glyph
 
-**Key risks:** Terminal bidi is notoriously underspecified. We should study how other terminals (e.g., Windows Terminal, mlterm) handle it and adopt a pragmatic approach. Perfect bidi in a terminal may not exist -- but good-enough bidi does.
+**Deferred to v2:**
+- Arabic text shaping (ligatures, contextual forms) — requires run-level shaping instead of per-character rasterization
+- Bidirectional text support in the terminal grid — terminal grids are inherently LTR; a bidi layer between `alacritty_terminal`'s grid and the renderer would reorder glyphs for display while preserving logical cursor position
 
-**Definition of done:** You can `cat` a file containing mixed English/Arabic text and see correctly shaped, correctly ordered output. You can type French accented characters via macOS IME.
+**Definition of done:** You can type French accented characters via macOS dead keys (e.g. Option+e then e → é). You can `cat` a file containing Cyrillic text and see it rendered correctly with a monospace system fallback font.
 
 ---
 

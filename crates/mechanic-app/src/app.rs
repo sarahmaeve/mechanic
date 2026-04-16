@@ -14,8 +14,8 @@ use mechanic_config::Config;
 use mechanic_core::{GridColumn, GridLine, GridPoint, GridSide, Terminal, TerminalSize};
 use mechanic_renderer::{CellMetrics, Renderer};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -183,6 +183,11 @@ impl ApplicationHandler for App {
         let clipboard =
             arboard::Clipboard::new().map_err(|e| log::warn!("clipboard unavailable: {e}")).ok();
 
+        // ── Enable IME ────────────────────────────────────────────────────────
+        // This tells the OS to send Ime::Preedit / Ime::Commit events for
+        // composed characters (accented Latin, CJK input, etc.).
+        window.set_ime_allowed(true);
+
         // ── Store state and request first frame ───────────────────────────────
         self.state = Some(AppState {
             window: window.clone(),
@@ -266,6 +271,44 @@ impl ApplicationHandler for App {
                     if let Err(e) = state.terminal.write_to_pty(&bytes) {
                         log::warn!("PTY write failed: {e}");
                     }
+                }
+                state.window.request_redraw();
+            }
+
+            // ── IME composition ───────────────────────────────────────────────
+            WindowEvent::Ime(ime_event) => {
+                match ime_event {
+                    Ime::Commit(text) => {
+                        // The IME has finalised a composed character (e.g. é, ü, 你好).
+                        // Write the committed text directly to the PTY.
+                        if let Err(e) = state.terminal.write_to_pty(text.as_bytes()) {
+                            log::warn!("PTY IME commit failed: {e}");
+                        }
+                    }
+                    Ime::Preedit(text, cursor) => {
+                        // Update the IME cursor area so the candidate window
+                        // appears near the terminal cursor, not at (0, 0).
+                        let (cx, cy) = {
+                            let grid = state.terminal.grid();
+                            let cp = grid.cursor.point;
+                            (cp.column.0, cp.line.0)
+                        };
+                        let cw = state.cell_metrics.cell_width;
+                        let ch = state.cell_metrics.cell_height;
+                        let px = cx as f64 * cw as f64;
+                        let py = cy as f64 * ch as f64;
+                        state.window.set_ime_cursor_area(
+                            LogicalPosition::new(px, py),
+                            LogicalSize::new(cw as f64, ch as f64),
+                        );
+
+                        // Preedit text display (the inline composition indicator)
+                        // is deferred — for now we just position the candidate
+                        // window.  A full implementation would overlay the preedit
+                        // string at the cursor.
+                        let _ = (text, cursor);
+                    }
+                    Ime::Enabled | Ime::Disabled => {}
                 }
                 state.window.request_redraw();
             }
