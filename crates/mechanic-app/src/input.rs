@@ -129,6 +129,15 @@ pub(crate) fn named_key_bytes(key: &NamedKey) -> Option<Vec<u8>> {
 ///
 /// Returns `None` if the key isn't an arrow or no modifier is held
 /// (the caller falls back to the unmodified `named_key_bytes`).
+///
+/// # Platform note
+///
+/// On macOS, Cmd+Left/Right are consumed by the system's text-input
+/// layer (`interpretKeyEvents` → `moveToBeginningOfLine:`) before winit
+/// sees them.  Those arms are kept for completeness and for use on
+/// non-macOS platforms.  macOS users can use Ctrl+A / Ctrl+E for line
+/// start/end instead — those are raw control characters and bypass
+/// the text-input layer entirely.
 pub(crate) fn modified_arrow(key: &NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
     let is_alt = modifiers.alt_key();
     let is_super = modifiers.super_key();

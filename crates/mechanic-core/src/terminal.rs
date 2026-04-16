@@ -226,9 +226,15 @@ impl Terminal {
 
     // ── History ───────────────────────────────────────────────────────────────
 
-    /// Clear the scrollback buffer (history above the visible viewport).
+    /// Clear the scrollback buffer and the visible screen.
+    ///
+    /// Matches iTerm2's Cmd+K: removes all scrollback history AND sends
+    /// Ctrl+L (form feed) so the shell clears the visible viewport and
+    /// redraws its prompt.  Clearing scrollback alone would be invisible
+    /// to the user since the scrollback isn't rendered.
     pub fn clear_history(&mut self) {
         self.term.grid_mut().clear_history();
+        let _ = self.pty.write(b"\x0c");
     }
 
     // ── Select all ───────────────────────────────────────────────────────────
