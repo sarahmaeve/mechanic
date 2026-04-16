@@ -182,8 +182,8 @@ impl Default for OpacityConfig {
     fn default() -> Self {
         Self {
             title_bar_opacity: 0.95,
-            content_active_opacity: 0.95,
-            content_idle_opacity: 0.80,
+            content_active_opacity: 0.90,
+            content_idle_opacity: 0.75,
             fade_begin_secs: 30,
             fade_end_secs: 60,
         }
@@ -268,8 +268,8 @@ mod tests {
     fn opacity_defaults_are_correct() {
         let op = OpacityConfig::default();
         assert!((op.title_bar_opacity - 0.95).abs() < f32::EPSILON);
-        assert!((op.content_active_opacity - 0.95).abs() < f32::EPSILON);
-        assert!((op.content_idle_opacity - 0.80).abs() < f32::EPSILON);
+        assert!((op.content_active_opacity - 0.90).abs() < f32::EPSILON);
+        assert!((op.content_idle_opacity - 0.75).abs() < f32::EPSILON);
         assert_eq!(op.fade_begin_secs, 30);
         assert_eq!(op.fade_end_secs, 60);
     }

@@ -46,6 +46,9 @@ struct AppState {
     last_input_time: std::time::Instant,
     /// Instant when the application started (used to compute the `time` uniform).
     start_time: std::time::Instant,
+    /// Whether the window currently has keyboard focus.  When unfocused the
+    /// window fades toward `content_idle_opacity`.
+    focused: bool,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -206,7 +209,14 @@ impl ApplicationHandler for App {
             clipboard,
             last_input_time: now,
             start_time: now,
+            focused: true,
         });
+
+        // Continuous polling so the fade animation renders smoothly.  With
+        // ControlFlow::Wait the event loop can sleep indefinitely when no
+        // events arrive, which makes the opacity fade jerky or frozen.
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+
         window.request_redraw();
     }
 
@@ -237,6 +247,28 @@ impl ApplicationHandler for App {
             // ── Modifier keys ─────────────────────────────────────────────────
             WindowEvent::ModifiersChanged(mods) => {
                 state.modifiers = mods.state();
+            }
+
+            // ── Window focus changes ──────────────────────────────────────────
+            //
+            // On blur, kickstart the fade to idle by pretending the last input
+            // happened `fade_begin_secs` ago.  The smoothstep in `compute_opacity`
+            // then takes the window from active down to idle over the remaining
+            // `(fade_end - fade_begin)` seconds.
+            //
+            // On focus, reset the timer so the window snaps back and any
+            // subsequent period of inactivity restarts the fade.
+            WindowEvent::Focused(focused) => {
+                state.focused = focused;
+                if focused {
+                    state.last_input_time = std::time::Instant::now();
+                } else {
+                    let fade_begin = self.config.theme.opacity.fade_begin_secs;
+                    state.last_input_time = std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(fade_begin as u64))
+                        .unwrap_or_else(std::time::Instant::now);
+                }
+                state.window.request_redraw();
             }
 
             // ── Keyboard input ────────────────────────────────────────────────
