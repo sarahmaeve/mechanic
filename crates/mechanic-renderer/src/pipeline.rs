@@ -9,6 +9,7 @@ use wgpu::util::DeviceExt as _;
 use crate::{
     background,
     grid::RenderGrid,
+    logo::Logo,
     text::{CellMetrics, TextRenderer},
 };
 use mechanic_config::theme::Rgb;
@@ -73,6 +74,9 @@ pub struct RenderState {
     instance_buf: wgpu::Buffer,
     instance_capacity: usize,
     sampler: wgpu::Sampler,
+    /// Rasterized corner logo.  Kept here so its texture view stays alive
+    /// for the lifetime of the bind group.
+    logo: Logo,
     /// Cell dimensions in pixels (from real font metrics).
     pub cell_size: (f32, f32),
     /// Current surface size in pixels.
@@ -167,8 +171,9 @@ impl RenderState {
         // ── Bind group layout ─────────────────────────────────────────────────
         //
         // group(0) binding(0) = Globals uniform
-        // group(0) binding(1) = atlas texture
-        // group(0) binding(2) = atlas sampler
+        // group(0) binding(1) = glyph atlas texture
+        // group(0) binding(2) = shared filtering sampler (used by both textures)
+        // group(0) binding(3) = corner logo texture
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cell_bgl"),
@@ -197,6 +202,16 @@ impl RenderState {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -322,8 +337,17 @@ impl RenderState {
         });
         let dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let bind_group =
-            Self::make_bind_group(&device, &bind_group_layout, &globals_buf, &dummy_view, &sampler);
+        // Rasterize the corner logo SVG once at startup.
+        let logo = Logo::new(&device, &queue);
+
+        let bind_group = Self::make_bind_group(
+            &device,
+            &bind_group_layout,
+            &globals_buf,
+            &dummy_view,
+            &sampler,
+            &logo.view,
+        );
 
         Ok(Self {
             device,
@@ -337,6 +361,7 @@ impl RenderState {
             instance_buf,
             instance_capacity: INITIAL_CAPACITY,
             sampler,
+            logo,
             cell_size,
             size,
             clear_color: background::clear_color(bg),
@@ -351,6 +376,7 @@ impl RenderState {
         globals_buf: &wgpu::Buffer,
         atlas_view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
+        logo_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cell_bg"),
@@ -365,11 +391,19 @@ impl RenderState {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(logo_view),
+                },
             ],
         })
     }
 
     /// Rebuild the bind group to point at the current atlas texture view.
+    ///
+    /// Called after the glyph atlas grows — the atlas texture is replaced
+    /// so the bind group's binding 1 needs to be re-pointed.  The logo
+    /// (binding 3) is stable and re-bound from `self.logo`.
     pub fn update_atlas_bind_group(&mut self, atlas_view: &wgpu::TextureView) {
         self.bind_group = Self::make_bind_group(
             &self.device,
@@ -377,6 +411,7 @@ impl RenderState {
             &self.globals_buf,
             atlas_view,
             &self.sampler,
+            &self.logo.view,
         );
     }
 

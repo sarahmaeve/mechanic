@@ -5,6 +5,7 @@
 
 pub mod background;
 pub mod grid;
+pub mod logo;
 pub mod pipeline;
 pub mod text;
 

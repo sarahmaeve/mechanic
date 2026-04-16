@@ -25,6 +25,10 @@ struct Globals {
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var atlas_texture: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
+// Corner logo — rasterized from assets/logo.svg once at startup.
+// Sampled in the background fragment path to overlay the IC mark
+// on top of the animated gradient in the lower-right corner.
+@group(0) @binding(3) var logo_texture: texture_2d<f32>;
 
 // ── Per-instance data ─────────────────────────────────────────────────────────
 //
@@ -164,6 +168,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let gradient_b: f32 = gradient_strength;
 
         bg_rgb = bg_rgb + vec3<f32>(gradient_r, gradient_g, gradient_b);
+
+        // ── Corner logo overlay ───────────────────────────────────────
+        //
+        // Sampled and composited on top of the gradient, anchored to the
+        // lower-right of the viewport with a small margin.  The logo
+        // texture has pre-multiplied alpha (tiny-skia native format), so
+        // we composite with the standard "over" operator:
+        //     out = src + dst * (1 - src.a)
+        //
+        // `logo_opacity` controls how prominent the logo reads against
+        // the gradient — 1.0 is full strength, lower values blend in.
+        let logo_size: f32 = 180.0;   // display size in physical pixels
+        let logo_margin: f32 = 16.0;  // inset from the corner
+        let logo_opacity: f32 = 0.85;
+
+        let logo_br = globals.viewport_size - vec2<f32>(logo_margin, logo_margin);
+        let logo_tl = logo_br - vec2<f32>(logo_size, logo_size);
+        let logo_px = in.pixel_pos - logo_tl;
+
+        if logo_px.x >= 0.0 && logo_px.x < logo_size
+            && logo_px.y >= 0.0 && logo_px.y < logo_size {
+            let logo_uv = logo_px / logo_size;
+            let logo = textureSample(logo_texture, atlas_sampler, logo_uv);
+            let a = logo.a * logo_opacity;
+            bg_rgb = logo.rgb * logo_opacity + bg_rgb * (1.0 - a);
+        }
 
         return vec4<f32>(bg_rgb, globals.content_opacity);
     }
