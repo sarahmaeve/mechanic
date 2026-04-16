@@ -15,7 +15,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, ModifiersState};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 // ── AppState ──────────────────────────────────────────────────────────────────
@@ -361,6 +361,47 @@ impl ApplicationHandler for App {
 
             // ── Keyboard input ────────────────────────────────────────────────
             WindowEvent::KeyboardInput { event: key_event, .. } => {
+                // ── Frozen-window dispatch ────────────────────────────────
+                //
+                // The shell has exited and we're holding the window open for
+                // inspection (per close_on_exit = "success" with non-zero
+                // exit, or "never" policy).  Restrict the keyboard surface
+                // so accidental typing doesn't hit the dead PTY:
+                //
+                // - Cmd+R        → respawn the shell in place.
+                // - Cmd+C / Cmd+A → fall through to their normal handlers
+                //                   so users can copy the final output
+                //                   before dismissing.
+                // - Any printable key, Enter, Esc, or Space → close.
+                // - Cmd+W is handled globally above and already closes.
+                // - Everything else is swallowed.
+                if state.exit_status.is_some() && key_event.state == ElementState::Pressed {
+                    let key = &key_event.logical_key;
+                    let mods = state.modifiers;
+
+                    // Cmd+R — respawn.
+                    if mods.super_key()
+                        && matches!(key, Key::Character(c) if c.as_str() == "r")
+                    {
+                        respawn_shell(state, &self.config, id);
+                        return;
+                    }
+
+                    // Cmd+C / Cmd+A — allow fall-through to normal handling.
+                    let allow_fall_through = mods.super_key()
+                        && matches!(key, Key::Character(c) if matches!(c.as_str(), "c" | "a"));
+
+                    if !allow_fall_through {
+                        // Non-Cmd dismissal key → close the window.
+                        if !mods.super_key() && is_dismissal_key(key) {
+                            self.close_window(id, event_loop);
+                        }
+                        // Non-dismissal, non-allowed-Cmd: swallow.
+                        return;
+                    }
+                    // else: fall through to the Cmd+C / Cmd+A handler below.
+                }
+
                 // Handle Cmd+C (copy) and Cmd+V (paste) before the normal
                 // key translation, so these shortcuts are not forwarded to the PTY.
                 // (Cmd+N was handled above, before the state lookup.)
@@ -748,6 +789,51 @@ impl ApplicationHandler for App {
     }
 }
 
+// ── Frozen-window dismissal / respawn helpers ─────────────────────────────────
+
+/// Which keys close a frozen window.
+///
+/// Matches the spec: any printable key, Enter, Esc, or Space.  Modifier-
+/// only presses (Shift/Ctrl/Alt/Super alone) and non-printable navigation
+/// keys (arrows, F-keys, Home/End, dead keys) are deliberately NOT
+/// dismissal keys — accidental hover-bumps on a modifier key shouldn't
+/// throw away the window's final output.
+///
+/// Space is both a `Key::Character(" ")` on most platforms and
+/// `Key::Named(NamedKey::Space)` on some — we match both to be safe.
+fn is_dismissal_key(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::Character(_) | Key::Named(NamedKey::Enter | NamedKey::Escape | NamedKey::Space)
+    )
+}
+
+/// Respawn the shell inside an already-frozen window.
+///
+/// Constructs a fresh [`Terminal`] with the window's current grid size
+/// and replaces `state.terminal` — the old `Terminal`'s `Drop` handles
+/// the cleanup (its PTY handle closes, its reader thread sees EOF and
+/// exits).  On success, clears the `exit_status` marker so the window
+/// leaves frozen state.
+///
+/// If `Terminal::new` fails we log and leave the window frozen — the
+/// user can Cmd+W to dismiss.
+fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId) {
+    let size = state.terminal.size();
+    match Terminal::new(config, size) {
+        Ok(new_term) => {
+            state.terminal = new_term;
+            state.exit_status = None;
+            state.last_input_time = std::time::Instant::now();
+            state.window.request_redraw();
+            log::info!("window {id:?} shell respawned");
+        }
+        Err(e) => {
+            log::error!("window {id:?} respawn failed: {e}");
+        }
+    }
+}
+
 // ── Exit-banner helpers ───────────────────────────────────────────────────────
 
 /// Write an amber "shell exited" banner into the terminal grid.
@@ -982,6 +1068,61 @@ mod tests {
     #[test]
     fn title_suffix_no_status() {
         assert_eq!(format_title_suffix(None), "[exited]");
+    }
+
+    // ── Frozen-window dismissal ───────────────────────────────────────────────
+
+    #[test]
+    fn dismissal_printable_char() {
+        // Any character-bearing key dismisses — covers letters, digits,
+        // symbols, and Space-as-character on platforms that deliver it that way.
+        assert!(is_dismissal_key(&Key::Character(winit::keyboard::SmolStr::new("a"))));
+        assert!(is_dismissal_key(&Key::Character(winit::keyboard::SmolStr::new("!"))));
+        assert!(is_dismissal_key(&Key::Character(winit::keyboard::SmolStr::new(" "))));
+    }
+
+    #[test]
+    fn dismissal_named_enter_escape_space() {
+        assert!(is_dismissal_key(&Key::Named(NamedKey::Enter)));
+        assert!(is_dismissal_key(&Key::Named(NamedKey::Escape)));
+        assert!(is_dismissal_key(&Key::Named(NamedKey::Space)));
+    }
+
+    #[test]
+    fn modifier_alone_does_not_dismiss() {
+        // A stray bump on Shift / Ctrl / Alt / Super should never throw
+        // the window away.  The user may just be preparing to hit Cmd+C.
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::Shift)));
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::Control)));
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::Alt)));
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::Super)));
+    }
+
+    #[test]
+    fn navigation_keys_do_not_dismiss() {
+        // Arrow / Home / End / Page keys are non-destructive navigation;
+        // they shouldn't close a frozen window since the user might
+        // want to scroll through the final output.
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::ArrowUp)));
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::ArrowDown)));
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::Home)));
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::End)));
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::PageUp)));
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::PageDown)));
+    }
+
+    #[test]
+    fn function_keys_do_not_dismiss() {
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::F1)));
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::F12)));
+    }
+
+    #[test]
+    fn tab_does_not_dismiss() {
+        // Tab is borderline — kitty dismisses on any key, but the spec
+        // here is "printable + Enter/Esc/Space".  Tab isn't printable
+        // in the glyph sense, so it's not a dismissal key.
+        assert!(!is_dismissal_key(&Key::Named(NamedKey::Tab)));
     }
 
     #[cfg(unix)]
