@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mechanic-app",
+    "crates/mechanic-core",
+    "crates/mechanic-renderer",
+    "crates/mechanic-config",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.87"
+
+[workspace.dependencies]
+# Terminal emulation
+alacritty_terminal = "0.26"
+
+# GPU rendering
+wgpu = "29"
+
+# Windowing
+winit = "0.30"
+
+# Text shaping and layout
+cosmic-text = "0.18"
+
+# Serialization / configuration
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Concurrency
+crossbeam-channel = "0.5"
+
+# Async executor (used to drive wgpu init on the main thread)
+pollster = "0.4"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# System
+libc = "0.2"
+
+# Internal crates
+mechanic-core = { path = "crates/mechanic-core" }
+mechanic-renderer = { path = "crates/mechanic-renderer" }
+mechanic-config = { path = "crates/mechanic-config" }

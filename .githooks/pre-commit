@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# Mechanic pre-commit hook
+# Runs cargo fmt check, clippy, and tests before allowing a commit.
+#
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+echo -e "${YELLOW}Running pre-commit checks...${NC}"
+
+# Only check Rust files and Cargo manifests -- skip hook entirely if none are staged.
+RUST_STAGED=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' 'Cargo.toml' 'Cargo.lock' || true)
+if [ -z "$RUST_STAGED" ]; then
+    echo -e "${GREEN}No Rust files staged -- skipping checks.${NC}"
+    exit 0
+fi
+
+# 1. Formatting
+echo -e "${YELLOW}[1/3] cargo fmt --check${NC}"
+if ! cargo fmt --all -- --check 2>&1; then
+    echo -e "${RED}Formatting check failed. Run 'cargo fmt' and re-stage.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}  fmt OK${NC}"
+
+# 2. Clippy
+echo -e "${YELLOW}[2/3] cargo clippy${NC}"
+if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1; then
+    echo -e "${RED}Clippy found warnings treated as errors. Fix them and re-stage.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}  clippy OK${NC}"
+
+# 3. Tests
+echo -e "${YELLOW}[3/3] cargo test${NC}"
+if ! cargo test --all 2>&1; then
+    echo -e "${RED}Tests failed. Fix them and re-stage.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}  tests OK${NC}"
+
+echo -e "${GREEN}All pre-commit checks passed.${NC}"

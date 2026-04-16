@@ -1,0 +1,21 @@
+[package]
+name = "mechanic-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mechanic"
+path = "src/main.rs"
+
+[dependencies]
+alacritty_terminal.workspace = true
+winit.workspace = true
+pollster.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+env_logger.workspace = true
+mechanic-core.workspace = true
+mechanic-renderer.workspace = true
+mechanic-config.workspace = true

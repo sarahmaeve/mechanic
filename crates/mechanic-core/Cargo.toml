@@ -1,0 +1,13 @@
+[package]
+name = "mechanic-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+crossbeam-channel.workspace = true
+libc.workspace = true
+log.workspace = true
+mechanic-config.workspace = true
