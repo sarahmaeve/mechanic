@@ -229,9 +229,9 @@ impl Default for Theme {
             foreground: palette::ELECTRIC,
             background: palette::BLACK,
             cursor: palette::CELESTE,
-            // Amber reads clearly against the bright celeste cursor block
-            // and matches the Stark palette's warm-accent hue.
-            cursor_text: palette::AMBER,
+            // Black under the celeste cursor block — highest contrast,
+            // clearest read at a glance.
+            cursor_text: palette::BLACK,
             ansi: AnsiColors::default(),
             selection: SelectionColors::default(),
             opacity: OpacityConfig::default(),

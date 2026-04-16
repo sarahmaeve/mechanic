@@ -439,6 +439,28 @@ impl ApplicationHandler for App {
                 }
 
                 state.last_input_time = std::time::Instant::now();
+
+                // If there's an active selection and the user pressed Escape,
+                // collapse the selection rather than forwarding Esc to the
+                // PTY.  This matches iTerm2 / Terminal.app behavior: hitting
+                // Escape with a selection clears it without interrupting
+                // shell apps that consume Escape (vim, less, etc.) — those
+                // apps never see the Escape in this case, which they
+                // wouldn't want to handle as a mode-exit with selection
+                // present anyway.  Without a selection, Escape falls through
+                // to translate_key and is sent to the PTY as usual.
+                if key_event.state == ElementState::Pressed
+                    && matches!(
+                        &key_event.logical_key,
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+                    )
+                    && state.terminal.selection_range().is_some()
+                {
+                    state.terminal.clear_selection();
+                    state.window.request_redraw();
+                    return;
+                }
+
                 if let Some(bytes) = crate::input::translate_key(&key_event, state.modifiers) {
                     if let Err(e) = state.terminal.write_to_pty(&bytes) {
                         log::warn!("PTY write failed: {e}");
