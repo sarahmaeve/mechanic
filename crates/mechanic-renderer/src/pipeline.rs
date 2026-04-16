@@ -52,7 +52,10 @@ struct Globals {
     cell_size: [f32; 2],
     time: f32,
     content_opacity: f32,
-    _pad: [f32; 2], // keep 16-byte aligned
+    /// 1.0 when the window has keyboard focus, 0.0 when blurred.  Gates the
+    /// corner-gradient color pulse so unfocused/faded windows stay static.
+    focused: f32,
+    _pad: f32, // keep 16-byte aligned
 }
 
 // ── RenderState ───────────────────────────────────────────────────────────────
@@ -270,7 +273,8 @@ impl RenderState {
             cell_size: [cell_size.0, cell_size.1],
             time: 0.0,
             content_opacity: 1.0,
-            _pad: [0.0; 2],
+            focused: 1.0,
+            _pad: 0.0,
         };
 
         let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -394,7 +398,8 @@ impl RenderState {
             cell_size: [self.cell_size.0, self.cell_size.1],
             time: 0.0,
             content_opacity: 1.0,
-            _pad: [0.0; 2],
+            focused: 1.0,
+            _pad: 0.0,
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
     }
@@ -416,6 +421,7 @@ impl RenderState {
         font_config: &mechanic_config::font::FontConfig,
         content_opacity: f32,
         time: f32,
+        focused: bool,
     ) {
         // ── Update globals uniform ────────────────────────────────────────────
 
@@ -424,7 +430,8 @@ impl RenderState {
             cell_size: [self.cell_size.0, self.cell_size.1],
             time,
             content_opacity,
-            _pad: [0.0; 2],
+            focused: if focused { 1.0 } else { 0.0 },
+            _pad: 0.0,
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 

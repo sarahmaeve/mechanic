@@ -637,7 +637,7 @@ impl ApplicationHandler for App {
 
                 let time = state.start_time.elapsed().as_secs_f32();
 
-                state.renderer.render(&grid, opacity, time);
+                state.renderer.render(&grid, opacity, time, state.focused);
 
                 let title = state.terminal.title();
                 if !title.is_empty() {

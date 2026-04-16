@@ -16,8 +16,10 @@ struct Globals {
     time: f32,
     // Content opacity (activity-based fade).
     content_opacity: f32,
-    // Padding to maintain 16-byte alignment.
-    _pad: vec2<f32>,
+    // 1.0 when the window has keyboard focus, 0.0 when blurred.  Used to
+    // freeze the corner-gradient color pulse on unfocused windows.
+    focused: f32,
+    _pad: f32,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -152,8 +154,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let gradient_strength = exp(-dist * dist / 0.08) * 0.15;
 
         // Animated color: slowly rotating between electric cyan (#52E8FF)
-        // and azure (#007FFF) over time.
-        let phase: f32 = globals.time * 0.3;
+        // and azure (#007FFF) over time.  Phase is multiplied by `focused`
+        // so unfocused windows stay at phase = 0 (static color) — avoids
+        // distracting pulses on background / fading windows.
+        let phase: f32 = globals.time * 0.3 * globals.focused;
         let t: f32 = sin(phase) * 0.5 + 0.5;
         let gradient_r: f32 = mix(0.322, 0.0, t) * gradient_strength;
         let gradient_g: f32 = mix(0.910, 0.498, t) * gradient_strength;
