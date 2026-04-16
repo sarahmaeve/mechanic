@@ -39,6 +39,10 @@ struct AppState {
     /// is released, so a pure click can move the shell cursor instead of
     /// leaving a single-character selection.
     mouse_press_origin: Option<(f64, f64)>,
+    /// X11-style "primary" selection — populated automatically whenever
+    /// the user finishes a drag-select, separate from the macOS clipboard.
+    /// Pasted by middle-click without needing an explicit Cmd+C step.
+    primary_selection: Option<String>,
     /// Current keyboard modifier state (updated via `ModifiersChanged`).
     modifiers: ModifiersState,
     /// Clipboard handle for copy/paste operations.
@@ -200,6 +204,7 @@ impl App {
             mouse_position: (0.0, 0.0),
             mouse_pressed: false,
             mouse_press_origin: None,
+            primary_selection: None,
             modifiers: ModifiersState::empty(),
             clipboard,
             last_input_time: now,
@@ -580,10 +585,46 @@ impl ApplicationHandler for App {
                                     }
                                 }
                             }
+                        } else {
+                            // Drag completed.  Capture the selected text into
+                            // the X11-style "primary" buffer so middle-click
+                            // can paste it without an explicit Cmd+C.  The
+                            // macOS clipboard is left alone.
+                            state.primary_selection = state.terminal.selection_text();
                         }
                     }
                 }
                 state.window.request_redraw();
+            }
+
+            // ── Middle-click paste (X11 primary-selection model) ──────────────
+            //
+            // Pastes the most recently drag-selected text — captured into
+            // `primary_selection` automatically when a drag completes.  Does
+            // NOT touch the macOS clipboard, so Cmd+V / Cmd+C still work
+            // independently with their own buffer.  Bracketed-paste is
+            // applied when the shell has it enabled (matches Cmd+V).
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                if let Some(text) = state.primary_selection.as_ref() {
+                    let payload: Vec<u8> = if state.terminal.bracketed_paste() {
+                        let mut v = Vec::with_capacity(text.len() + 12);
+                        v.extend_from_slice(b"\x1b[200~");
+                        v.extend_from_slice(text.as_bytes());
+                        v.extend_from_slice(b"\x1b[201~");
+                        v
+                    } else {
+                        text.clone().into_bytes()
+                    };
+                    if let Err(e) = state.terminal.write_to_pty(&payload) {
+                        log::warn!("PTY middle-click paste failed: {e}");
+                    }
+                    state.last_input_time = std::time::Instant::now();
+                    state.window.request_redraw();
+                }
             }
 
             // ── Cursor movement ───────────────────────────────────────────────
