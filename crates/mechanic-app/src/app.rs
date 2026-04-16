@@ -7,16 +7,43 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use mechanic_config::Config;
-use mechanic_core::{GridColumn, GridLine, GridPoint, GridSide, Terminal, TerminalSize};
+use mechanic_core::{GridColumn, GridLine, GridPoint, GridSide, PtyWaker, Terminal, TerminalSize};
 use mechanic_renderer::{CellMetrics, Renderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
+
+// ── Frame timing ──────────────────────────────────────────────────────────────
+
+/// Target interval between animation frames (~30 FPS).
+///
+/// 30 FPS is visually indistinguishable from 60 FPS for the animations
+/// we run (opacity fade over 30 s, corner gradient oscillation with a
+/// 3-s period, electron pulses with 2–3 s periods — all far too slow
+/// for the extra frames to matter) while halving the CPU/GPU cost.
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+// ── User events ───────────────────────────────────────────────────────────────
+
+/// Events the main event loop receives from other threads.
+///
+/// `winit::EventLoopProxy::send_event` is the only cross-thread wake
+/// mechanism winit provides.  We use it so the main loop can sleep on
+/// `ControlFlow::Wait` at idle and still get woken promptly by PTY
+/// output from the reader threads.
+#[derive(Debug, Clone)]
+pub enum UserEvent {
+    /// The reader thread for `WindowId`'s PTY sent bytes to the
+    /// channel — please redraw so `process_input` drains them and the
+    /// glyphs appear this frame rather than the next polling tick.
+    PtyOutput(WindowId),
+}
 
 // ── AppState ──────────────────────────────────────────────────────────────────
 
@@ -76,14 +103,39 @@ pub struct App {
     config: Config,
     /// All currently open windows, keyed by winit's [`WindowId`].
     windows: HashMap<WindowId, AppState>,
+    /// Event-loop proxy cloned into PTY reader threads so they can
+    /// wake the main loop via `UserEvent::PtyOutput` when new bytes
+    /// arrive.  Cheap to clone (internally an `Arc`).
+    proxy: EventLoopProxy<UserEvent>,
+    /// Master switch for time-based visual effects.  `false` when the
+    /// user passed `--no-animation`.  When off: opacity stays at
+    /// `content_active_opacity` forever (no fade), the shader's
+    /// `focused` uniform is forced to `0.0` (freezing the corner
+    /// gradient and electron pulses), and `about_to_wait` never asks
+    /// for periodic redraws — the loop sleeps entirely until input
+    /// or PTY output arrives.
+    animate: bool,
 }
 
 impl App {
     /// Create a new `App` with the given configuration.
     ///
+    /// `proxy` is the event-loop proxy used by PTY reader threads to
+    /// wake the main loop.  `animate` controls time-based visual
+    /// effects (`false` when `--no-animation` was passed).
+    ///
     /// The first window is created in [`Self::resumed`].
-    pub fn new(config: Config) -> Self {
-        Self { config, windows: HashMap::new() }
+    pub fn new(config: Config, proxy: EventLoopProxy<UserEvent>, animate: bool) -> Self {
+        Self { config, windows: HashMap::new(), proxy, animate }
+    }
+
+    /// Build a [`PtyWaker`] for the given window using `self.proxy`.
+    ///
+    /// Convenience wrapper over [`make_waker_for`] for call sites
+    /// where a `&self` borrow is not disputed by the borrow checker
+    /// (i.e. `spawn_window`, where `&mut self` is held exclusively).
+    fn make_waker(&self, window_id: WindowId) -> PtyWaker {
+        make_waker_for(&self.proxy, window_id)
     }
 
     // ── Window management helpers ─────────────────────────────────────────────
@@ -183,12 +235,11 @@ impl App {
         let terminal_size =
             Self::terminal_size_from_metrics(size.width, size.height, &cell_metrics);
 
-        // Placeholder waker — commit 2 of the #9 series wires the real
-        // EventLoopProxy-backed waker so the main loop can sleep at idle
-        // and wake promptly on PTY output.  For now the no-op keeps
-        // behaviour identical to pre-waker code (app still polls every
-        // frame via about_to_wait).
-        let waker: mechanic_core::PtyWaker = std::sync::Arc::new(|| {});
+        // Real waker: PTY reader thread calls this after every chunk
+        // send, posting a UserEvent::PtyOutput that wakes our main
+        // loop from ControlFlow::Wait and triggers a redraw.
+        let window_id = window.id();
+        let waker = self.make_waker(window_id);
         let terminal = match Terminal::new(&self.config, terminal_size, waker) {
             Ok(t) => t,
             Err(e) => {
@@ -204,7 +255,6 @@ impl App {
         // for composed input (accented Latin characters, CJK input, etc.).
         window.set_ime_allowed(true);
 
-        let window_id = window.id();
         let now = std::time::Instant::now();
         let state = AppState {
             window: window.clone(),
@@ -263,7 +313,7 @@ fn pixel_to_grid_point(
 
 // ── ApplicationHandler ────────────────────────────────────────────────────────
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     /// Called when the application is first started (and on iOS/Android resume).
     ///
     /// Spawns the initial window the first time it fires.  Later resumes are
@@ -389,7 +439,15 @@ impl ApplicationHandler for App {
                     if mods.super_key()
                         && matches!(key, Key::Character(c) if c.as_str() == "r")
                     {
-                        respawn_shell(state, &self.config, id);
+                        // Construct the waker inline: going through
+                        // `self.make_waker(id)` would conflict with the
+                        // `&mut self.windows` borrow that holds `state`.
+                        // Here `self.proxy` and `self.config` are
+                        // disjoint fields from `self.windows`, so the
+                        // borrow checker allows these direct-field
+                        // accesses alongside the `state` borrow.
+                        let waker = make_waker_for(&self.proxy, id);
+                        respawn_shell(state, &self.config, id, waker);
                         return;
                     }
 
@@ -754,12 +812,24 @@ impl ApplicationHandler for App {
 
                 let grid = crate::convert::convert_grid(&state.terminal, &self.config.theme);
 
-                let elapsed_secs = state.last_input_time.elapsed().as_secs_f32();
-                let opacity = compute_opacity(elapsed_secs, &self.config.theme.opacity);
+                // Opacity: fade interpolation uses wall-clock elapsed
+                // since last input.  --no-animation forces the window
+                // to stay at active opacity forever — no fade at all.
+                let opacity = if self.animate {
+                    let elapsed_secs = state.last_input_time.elapsed().as_secs_f32();
+                    compute_opacity(elapsed_secs, &self.config.theme.opacity)
+                } else {
+                    self.config.theme.opacity.content_active_opacity
+                };
 
                 let time = state.start_time.elapsed().as_secs_f32();
 
-                state.renderer.render(&grid, opacity, time, state.focused);
+                // Shader animations (corner gradient pulse, electron
+                // traces) are all gated on the `focused` uniform.  When
+                // --no-animation is set we pass `false` regardless of
+                // real focus state, freezing them at their midpoint.
+                let shader_focused = state.focused && self.animate;
+                state.renderer.render(&grid, opacity, time, shader_focused);
 
                 // Title: base from the shell's OSC-set title (or "Mechanic"
                 // when unset), suffixed with exit info when the window is
@@ -780,19 +850,194 @@ impl ApplicationHandler for App {
 
     /// Called just before the event loop sleeps.
     ///
-    /// Request a redraw on every open window so the opacity fade continues
-    /// to animate even when no input events are arriving.  Frozen windows
-    /// (shell has exited, waiting for user dismissal) are skipped — their
-    /// grid is static and the fade animation is meaningless, so rendering
-    /// at 60 fps would burn battery for no visible change.
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    /// Decides control flow for the next iteration based on what each
+    /// window needs:
+    ///
+    /// - Any window currently animating (focused gradient, or mid-fade)
+    ///   gets a redraw request; we set `ControlFlow::WaitUntil(now + 33ms)`
+    ///   to wake for the next ~30 FPS frame.
+    /// - Any window whose animation will *start* later (unfocused, fade
+    ///   not yet begun) schedules a wake at that future moment.
+    /// - Windows that are fully static (frozen shell, or unfocused past
+    ///   fade-end, or `--no-animation`) contribute no deadline and no
+    ///   redraw — the loop sleeps on `ControlFlow::Wait` until user
+    ///   input or a PTY-output user event arrives.
+    ///
+    /// We take the earliest deadline across all windows so a single
+    /// global timer drives everyone.  Simpler than per-window vsync
+    /// alignment; `PresentMode::Fifo` still aligns actual presents to
+    /// each monitor's refresh rate.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let mut earliest_deadline: Option<Instant> = None;
+
         for state in self.windows.values() {
-            if state.exit_status.is_some() {
-                continue;
+            let input = AnimationInputs {
+                is_alive: state.exit_status.is_none(),
+                focused: state.focused,
+                last_input_time: state.last_input_time,
+            };
+            let anim = classify_animation(
+                input,
+                &self.config.theme.opacity,
+                self.animate,
+                now,
+            );
+            match anim {
+                AnimationState::Active { next_frame } => {
+                    state.window.request_redraw();
+                    merge_deadline(&mut earliest_deadline, next_frame);
+                }
+                AnimationState::WakeAt(deadline) => {
+                    merge_deadline(&mut earliest_deadline, deadline);
+                }
+                AnimationState::Idle => {
+                    // No redraw, no deadline contribution.
+                }
             }
-            state.window.request_redraw();
+        }
+
+        event_loop.set_control_flow(match earliest_deadline {
+            Some(t) => ControlFlow::WaitUntil(t),
+            None => ControlFlow::Wait,
+        });
+    }
+
+    /// Handle a user event pushed from a background thread.
+    ///
+    /// Currently the only producer is each window's PTY reader thread,
+    /// which posts [`UserEvent::PtyOutput`] after draining bytes into
+    /// the channel.  Requesting a redraw on the target window causes
+    /// the next frame's `RedrawRequested` to fire `process_input`,
+    /// which drains the channel and renders the new output.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::PtyOutput(id) => {
+                if let Some(state) = self.windows.get(&id) {
+                    // Ignored for frozen windows — `process_input` would
+                    // observe nothing new (reader thread has exited) and
+                    // we don't want to hot-loop on stray wakes.
+                    if state.exit_status.is_none() {
+                        state.window.request_redraw();
+                    }
+                }
+            }
         }
     }
+}
+
+// ── Event-loop proxy wiring ───────────────────────────────────────────────────
+
+/// Build a [`PtyWaker`] that fires `UserEvent::PtyOutput(window_id)`
+/// through `proxy` whenever called.
+///
+/// The closure captures a clone of `proxy` (cheap — it's `Arc`-backed)
+/// and the window id.  Send errors (event loop closed) are silently
+/// ignored: if the loop has shut down, the window has too, and the
+/// reader thread is about to exit anyway.
+///
+/// Lives at module scope as a free function so call sites inside
+/// `App::window_event` can use it while holding a `&mut self.windows`
+/// borrow — a method on `&self` would be barred by the borrow checker
+/// even though only the disjoint `self.proxy` field is touched.
+fn make_waker_for(proxy: &EventLoopProxy<UserEvent>, window_id: WindowId) -> PtyWaker {
+    let proxy = proxy.clone();
+    Arc::new(move || {
+        let _ = proxy.send_event(UserEvent::PtyOutput(window_id));
+    })
+}
+
+// ── Animation scheduling ──────────────────────────────────────────────────────
+
+/// What a window needs from the event-loop scheduler for the next tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimationState {
+    /// Window has active animation.  Redraw now; next frame at `next_frame`.
+    Active { next_frame: Instant },
+    /// Window is static right now but animation will start at `deadline`
+    /// (e.g. fade-begin for an unfocused window that's still in its
+    /// pre-fade grace period).  Don't redraw yet — just schedule a wake.
+    WakeAt(Instant),
+    /// Window is fully static with no scheduled future animation.
+    /// Only user input or PTY output should wake us on its behalf.
+    Idle,
+}
+
+/// Inputs to [`classify_animation`] — the minimal slice of `AppState`
+/// the scheduler actually needs.  A small struct (rather than three
+/// positional args) keeps call sites readable and makes unit tests
+/// self-documenting.
+#[derive(Debug, Clone, Copy)]
+struct AnimationInputs {
+    /// Is the shell still alive (vs. frozen awaiting dismissal)?
+    is_alive: bool,
+    /// Does the window currently hold keyboard focus?
+    focused: bool,
+    /// When was the last user interaction in this window?
+    last_input_time: Instant,
+}
+
+/// Decide what scheduling a window needs right now.
+///
+/// Pure function — unit-testable without GPU, Terminal, or real
+/// windowing.  Rules:
+///
+/// 1. Frozen window (shell exited, awaiting dismissal) → `Idle`.
+/// 2. `animate == false` (user passed `--no-animation`) → `Idle` for
+///    every window.  The shader's focused uniform is already forced to
+///    0 in the render path, so nothing time-dependent is running.
+/// 3. Focused, animating → `Active` every `FRAME_INTERVAL` (the corner
+///    gradient and electron pulses animate continuously while focused).
+/// 4. Unfocused, `elapsed < fade_begin` → `WakeAt(last_input + fade_begin)`.
+///    Nothing is animating yet, but the fade will start at that instant.
+/// 5. Unfocused, `fade_begin <= elapsed <= fade_end` → `Active` (mid-fade).
+/// 6. Unfocused, `elapsed > fade_end` → `Idle`.  Opacity has settled at
+///    `content_idle_opacity` and the shader `focused` uniform is 0, so
+///    there's nothing to redraw.
+fn classify_animation(
+    input: AnimationInputs,
+    opacity_cfg: &mechanic_config::OpacityConfig,
+    animate: bool,
+    now: Instant,
+) -> AnimationState {
+    // Rule 1.
+    if !input.is_alive {
+        return AnimationState::Idle;
+    }
+    // Rule 2.
+    if !animate {
+        return AnimationState::Idle;
+    }
+    // Rule 3.
+    if input.focused {
+        return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
+    }
+
+    // Unfocused — check fade state.  `saturating_duration_since` handles
+    // the (impossible-in-practice) case where `last_input_time > now`.
+    let elapsed = now.saturating_duration_since(input.last_input_time);
+    let fade_begin = Duration::from_secs(u64::from(opacity_cfg.fade_begin_secs));
+    let fade_end = Duration::from_secs(u64::from(opacity_cfg.fade_end_secs));
+
+    if elapsed < fade_begin {
+        // Rule 4 — wake when the fade is due to start.
+        let wake_in = fade_begin - elapsed;
+        AnimationState::WakeAt(now + wake_in)
+    } else if elapsed <= fade_end {
+        // Rule 5 — mid-fade, animate continuously.
+        AnimationState::Active { next_frame: now + FRAME_INTERVAL }
+    } else {
+        // Rule 6 — past fade end, nothing moves.
+        AnimationState::Idle
+    }
+}
+
+/// Keep the earlier of two deadlines.
+fn merge_deadline(current: &mut Option<Instant>, candidate: Instant) {
+    *current = Some(match *current {
+        Some(existing) => existing.min(candidate),
+        None => candidate,
+    });
 }
 
 // ── Frozen-window dismissal / respawn helpers ─────────────────────────────────
@@ -824,11 +1069,8 @@ fn is_dismissal_key(key: &Key) -> bool {
 ///
 /// If `Terminal::new` fails we log and leave the window frozen — the
 /// user can Cmd+W to dismiss.
-fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId) {
+fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId, waker: PtyWaker) {
     let size = state.terminal.size();
-    // Same placeholder as spawn_window — replaced with a real proxy
-    // waker in commit 2.
-    let waker: mechanic_core::PtyWaker = std::sync::Arc::new(|| {});
     match Terminal::new(config, size, waker) {
         Ok(new_term) => {
             state.terminal = new_term;
@@ -1124,6 +1366,161 @@ mod tests {
     fn function_keys_do_not_dismiss() {
         assert!(!is_dismissal_key(&Key::Named(NamedKey::F1)));
         assert!(!is_dismissal_key(&Key::Named(NamedKey::F12)));
+    }
+
+    // ── Animation scheduling ──────────────────────────────────────────────────
+
+    fn default_opacity_cfg() -> mechanic_config::OpacityConfig {
+        mechanic_config::OpacityConfig {
+            title_bar_opacity: 0.95,
+            content_active_opacity: 0.95,
+            content_idle_opacity: 0.80,
+            fade_begin_secs: 30,
+            fade_end_secs: 60,
+        }
+    }
+
+    /// Build inputs where `last_input_time` is exactly `last_input_ago`
+    /// before `now`.  Both the inputs and the caller-visible `now`
+    /// share the same reference instant so boundary tests aren't
+    /// subject to a race between two independent `Instant::now()`
+    /// calls.
+    fn inputs_at(
+        now: Instant,
+        is_alive: bool,
+        focused: bool,
+        last_input_ago: Duration,
+    ) -> AnimationInputs {
+        AnimationInputs {
+            is_alive,
+            focused,
+            last_input_time: now.checked_sub(last_input_ago).unwrap_or(now),
+        }
+    }
+
+    /// Convenience wrapper that uses `Instant::now()` for tests that
+    /// don't care about sub-microsecond timing.
+    fn inputs(is_alive: bool, focused: bool, last_input_ago: Duration) -> AnimationInputs {
+        inputs_at(Instant::now(), is_alive, focused, last_input_ago)
+    }
+
+    #[test]
+    fn anim_frozen_window_is_idle() {
+        // Rule 1: shell exited → nothing to render.
+        let cfg = default_opacity_cfg();
+        let input = inputs(false, true, Duration::ZERO);
+        assert_eq!(
+            classify_animation(input, &cfg, true, Instant::now()),
+            AnimationState::Idle
+        );
+    }
+
+    #[test]
+    fn anim_no_animation_flag_forces_idle() {
+        // Rule 2: --no-animation overrides everything else.  Even a
+        // focused window reports idle so the event loop can sleep.
+        let cfg = default_opacity_cfg();
+        let input = inputs(true, true, Duration::ZERO);
+        assert_eq!(
+            classify_animation(input, &cfg, false, Instant::now()),
+            AnimationState::Idle
+        );
+    }
+
+    #[test]
+    fn anim_focused_window_is_active() {
+        // Rule 3: focused windows always have shader animations running.
+        let cfg = default_opacity_cfg();
+        let input = inputs(true, true, Duration::from_secs(1000));
+        let now = Instant::now();
+        match classify_animation(input, &cfg, true, now) {
+            AnimationState::Active { next_frame } => {
+                // next_frame should be roughly one FRAME_INTERVAL out.
+                let delta = next_frame.saturating_duration_since(now);
+                assert!(delta >= FRAME_INTERVAL);
+                assert!(delta <= FRAME_INTERVAL + Duration::from_millis(5));
+            }
+            other => panic!("expected Active, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anim_unfocused_pre_fade_wakes_later() {
+        // Rule 4: unfocused + before fade_begin → WakeAt(fade_begin).
+        let cfg = default_opacity_cfg();
+        let elapsed = Duration::from_secs(10); // well before fade_begin = 30
+        let input = inputs(true, false, elapsed);
+        let now = Instant::now();
+        match classify_animation(input, &cfg, true, now) {
+            AnimationState::WakeAt(deadline) => {
+                // Deadline should be ~20s from now (fade_begin 30 - elapsed 10).
+                let delta = deadline.saturating_duration_since(now);
+                assert!(delta >= Duration::from_secs(19));
+                assert!(delta <= Duration::from_secs(21));
+            }
+            other => panic!("expected WakeAt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anim_unfocused_mid_fade_is_active() {
+        // Rule 5: unfocused + elapsed between fade_begin and fade_end →
+        // animate at FRAME_INTERVAL.
+        let cfg = default_opacity_cfg();
+        let elapsed = Duration::from_secs(45); // between 30 and 60
+        let input = inputs(true, false, elapsed);
+        let now = Instant::now();
+        assert!(matches!(
+            classify_animation(input, &cfg, true, now),
+            AnimationState::Active { .. }
+        ));
+    }
+
+    #[test]
+    fn anim_unfocused_past_fade_end_is_idle() {
+        // Rule 6: unfocused + elapsed > fade_end → fully static.
+        let cfg = default_opacity_cfg();
+        let elapsed = Duration::from_secs(120); // well past fade_end = 60
+        let input = inputs(true, false, elapsed);
+        assert_eq!(
+            classify_animation(input, &cfg, true, Instant::now()),
+            AnimationState::Idle
+        );
+    }
+
+    #[test]
+    fn anim_unfocused_exactly_at_fade_end_still_active() {
+        // Boundary: elapsed == fade_end is treated as "still fading"
+        // (rule 5's `<= fade_end`) so the last frame of the fade
+        // actually renders before we go idle.  Use `inputs_at` so the
+        // inputs and classifier's `now` share a reference instant —
+        // otherwise nanoseconds of drift push us past fade_end.
+        let cfg = default_opacity_cfg();
+        let now = Instant::now();
+        let input = inputs_at(now, true, false, Duration::from_secs(60));
+        assert!(matches!(
+            classify_animation(input, &cfg, true, now),
+            AnimationState::Active { .. }
+        ));
+    }
+
+    // ── merge_deadline ────────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_deadline_picks_earliest() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let t2 = t0 + Duration::from_secs(2);
+
+        let mut acc: Option<Instant> = None;
+        merge_deadline(&mut acc, t2);
+        assert_eq!(acc, Some(t2));
+
+        merge_deadline(&mut acc, t1);
+        assert_eq!(acc, Some(t1), "should prefer earlier");
+
+        merge_deadline(&mut acc, t2);
+        assert_eq!(acc, Some(t1), "later candidate shouldn't overwrite");
     }
 
     #[test]
