@@ -198,8 +198,94 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let logo = textureSample(logo_texture, atlas_sampler, logo_uv);
             let a = logo.a * logo_opacity;
             bg_rgb = logo.rgb * logo_opacity + bg_rgb * (1.0 - a);
+
+            // ── Electron pulses riding the circuit traces ────────────
+            //
+            // Hand-picked straight-line segments from the SVG traces.
+            // Each electron is a small Gaussian blob that walks its
+            // segment from start → end over `period` seconds, with a
+            // per-segment phase offset so the pulses flow in a
+            // staggered sequence rather than marching in lockstep.
+            //
+            // Coordinates are in SVG space (0–256) so you can read
+            // them straight out of assets/logo.svg.  They're mapped to
+            // the on-screen logo rect at the end.
+            //
+            // Only drawn when focused — keeps background windows quiet.
+            let pulse_glow = electron_pulses(logo_px, logo_size, globals.time)
+                * globals.focused;
+            // Celeste-white core with a hint of cyan — brighter than
+            // the trace it rides on, so the trace visibly lights up.
+            let electron_color = vec3<f32>(0.85, 1.0, 1.0);
+            bg_rgb = bg_rgb + electron_color * pulse_glow;
         }
 
         return vec4<f32>(bg_rgb, globals.content_opacity);
     }
+}
+
+// ── Electron pulse helpers ────────────────────────────────────────────────────
+
+// Glow from a single electron moving along a SVG-space line segment.
+//
+// `logo_px` is the fragment's position inside the logo rect, in display pixels.
+// `logo_size` is the on-screen logo edge length (same in x and y).
+// `a_svg`/`b_svg` are the segment endpoints in SVG viewBox coords (0–256).
+// `t` is the electron's progress along the segment, in [0, 1).
+// `radius` is the glow radius in display pixels.
+fn electron_glow(
+    logo_px: vec2<f32>,
+    logo_size: f32,
+    a_svg: vec2<f32>,
+    b_svg: vec2<f32>,
+    t: f32,
+    radius: f32,
+) -> f32 {
+    let e_svg = mix(a_svg, b_svg, t);
+    // SVG → logo pixel space.  SVG viewBox is 256 units per edge.
+    let e_px = e_svg * (logo_size / 256.0);
+    let d = distance(logo_px, e_px);
+    return exp(-d * d / (radius * radius));
+}
+
+// Sum of all electron glows for this fragment.
+fn electron_pulses(logo_px: vec2<f32>, logo_size: f32, time: f32) -> f32 {
+    let period: f32 = 3.0;   // seconds per full sweep of any given path
+    let radius: f32 = 5.0;   // glow radius in display pixels
+
+    // Phase offsets stagger the pulses through a common cycle so you
+    // always see at least one mid-trace rather than all five starting
+    // or ending together.
+    let t0 = fract((time + 0.0) / period);
+    let t1 = fract((time + 0.6) / period);
+    let t2 = fract((time + 1.2) / period);
+    let t3 = fract((time + 1.8) / period);
+    let t4 = fract((time + 2.4) / period);
+
+    var glow: f32 = 0.0;
+
+    // 1. IC1 bottom-right pin down into IC2 — a prominent vertical trace
+    //    in the middle-upper area.
+    glow = glow + electron_glow(logo_px, logo_size,
+        vec2<f32>(186.0, 118.0), vec2<f32>(186.0, 155.0), t0, radius);
+
+    // 2. R2 → C1 horizontal feeder on the lower-left.
+    glow = glow + electron_glow(logo_px, logo_size,
+        vec2<f32>(44.0, 196.0), vec2<f32>(140.0, 196.0), t1, radius);
+
+    // 3. Upper vertical trace on the right (travelling upward).
+    glow = glow + electron_glow(logo_px, logo_size,
+        vec2<f32>(228.0, 120.0), vec2<f32>(228.0, 78.0), t2, radius);
+
+    // 4. Top meander from upper-left origin pad rightward to the
+    //    capacitor C0.
+    glow = glow + electron_glow(logo_px, logo_size,
+        vec2<f32>(25.0, 28.0), vec2<f32>(100.0, 28.0), t3, radius);
+
+    // 5. Right side of IC2, top-most pin out to its pad — short but
+    //    close to the logo's visual anchor.
+    glow = glow + electron_glow(logo_px, logo_size,
+        vec2<f32>(222.0, 165.0), vec2<f32>(244.0, 165.0), t4, radius);
+
+    return glow;
 }
