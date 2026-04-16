@@ -48,6 +48,43 @@ struct AppState {
     /// Current font size in points, tracked so Cmd++/Cmd+-/Cmd+0 can step
     /// relative to the live value (not the config default).
     current_font_size: f32,
+    /// Active tilt animation, if any.  Drives the 3D rotation during
+    /// Cmd+` window-cycle transitions.
+    tilt_animation: Option<TiltAnimation>,
+}
+
+// ── TiltAnimation ─────────────────────────────────────────────────────────────
+
+/// A short 3D-rotation animation applied to the window during Cmd+` cycles.
+///
+/// The tilt angle (radians) interpolates from `from` to `to` over `duration`
+/// using a smoothstep curve.  Once elapsed >= duration the animation is
+/// cleared and tilt_angle is held at `to`.
+#[derive(Debug, Clone, Copy)]
+struct TiltAnimation {
+    start: std::time::Instant,
+    duration: std::time::Duration,
+    from: f32,
+    to: f32,
+}
+
+impl TiltAnimation {
+    /// Current tilt angle in radians, smoothstep-interpolated.
+    fn current(&self) -> f32 {
+        let elapsed = self.start.elapsed().as_secs_f32();
+        let dur = self.duration.as_secs_f32();
+        if elapsed >= dur {
+            return self.to;
+        }
+        let t = (elapsed / dur).clamp(0.0, 1.0);
+        let smooth_t = t * t * (3.0 - 2.0 * t);
+        self.from + (self.to - self.from) * smooth_t
+    }
+
+    /// Whether the animation has finished and can be cleared.
+    fn is_complete(&self) -> bool {
+        self.start.elapsed() >= self.duration
+    }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -189,6 +226,7 @@ impl App {
             start_time: now,
             focused: true,
             current_font_size: self.config.font.size,
+            tilt_animation: None,
         };
 
         self.windows.insert(window_id, state);
@@ -320,13 +358,36 @@ impl ApplicationHandler for App {
             // happened `fade_begin_secs` ago.  On focus, reset the timer.
             WindowEvent::Focused(focused) => {
                 state.focused = focused;
+                // If Cmd is held during the focus change, the user is
+                // Cmd+`-cycling between Mechanic windows.  Trigger a 3D
+                // tilt animation — the exiting window tilts away, the
+                // incoming window tilts in from the opposite direction.
+                let cmd_held = state.modifiers.super_key();
+                let tilt_dur = std::time::Duration::from_millis(250);
+                let tilt_target = std::f32::consts::FRAC_PI_4; // 45°
                 if focused {
                     state.last_input_time = std::time::Instant::now();
+                    if cmd_held {
+                        state.tilt_animation = Some(TiltAnimation {
+                            start: std::time::Instant::now(),
+                            duration: tilt_dur,
+                            from: -tilt_target, // tilt in from the other side
+                            to: 0.0,
+                        });
+                    }
                 } else {
                     let fade_begin = self.config.theme.opacity.fade_begin_secs;
                     state.last_input_time = std::time::Instant::now()
                         .checked_sub(std::time::Duration::from_secs(fade_begin as u64))
                         .unwrap_or_else(std::time::Instant::now);
+                    if cmd_held {
+                        state.tilt_animation = Some(TiltAnimation {
+                            start: std::time::Instant::now(),
+                            duration: tilt_dur,
+                            from: 0.0,
+                            to: tilt_target, // tilt the exiting window away
+                        });
+                    }
                 }
                 state.window.request_redraw();
             }
@@ -508,7 +569,14 @@ impl ApplicationHandler for App {
 
                 let time = state.start_time.elapsed().as_secs_f32();
 
-                state.renderer.render(&grid, opacity, time);
+                // Current tilt angle from the animation (if any).  Clear
+                // the animation once it has fully played out.
+                let tilt_angle = state.tilt_animation.map(|a| a.current()).unwrap_or(0.0);
+                if state.tilt_animation.is_some_and(|a| a.is_complete()) {
+                    state.tilt_animation = None;
+                }
+
+                state.renderer.render(&grid, opacity, time, tilt_angle);
 
                 let title = state.terminal.title();
                 if !title.is_empty() {

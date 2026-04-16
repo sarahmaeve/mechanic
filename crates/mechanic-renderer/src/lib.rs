@@ -107,8 +107,20 @@ impl Renderer {
     }
 
     /// Render one frame from the given terminal grid.
-    pub fn render(&mut self, grid: &RenderGrid, content_opacity: f32, time: f32) {
-        self.state.render(grid, &mut self.text, &self.font_config, content_opacity, time);
+    ///
+    /// `tilt_angle` (radians) applies a 3D rotation around the window's
+    /// vertical center axis — pass `0.0` for normal rendering.  Positive
+    /// values tilt the right edge away from the viewer; used for the
+    /// Cmd+` window-cycle animation.
+    pub fn render(&mut self, grid: &RenderGrid, content_opacity: f32, time: f32, tilt_angle: f32) {
+        self.state.render(
+            grid,
+            &mut self.text,
+            &self.font_config,
+            content_opacity,
+            time,
+            tilt_angle,
+        );
     }
 
     /// Change the font size and rebuild text rendering state.
