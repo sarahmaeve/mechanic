@@ -223,6 +223,25 @@ impl Terminal {
     pub fn selection_range(&self) -> Option<alacritty_terminal::selection::SelectionRange> {
         self.term.selection.as_ref().and_then(|s| s.to_range(&self.term))
     }
+
+    // ── History ───────────────────────────────────────────────────────────────
+
+    /// Clear the scrollback buffer (history above the visible viewport).
+    pub fn clear_history(&mut self) {
+        self.term.grid_mut().clear_history();
+    }
+
+    // ── Select all ───────────────────────────────────────────────────────────
+
+    /// Create a selection that covers the entire scrollback + visible viewport.
+    pub fn select_all(&mut self) {
+        let start =
+            Point::new(self.term.grid().topmost_line(), alacritty_terminal::index::Column(0));
+        let end = Point::new(self.term.grid().bottommost_line(), self.term.grid().last_column());
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        self.term.selection = Some(selection);
+    }
 }
 
 // ── Re-exports for callers ────────────────────────────────────────────────────
@@ -339,5 +358,32 @@ mod tests {
 
         // Writing bytes to the PTY should not fail.
         term.write_to_pty(b"echo hello\n").expect("PTY write should succeed");
+    }
+
+    #[test]
+    fn terminal_clear_history_does_not_panic() {
+        let config = Config::default();
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+
+        // Clear on a fresh terminal (no history yet) should be a no-op that
+        // doesn't panic.
+        term.clear_history();
+    }
+
+    #[test]
+    fn terminal_select_all_populates_selection() {
+        let config = Config::default();
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+
+        // Before select_all, no selection text.
+        assert!(term.selection_text().is_none());
+
+        term.select_all();
+
+        // After select_all, selection_range should exist (even if the grid is
+        // empty — an empty terminal still has an area to select).
+        assert!(term.selection_range().is_some());
     }
 }

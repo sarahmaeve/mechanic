@@ -22,6 +22,9 @@ pub struct Renderer {
     state: RenderState,
     text: TextRenderer,
     font_config: FontConfig,
+    /// The window's DPI scale factor, stored so `set_font_size` can
+    /// rebuild the text renderer at the same physical resolution.
+    scale_factor: f32,
 }
 
 impl Renderer {
@@ -56,7 +59,7 @@ impl Renderer {
 
         let text = TextRenderer::new(&state.device, &state.queue, &font_config, scale_factor);
 
-        Ok(Self { state, text, font_config })
+        Ok(Self { state, text, font_config, scale_factor })
     }
 
     /// Compute a bootstrap `CellMetrics` without a GPU device.
@@ -106,6 +109,32 @@ impl Renderer {
     /// Render one frame from the given terminal grid.
     pub fn render(&mut self, grid: &RenderGrid, content_opacity: f32, time: f32) {
         self.state.render(grid, &mut self.text, &self.font_config, content_opacity, time);
+    }
+
+    /// Change the font size and rebuild text rendering state.
+    ///
+    /// The new size is clamped to `[6.0, 72.0]` points.  The `TextRenderer`
+    /// is reconstructed (new atlas, fresh ASCII pre-rasterization at the
+    /// new size) and the pipeline's cell size is updated so the next frame
+    /// uses the new metrics.
+    ///
+    /// Returns the new [`CellMetrics`] so the caller can resize the terminal
+    /// grid to match.
+    pub fn set_font_size(&mut self, new_size: f32) -> CellMetrics {
+        let clamped = new_size.clamp(6.0, 72.0);
+        self.font_config.size = clamped;
+
+        // Rebuild the text renderer: new atlas, re-extracted metrics.
+        self.text = TextRenderer::new(
+            &self.state.device,
+            &self.state.queue,
+            &self.font_config,
+            self.scale_factor,
+        );
+
+        let metrics = self.text.cell_metrics();
+        self.state.set_cell_size((metrics.cell_width, metrics.cell_height));
+        metrics
     }
 }
 

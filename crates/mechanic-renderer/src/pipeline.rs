@@ -399,6 +399,15 @@ impl RenderState {
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
     }
 
+    /// Update the cell size used by the pipeline's globals uniform.
+    ///
+    /// The next `render()` call will write the new cell_size to the GPU.
+    /// Used by `Renderer::set_font_size` after the text renderer is rebuilt
+    /// at a new point size.
+    pub fn set_cell_size(&mut self, cell_size: (f32, f32)) {
+        self.cell_size = cell_size;
+    }
+
     /// Render a single frame.
     pub fn render(
         &mut self,

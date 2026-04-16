@@ -19,7 +19,13 @@ pub fn translate_key(event: &KeyEvent, modifiers: ModifiersState) -> Option<Vec<
     }
 
     match &event.logical_key {
-        Key::Named(named) => named_key_bytes(named),
+        Key::Named(named) => {
+            // Modifier-aware arrow key handling.
+            if let Some(bytes) = modified_arrow(named, modifiers) {
+                return Some(bytes);
+            }
+            named_key_bytes(named)
+        }
         Key::Character(ch) => {
             // ── Ctrl+letter → control character ──────────────────────────
             //
@@ -113,6 +119,32 @@ pub(crate) fn named_key_bytes(key: &NamedKey) -> Option<Vec<u8>> {
         NamedKey::F12 => b"\x1b[24~",
 
         // Modifier-only and all other unhandled named keys → no output.
+        _ => return None,
+    };
+
+    Some(seq.to_vec())
+}
+
+/// Map an arrow key + modifier combo to its shell escape sequence.
+///
+/// Returns `None` if the key isn't an arrow or no modifier is held
+/// (the caller falls back to the unmodified `named_key_bytes`).
+pub(crate) fn modified_arrow(key: &NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
+    let is_alt = modifiers.alt_key();
+    let is_super = modifiers.super_key();
+
+    // No relevant modifier → fall through to default arrow handling.
+    if !is_alt && !is_super {
+        return None;
+    }
+
+    let seq: &[u8] = match (key, is_alt, is_super) {
+        // Opt+Arrow — word movement via readline conventions.
+        (NamedKey::ArrowLeft, true, _) => b"\x1bb",
+        (NamedKey::ArrowRight, true, _) => b"\x1bf",
+        // Cmd+Arrow — line start/end via Home/End escape sequences.
+        (NamedKey::ArrowLeft, _, true) => b"\x1b[H",
+        (NamedKey::ArrowRight, _, true) => b"\x1b[F",
         _ => return None,
     };
 
@@ -429,5 +461,54 @@ mod tests {
             let upper_s = upper.to_string();
             assert_eq!(ctrl_char(&lower_s), ctrl_char(&upper_s));
         }
+    }
+
+    // ── modified_arrow ────────────────────────────────────────────────────────
+
+    #[test]
+    fn opt_arrow_left_is_backward_word() {
+        let mods = ModifiersState::ALT;
+        assert_eq!(modified_arrow(&NamedKey::ArrowLeft, mods), Some(b"\x1bb".to_vec()));
+    }
+
+    #[test]
+    fn opt_arrow_right_is_forward_word() {
+        let mods = ModifiersState::ALT;
+        assert_eq!(modified_arrow(&NamedKey::ArrowRight, mods), Some(b"\x1bf".to_vec()));
+    }
+
+    #[test]
+    fn cmd_arrow_left_is_line_start() {
+        let mods = ModifiersState::SUPER;
+        assert_eq!(modified_arrow(&NamedKey::ArrowLeft, mods), Some(b"\x1b[H".to_vec()));
+    }
+
+    #[test]
+    fn cmd_arrow_right_is_line_end() {
+        let mods = ModifiersState::SUPER;
+        assert_eq!(modified_arrow(&NamedKey::ArrowRight, mods), Some(b"\x1b[F".to_vec()));
+    }
+
+    #[test]
+    fn unmodified_arrow_falls_through() {
+        // No modifier → function returns None so the caller uses named_key_bytes.
+        let mods = ModifiersState::empty();
+        assert_eq!(modified_arrow(&NamedKey::ArrowLeft, mods), None);
+        assert_eq!(modified_arrow(&NamedKey::ArrowRight, mods), None);
+    }
+
+    #[test]
+    fn non_arrow_keys_ignored() {
+        let mods = ModifiersState::ALT;
+        assert_eq!(modified_arrow(&NamedKey::Enter, mods), None);
+        assert_eq!(modified_arrow(&NamedKey::Backspace, mods), None);
+    }
+
+    #[test]
+    fn opt_arrow_up_and_down_ignored() {
+        // We only handle horizontal arrows — Opt+Up/Down fall through.
+        let mods = ModifiersState::ALT;
+        assert_eq!(modified_arrow(&NamedKey::ArrowUp, mods), None);
+        assert_eq!(modified_arrow(&NamedKey::ArrowDown, mods), None);
     }
 }

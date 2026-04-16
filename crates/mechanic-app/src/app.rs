@@ -45,6 +45,9 @@ struct AppState {
     /// Whether the window currently has keyboard focus.  When unfocused the
     /// window fades toward `content_idle_opacity`.
     focused: bool,
+    /// Current font size in points, tracked so Cmd++/Cmd+-/Cmd+0 can step
+    /// relative to the live value (not the config default).
+    current_font_size: f32,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -71,6 +74,23 @@ impl App {
     }
 
     // ── Cell-size helpers ─────────────────────────────────────────────────────
+
+    /// Apply a new font size to a window's renderer and resize the terminal
+    /// grid so it matches the new cell dimensions.
+    ///
+    /// Clamping of the size itself happens in `Renderer::set_font_size`; the
+    /// caller is expected to pass a sensible value.
+    fn apply_font_size(state: &mut AppState, new_size: f32) {
+        let new_metrics = state.renderer.set_font_size(new_size);
+        state.cell_metrics = new_metrics;
+        state.current_font_size = new_size;
+
+        let inner = state.window.inner_size();
+        let term_size = Self::terminal_size_from_metrics(inner.width, inner.height, &new_metrics);
+        state.terminal.resize(term_size);
+
+        state.window.request_redraw();
+    }
 
     /// Compute [`TerminalSize`] from a physical pixel surface size and real
     /// cell metrics.
@@ -168,6 +188,7 @@ impl App {
             last_input_time: now,
             start_time: now,
             focused: true,
+            current_font_size: self.config.font.size,
         };
 
         self.windows.insert(window_id, state);
@@ -338,6 +359,37 @@ impl ApplicationHandler for App {
                                     }
                                 }
                                 state.window.request_redraw();
+                                return;
+                            }
+                            "k" => {
+                                // Cmd+K — clear scrollback (matches iTerm2).
+                                state.terminal.clear_history();
+                                state.window.request_redraw();
+                                return;
+                            }
+                            "a" => {
+                                // Cmd+A — select the full terminal buffer
+                                // including scrollback.
+                                state.terminal.select_all();
+                                state.window.request_redraw();
+                                return;
+                            }
+                            // Cmd++ requires Shift on US keyboards (Shift+=),
+                            // which the OS delivers as "+".  Cmd+= without
+                            // Shift is accepted too for convenience.
+                            "+" | "=" => {
+                                let new_size = (state.current_font_size + 1.0).min(72.0);
+                                Self::apply_font_size(state, new_size);
+                                return;
+                            }
+                            "-" => {
+                                let new_size = (state.current_font_size - 1.0).max(6.0);
+                                Self::apply_font_size(state, new_size);
+                                return;
+                            }
+                            "0" => {
+                                // Reset to the configured default size.
+                                Self::apply_font_size(state, self.config.font.size);
                                 return;
                             }
                             _ => {}
