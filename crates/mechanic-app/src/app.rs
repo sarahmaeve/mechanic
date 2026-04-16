@@ -451,28 +451,23 @@ impl ApplicationHandler for App {
 
                 state.last_input_time = std::time::Instant::now();
 
-                // If there's an active selection and the user pressed Escape,
-                // collapse the selection rather than forwarding Esc to the
-                // PTY.  This matches iTerm2 / Terminal.app behavior: hitting
-                // Escape with a selection clears it without interrupting
-                // shell apps that consume Escape (vim, less, etc.) — those
-                // apps never see the Escape in this case, which they
-                // wouldn't want to handle as a mode-exit with selection
-                // present anyway.  Without a selection, Escape falls through
-                // to translate_key and is sent to the PTY as usual.
-                if key_event.state == ElementState::Pressed
-                    && matches!(
-                        &key_event.logical_key,
-                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
-                    )
-                    && state.terminal.selection_range().is_some()
-                {
-                    state.terminal.clear_selection();
-                    state.window.request_redraw();
-                    return;
-                }
-
                 if let Some(bytes) = crate::input::translate_key(&key_event, state.modifiers) {
+                    // Clear any visible selection as a side effect of typing.
+                    //
+                    // Earlier we tried to gate Escape on selection presence
+                    // (swallow Esc, clear selection, don't forward to PTY)
+                    // which felt clean but broke vim in subtle ways: every
+                    // left-click creates a degenerate selection via
+                    // `start_selection`, and middle-click paste deliberately
+                    // preserves the selection.  A user could end up with a
+                    // stray invisible selection that silently swallowed
+                    // every Esc.  Now Esc always reaches the PTY (so vim
+                    // exits insert mode) AND the selection still clears
+                    // visually as a free side effect — same end result for
+                    // selection clearing, no broken vim.
+                    if state.terminal.selection_range().is_some() {
+                        state.terminal.clear_selection();
+                    }
                     if let Err(e) = state.terminal.write_to_pty(&bytes) {
                         log::warn!("PTY write failed: {e}");
                     }
