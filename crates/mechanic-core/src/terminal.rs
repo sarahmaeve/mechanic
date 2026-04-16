@@ -371,13 +371,30 @@ impl alacritty_terminal::grid::Dimensions for TermDimensions {
 /// We replicate the resize logic from `alacritty_terminal::tty::Pty`'s
 /// `OnResize` implementation, because after handing the `Pty` to the reader
 /// thread we only have a cloned `File` (the writer) available.
-fn resize_pty_fd(pty: &PtyHandle, window_size: WindowSize) -> std::io::Result<()> {
+/// Build a `libc::winsize` from a `WindowSize`, saturating the pixel fields at
+/// `u16::MAX`.
+///
+/// The pixel fields (`ws_xpixel`, `ws_ypixel`) are informational: only
+/// sixel-like protocols read them.  The products `col × cell_width` and
+/// `row × cell_height` can easily exceed 65535 on 4K+ displays with small
+/// fonts (e.g. 800 cols × 100 px = 80 000).  Silent wrapping would hand pixel-
+/// aware apps a completely wrong value; saturation gives at least a lower bound
+/// that such apps can clamp against.
+fn winsize_from_window_size(window_size: WindowSize) -> libc::winsize {
     let ws_row = window_size.num_lines as libc::c_ushort;
     let ws_col = window_size.num_cols as libc::c_ushort;
-    let ws_xpixel = ws_col * window_size.cell_width as libc::c_ushort;
-    let ws_ypixel = ws_row * window_size.cell_height as libc::c_ushort;
 
-    let winsize = libc::winsize { ws_row, ws_col, ws_xpixel, ws_ypixel };
+    let xpixel_u32 = (window_size.num_cols as u32) * (window_size.cell_width as u32);
+    let ypixel_u32 = (window_size.num_lines as u32) * (window_size.cell_height as u32);
+
+    let ws_xpixel = xpixel_u32.min(u32::from(u16::MAX)) as libc::c_ushort;
+    let ws_ypixel = ypixel_u32.min(u32::from(u16::MAX)) as libc::c_ushort;
+
+    libc::winsize { ws_row, ws_col, ws_xpixel, ws_ypixel }
+}
+
+fn resize_pty_fd(pty: &PtyHandle, window_size: WindowSize) -> std::io::Result<()> {
+    let winsize = winsize_from_window_size(window_size);
 
     let fd = pty.writer_fd();
     let res = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize as *const _) };
@@ -517,5 +534,49 @@ mod tests {
         // After select_all, selection_range should exist (even if the grid is
         // empty — an empty terminal still has an area to select).
         assert!(term.selection_range().is_some());
+    }
+
+    // ── winsize_from_window_size ──────────────────────────────────────────────
+
+    fn make_ws(num_cols: u16, num_lines: u16, cell_width: u16, cell_height: u16) -> WindowSize {
+        WindowSize { num_cols, num_lines, cell_width, cell_height }
+    }
+
+    #[test]
+    fn winsize_normal_case_exact() {
+        // 80 cols × 8 px wide, 24 rows × 16 px tall → 640 × 384, no overflow.
+        let ws = winsize_from_window_size(make_ws(80, 24, 8, 16));
+        assert_eq!(ws.ws_col, 80);
+        assert_eq!(ws.ws_row, 24);
+        assert_eq!(ws.ws_xpixel, 640);
+        assert_eq!(ws.ws_ypixel, 384);
+    }
+
+    #[test]
+    fn winsize_saturates_xpixel() {
+        // 800 cols × 100 px = 80 000 > 65 535 → must saturate to u16::MAX.
+        let ws = winsize_from_window_size(make_ws(800, 24, 100, 16));
+        assert_eq!(ws.ws_xpixel, u16::MAX);
+        // Row count and col count are unaffected.
+        assert_eq!(ws.ws_col, 800);
+        assert_eq!(ws.ws_row, 24);
+    }
+
+    #[test]
+    fn winsize_saturates_ypixel() {
+        // 24 rows × 3000 px = 72 000 > 65 535 → must saturate to u16::MAX.
+        let ws = winsize_from_window_size(make_ws(80, 24, 8, 3000));
+        assert_eq!(ws.ws_ypixel, u16::MAX);
+        assert_eq!(ws.ws_row, 24);
+    }
+
+    #[test]
+    fn winsize_zero_size_does_not_panic() {
+        // Shouldn't happen in practice, but must not overflow or panic.
+        let ws = winsize_from_window_size(make_ws(0, 0, 0, 0));
+        assert_eq!(ws.ws_col, 0);
+        assert_eq!(ws.ws_row, 0);
+        assert_eq!(ws.ws_xpixel, 0);
+        assert_eq!(ws.ws_ypixel, 0);
     }
 }
