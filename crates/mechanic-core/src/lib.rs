@@ -22,6 +22,7 @@
 
 pub mod error;
 pub mod event;
+pub mod paste;
 pub mod pty;
 pub mod terminal;
 

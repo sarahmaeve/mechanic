@@ -375,26 +375,25 @@ impl ApplicationHandler for App {
                                 return;
                             }
                             "v" => {
-                                let text =
-                                    state.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
-                                if let Some(text) = text {
-                                    // When the shell has enabled bracketed
-                                    // paste (DECSET 2004), wrap the paste
-                                    // in \x1b[200~ … \x1b[201~ so readline
-                                    // treats the whole thing as one edit
-                                    // operation.  Without this, Cmd+Z only
-                                    // undoes one character at a time.
-                                    let payload: Vec<u8> = if state.terminal.bracketed_paste() {
-                                        let mut v = Vec::with_capacity(text.len() + 12);
-                                        v.extend_from_slice(b"\x1b[200~");
-                                        v.extend_from_slice(text.as_bytes());
-                                        v.extend_from_slice(b"\x1b[201~");
-                                        v
-                                    } else {
-                                        text.into_bytes()
-                                    };
-                                    if let Err(e) = state.terminal.write_to_pty(&payload) {
-                                        log::warn!("PTY paste failed: {e}");
+                                // Delegate clipboard → PTY entirely to
+                                // `Terminal::paste`, which applies the
+                                // safety filter (strip bracketed-paste
+                                // markers, normalize CR/CRLF, strip
+                                // trailing newline when DECSET 2004 is
+                                // off) and then wraps in `\x1b[200~…~`
+                                // when bracketed paste is active so
+                                // readline treats the whole paste as one
+                                // edit (one Cmd+Z, no history expansion).
+                                //
+                                // The filter is crucial: a clipboard
+                                // payload containing `\x1b[201~` would
+                                // otherwise escape the wrap and smuggle
+                                // keystrokes into the shell.
+                                if let Some(cb) = state.clipboard.as_mut() {
+                                    if let Ok(text) = cb.get_text() {
+                                        if let Err(e) = state.terminal.paste(&text) {
+                                            log::warn!("PTY paste failed: {e}");
+                                        }
                                     }
                                 }
                                 state.window.request_redraw();
@@ -597,24 +596,23 @@ impl ApplicationHandler for App {
             // Pastes the most recently drag-selected text — captured into
             // `primary_selection` automatically when a drag completes.  Does
             // NOT touch the macOS clipboard, so Cmd+V / Cmd+C still work
-            // independently with their own buffer.  Bracketed-paste is
-            // applied when the shell has it enabled (matches Cmd+V).
+            // independently with their own buffer.
+            //
+            // Goes through the same `Terminal::paste` safety filter as
+            // Cmd+V: bracketed-paste markers stripped, line endings
+            // normalized, trailing newline stripped when the shell has
+            // not enabled DECSET 2004.  In practice the primary
+            // selection comes from the terminal's own grid (we wrote
+            // the glyphs ourselves), so markers shouldn't appear — but
+            // a drag across terminal-emitted escape sequences *could*
+            // pick one up, and we don't want that route either.
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Middle,
                 ..
             } => {
                 if let Some(text) = state.primary_selection.as_ref() {
-                    let payload: Vec<u8> = if state.terminal.bracketed_paste() {
-                        let mut v = Vec::with_capacity(text.len() + 12);
-                        v.extend_from_slice(b"\x1b[200~");
-                        v.extend_from_slice(text.as_bytes());
-                        v.extend_from_slice(b"\x1b[201~");
-                        v
-                    } else {
-                        text.clone().into_bytes()
-                    };
-                    if let Err(e) = state.terminal.write_to_pty(&payload) {
+                    if let Err(e) = state.terminal.paste(text) {
                         log::warn!("PTY middle-click paste failed: {e}");
                     }
                     state.last_input_time = std::time::Instant::now();

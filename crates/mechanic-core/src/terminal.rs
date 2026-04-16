@@ -23,6 +23,21 @@ use crate::error::TerminalError;
 use crate::event::{EventProxy, TerminalEvent};
 use crate::pty::PtyHandle;
 
+// ── Bracketed-paste constants ─────────────────────────────────────────────────
+
+/// DECSET 2004 start-of-paste marker, written as a raw byte slice so
+/// [`Terminal::paste`] can splice it into the outgoing buffer without
+/// any UTF-8 trip.
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+
+/// DECSET 2004 end-of-paste marker.  Paired with [`BRACKETED_PASTE_START`].
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Total bytes the start+end markers add to a payload.  Used as a
+/// capacity hint when allocating the outgoing buffer.
+const BRACKETED_PASTE_WRAP_OVERHEAD: usize =
+    BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len();
+
 // ── Terminal ──────────────────────────────────────────────────────────────────
 
 /// A running terminal session.
@@ -119,6 +134,57 @@ impl Terminal {
     pub fn write_to_pty(&mut self, data: &[u8]) -> Result<(), TerminalError> {
         self.term.scroll_display(Scroll::Bottom);
         self.pty.write(data)
+    }
+
+    /// Send `text` to the PTY as a paste, with clipboard-injection safety
+    /// filtering.
+    ///
+    /// Filters applied unconditionally:
+    ///
+    /// - Bracketed-paste markers (`\x1b[200~` and `\x1b[201~`) are
+    ///   stripped.  A clipboard payload containing the end marker
+    ///   could otherwise escape the bracketed-paste wrap and smuggle
+    ///   keystrokes into the shell — the canonical paste-injection
+    ///   attack.
+    /// - `\r\n` and lone `\r` are normalized to `\n` so pastes from
+    ///   Windows / classic-Mac applications behave consistently and
+    ///   a stray `\r` cannot act as "press Enter" in a non-bracketed
+    ///   shell.
+    ///
+    /// Additional filtering when the shell has *not* enabled bracketed
+    /// paste:
+    ///
+    /// - Any trailing newline is stripped.  Without bracketed paste
+    ///   the shell reads each byte as a keystroke, so a trailing `\n`
+    ///   would auto-execute the last pasted line before the user can
+    ///   review it.  Embedded newlines are preserved for legitimate
+    ///   multi-line pastes (heredocs, SQL, etc.).
+    ///
+    /// When bracketed paste IS active the filtered payload is wrapped
+    /// in `\x1b[200~ … \x1b[201~` so readline treats it as a single
+    /// edit (one undo step, history-expansion disabled, etc.).
+    ///
+    /// Prefer this over [`Self::write_to_pty`] for any byte stream
+    /// that originated outside the user's physical keyboard — the
+    /// system clipboard, X11-style middle-click primary selection,
+    /// drag-and-drop, or any future shell-integrated paste command.
+    pub fn paste(&mut self, text: &str) -> Result<(), TerminalError> {
+        let bracketed = self.bracketed_paste();
+        let filtered = crate::paste::filter(text, bracketed);
+
+        if bracketed {
+            // Wrap the sanitized payload in DECSET 2004 markers so
+            // readline handles it as one edit.  `filter` has removed
+            // any embedded markers, so the open/close bracket cannot
+            // be escaped from inside.
+            let mut payload = Vec::with_capacity(filtered.len() + BRACKETED_PASTE_WRAP_OVERHEAD);
+            payload.extend_from_slice(BRACKETED_PASTE_START);
+            payload.extend_from_slice(filtered.as_bytes());
+            payload.extend_from_slice(BRACKETED_PASTE_END);
+            self.write_to_pty(&payload)
+        } else {
+            self.write_to_pty(filtered.as_bytes())
+        }
     }
 
     // ── Resize ────────────────────────────────────────────────────────────────
@@ -390,6 +456,51 @@ mod tests {
         // Clear on a fresh terminal (no history yet) should be a no-op that
         // doesn't panic.
         term.clear_history();
+    }
+
+    #[test]
+    fn terminal_paste_plain_text_succeeds() {
+        // Smoke test: happy-path paste doesn't panic and doesn't error.
+        // Filter-level semantics are covered exhaustively by
+        // `paste::tests` — here we just verify the plumbing from
+        // `Terminal::paste` through the filter into the PTY works.
+        let config = Config::default();
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+
+        term.paste("echo hello\n").expect("plain paste should succeed");
+    }
+
+    #[test]
+    fn terminal_paste_tolerates_injection_attempt() {
+        // Payload contains the bracketed-paste end marker — the filter
+        // must strip it so no shell-injection vector survives.  We
+        // can't easily read the PTY back to assert the exact bytes,
+        // but we can verify the call itself doesn't panic or error
+        // and that the filter module did its job (covered by its own
+        // tests).  This test exists as a regression guard: if someone
+        // ever replaces `paste` with a naive write that skips the
+        // filter, this path still runs but `paste::tests` would have
+        // already failed at compile/test time.
+        let config = Config::default();
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+
+        let malicious = "safe\x1b[201~; rm -rf /";
+        term.paste(malicious).expect("filtered paste should succeed");
+    }
+
+    #[test]
+    fn terminal_paste_empty_string_succeeds() {
+        // Edge case: user pastes nothing (empty clipboard).  Should
+        // be a no-op-like write that the PTY tolerates.  Wrapped
+        // bracketed-paste markers around an empty payload are still
+        // a valid (if pointless) DECSET 2004 exchange.
+        let config = Config::default();
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size).expect("terminal should spawn");
+
+        term.paste("").expect("empty paste should succeed");
     }
 
     #[test]
