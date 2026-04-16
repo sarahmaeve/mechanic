@@ -118,6 +118,9 @@ impl App {
         let size = window.inner_size();
         let scale_factor = window.scale_factor() as f32;
 
+        // `Renderer::new` is async (wgpu adapter/device requests).  We use
+        // `pollster::block_on` to drive the future to completion on the main
+        // thread without spawning a runtime.
         let renderer = match pollster::block_on(Renderer::new(
             window.clone(),
             (size.width, size.height),
@@ -147,6 +150,8 @@ impl App {
         let clipboard =
             arboard::Clipboard::new().map_err(|e| log::warn!("clipboard unavailable: {e}")).ok();
 
+        // Enable IME events so the OS delivers Preedit/Commit notifications
+        // for composed input (accented Latin characters, CJK input, etc.).
         window.set_ime_allowed(true);
 
         let window_id = window.id();
@@ -222,18 +227,32 @@ impl ApplicationHandler for App {
 
     /// Handles all windowing events for a single window.
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        // Intercept Cmd+N before the per-window state lookup so we can mutate
-        // `self.windows`.  The key event state read doesn't need a window
-        // reference for this shortcut.
+        // Intercept window-management shortcuts (Cmd+N, Cmd+W) before the
+        // per-window state lookup so we can mutate `self.windows`.  Both
+        // need `&mut self`, which would conflict with a borrowed AppState.
         if let WindowEvent::KeyboardInput { event: ref key_event, .. } = event {
             if key_event.state == ElementState::Pressed {
                 let modifiers_snapshot = self.windows.get(&id).map(|s| s.modifiers);
                 if let (Some(modifiers), Key::Character(c)) =
                     (modifiers_snapshot, &key_event.logical_key)
                 {
-                    if modifiers.super_key() && c.as_str() == "n" {
-                        let _ = self.spawn_window(event_loop);
-                        return;
+                    if modifiers.super_key() {
+                        match c.as_str() {
+                            "n" => {
+                                let _ = self.spawn_window(event_loop);
+                                return;
+                            }
+                            "w" => {
+                                // Close the window that received the event.
+                                self.windows.remove(&id);
+                                if self.windows.is_empty() {
+                                    log::info!("all windows closed — exiting");
+                                    event_loop.exit();
+                                }
+                                return;
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -344,6 +363,9 @@ impl ApplicationHandler for App {
                         }
                     }
                     Ime::Preedit(text, cursor) => {
+                        // Position the IME candidate window near the terminal
+                        // cursor so popups appear where the user is typing
+                        // instead of the window's top-left corner.
                         let (cx, cy) = {
                             let grid = state.terminal.grid();
                             let cp = grid.cursor.point;
@@ -357,6 +379,9 @@ impl ApplicationHandler for App {
                             LogicalPosition::new(px, py),
                             LogicalSize::new(cw as f64, ch as f64),
                         );
+                        // Inline preedit display (showing the in-progress
+                        // composition at the cursor) is deferred — a full
+                        // implementation would overlay the preedit string.
                         let _ = (text, cursor);
                     }
                     Ime::Enabled | Ime::Disabled => {}
@@ -380,6 +405,8 @@ impl ApplicationHandler for App {
                         state.terminal.start_selection(point, side);
                     }
                     ElementState::Released => {
+                        // Selection persists after release until cleared by a
+                        // new click or keyboard input — matches iTerm2.
                         state.mouse_pressed = false;
                     }
                 }
