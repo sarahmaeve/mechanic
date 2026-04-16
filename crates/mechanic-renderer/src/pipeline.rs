@@ -498,7 +498,31 @@ impl RenderState {
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
-        // ── Build instance list ───────────────────────────────────────────────
+        // ── Pass 1: populate the atlas with every unique glyph this frame ─────
+        //
+        // Atlas grows (capacity-doubling in TextRenderer::alloc_slot) clear
+        // the atlas_map and invalidate UVs that were computed against the
+        // pre-grow texture layout.  If a grow happens *during* instance
+        // emission, some instances reference old UVs and later instances
+        // reference new UVs — the draw samples both against the (now-new)
+        // texture and the user sees a one-frame flash of garbled glyphs.
+        //
+        // Rasterizing all unique glyphs up front moves every grow to
+        // before instance emission, so the atlas stays stable through the
+        // rest of the frame.  The second-pass rasterize_char calls below
+        // all hit the char_cache fast path — no growth can occur.
+        //
+        // Typical English-grid frames have <200 unique (char, bold, italic)
+        // triples; the HashSet is tiny.
+        let unique_glyphs = collect_unique_glyphs(grid);
+        text_renderer.populate_atlas(
+            unique_glyphs,
+            &self.device,
+            &self.queue,
+            font_config,
+        );
+
+        // ── Pass 2: build instance list against the now-stable atlas ──────────
 
         let total_cells = grid.cols * grid.rows;
         let mut instances: Vec<GpuInstance> = Vec::with_capacity(total_cells * 2);
@@ -529,7 +553,9 @@ impl RenderState {
                     _pad: [0; 3],
                 });
 
-                // Glyph instance (only when a glyph exists).
+                // Glyph instance (only when a glyph exists).  After the
+                // pass-1 populate, this call always hits the cache and
+                // cannot trigger an atlas grow.
                 if cell.character != ' ' {
                     let bold = cell.flags.contains(crate::grid::CellFlags::BOLD);
                     let italic = cell.flags.contains(crate::grid::CellFlags::ITALIC);
@@ -682,5 +708,146 @@ impl RenderState {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Collect the set of unique `(char, bold, italic)` glyph keys that
+/// need to be rendered for `grid` this frame.
+///
+/// Pure function over the grid — no GPU interaction — so the atlas-
+/// pre-population logic can be exercised without a wgpu device.
+/// Space cells are skipped because the renderer draws no glyph for
+/// them (the cell's background quad is sufficient).
+fn collect_unique_glyphs(
+    grid: &RenderGrid,
+) -> std::collections::HashSet<(char, bool, bool)> {
+    let mut unique = std::collections::HashSet::with_capacity(128);
+    for cell in &grid.cells {
+        if cell.character != ' ' {
+            let bold = cell.flags.contains(crate::grid::CellFlags::BOLD);
+            let italic = cell.flags.contains(crate::grid::CellFlags::ITALIC);
+            unique.insert((cell.character, bold, italic));
+        }
+    }
+    unique
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grid::{CellFlags, RenderCell, RenderGrid};
+
+    fn make_grid_with_cells(cols: usize, rows: usize, cells: Vec<RenderCell>) -> RenderGrid {
+        let mut grid = RenderGrid::new(cols, rows);
+        for (i, cell) in cells.into_iter().enumerate() {
+            if i < grid.cells.len() {
+                grid.cells[i] = cell;
+            }
+        }
+        grid
+    }
+
+    fn cell(ch: char, flags: CellFlags) -> RenderCell {
+        RenderCell { character: ch, flags, ..Default::default() }
+    }
+
+    #[test]
+    fn unique_glyphs_empty_grid() {
+        // A blank grid (all default-constructed cells are spaces) has
+        // no glyphs to rasterize.  The fix must not submit empty work.
+        let grid = RenderGrid::new(10, 5);
+        assert!(collect_unique_glyphs(&grid).is_empty());
+    }
+
+    #[test]
+    fn unique_glyphs_all_spaces_produces_empty_set() {
+        let grid = make_grid_with_cells(
+            3,
+            1,
+            vec![cell(' ', CellFlags::empty()), cell(' ', CellFlags::empty()), cell(' ', CellFlags::empty())],
+        );
+        assert!(collect_unique_glyphs(&grid).is_empty());
+    }
+
+    #[test]
+    fn unique_glyphs_dedups_repeated_chars() {
+        // Many cells showing "h" at the same style should yield one
+        // entry — this is why we use a HashSet.  A filled-screen of a
+        // single character stays cheap to pre-rasterize.
+        let cells = vec![cell('h', CellFlags::empty()); 20];
+        let grid = make_grid_with_cells(5, 4, cells);
+        let u = collect_unique_glyphs(&grid);
+        assert_eq!(u.len(), 1);
+        assert!(u.contains(&('h', false, false)));
+    }
+
+    #[test]
+    fn unique_glyphs_distinguishes_style_variants() {
+        // Same character, different (bold, italic) combinations are
+        // distinct atlas entries because they rasterize to different
+        // bitmaps.  Atlas population must cover each combo.
+        let grid = make_grid_with_cells(
+            4,
+            1,
+            vec![
+                cell('a', CellFlags::empty()),
+                cell('a', CellFlags::BOLD),
+                cell('a', CellFlags::ITALIC),
+                cell('a', CellFlags::BOLD | CellFlags::ITALIC),
+            ],
+        );
+        let u = collect_unique_glyphs(&grid);
+        assert_eq!(u.len(), 4);
+        assert!(u.contains(&('a', false, false)));
+        assert!(u.contains(&('a', true, false)));
+        assert!(u.contains(&('a', false, true)));
+        assert!(u.contains(&('a', true, true)));
+    }
+
+    #[test]
+    fn unique_glyphs_mixed_chars_and_spaces() {
+        // Realistic scattered mix: the returned set contains exactly
+        // the non-space chars, each counted once.
+        let grid = make_grid_with_cells(
+            6,
+            1,
+            vec![
+                cell('H', CellFlags::empty()),
+                cell('i', CellFlags::empty()),
+                cell(' ', CellFlags::empty()),
+                cell('!', CellFlags::empty()),
+                cell(' ', CellFlags::empty()),
+                cell('H', CellFlags::empty()),
+            ],
+        );
+        let u = collect_unique_glyphs(&grid);
+        assert_eq!(u.len(), 3);
+        assert!(u.contains(&('H', false, false)));
+        assert!(u.contains(&('i', false, false)));
+        assert!(u.contains(&('!', false, false)));
+    }
+
+    #[test]
+    fn unique_glyphs_underlined_does_not_split_from_plain() {
+        // Underline is a rendering flag, not a glyph-rasterization
+        // flag — the same glyph bitmap is used, the underline is
+        // drawn as a separate quad in the shader.  So an underlined
+        // 'a' and a plain 'a' are the same atlas key.  (Only BOLD
+        // and ITALIC affect the bitmap the atlas stores.)
+        let grid = make_grid_with_cells(
+            2,
+            1,
+            vec![
+                cell('a', CellFlags::empty()),
+                cell('a', CellFlags::UNDERLINE),
+            ],
+        );
+        let u = collect_unique_glyphs(&grid);
+        assert_eq!(u.len(), 1);
+        assert!(u.contains(&('a', false, false)));
     }
 }

@@ -313,6 +313,45 @@ impl TextRenderer {
 
     // ── Rasterization ─────────────────────────────────────────────────────────
 
+    /// Pre-rasterize a set of glyphs into the atlas.
+    ///
+    /// Use this before a pipeline's instance-building pass to stabilize
+    /// the atlas: subsequent [`Self::rasterize_char`] calls for the same
+    /// `(char, bold, italic)` triples will all hit the fast-path cache,
+    /// so no atlas grow can happen during instance emission.
+    ///
+    /// # Why this exists
+    ///
+    /// Atlas growth (capacity-doubling inside [`Self::alloc_slot`])
+    /// clears `atlas_map` and invalidates any UVs already computed for
+    /// the glyphs that were in the old texture.  If a grow fires
+    /// mid-render-pass, some instances in the draw buffer reference
+    /// coordinates from the old texture while later instances reference
+    /// the new one — and both get sampled against the same bound atlas
+    /// view.  Result: a one-frame flash of garbled glyphs the moment
+    /// the atlas exceeds capacity (commonly when the user first types a
+    /// CJK character, emoji, or unusual symbol).
+    ///
+    /// Pre-populating the atlas with every unique glyph the frame needs
+    /// moves all grow events to before instance emission, so the atlas
+    /// stays put for the rest of the frame.
+    pub fn populate_atlas<I>(
+        &mut self,
+        glyphs: I,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &FontConfig,
+    ) where
+        I: IntoIterator<Item = (char, bool, bool)>,
+    {
+        for (ch, bold, italic) in glyphs {
+            // Return value ignored — we just want the atlas entry
+            // populated.  The pipeline's second pass will call
+            // rasterize_char again and consume the cached GlyphInfo.
+            self.rasterize_char(ch, bold, italic, device, queue, config);
+        }
+    }
+
     /// Pre-rasterize printable ASCII glyphs (U+0020 – U+007E).
     fn rasterize_ascii_range(
         &mut self,
