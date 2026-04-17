@@ -44,17 +44,64 @@ fn rgb_to_f32(c: Rgb) -> [f32; 4] {
     [f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0, 1.0]
 }
 
+// ── Instance discriminants ────────────────────────────────────────────────────
+//
+// The `use_atlas` field on [`GpuInstance`] selects which fragment-shader
+// branch the instance flows through.  Three values are meaningful; the
+// shader panics (via the default arm / discard) on anything else.
+//
+// Kept in sync with the `if in.use_atlas == N` chain in `cell.wgsl`.
+
+/// Solid-fill background or cursor quad — the fragment outputs
+/// `bg_color` directly (optionally mixed with the gradient in the
+/// background path).  Covers cell backgrounds and bar/underline
+/// cursors.
+const SOLID_USE_ATLAS: u32 = 0;
+
+/// Atlas-sampled glyph — the fragment samples the atlas texture at
+/// the instance's UV rect, multiplies coverage by `text_opacity`,
+/// and mixes `fg_color` over `bg_color` accordingly.
+#[expect(dead_code, reason = "reserved for future callers; paired with the _USE_ATLAS constants")]
+const GLYPH_USE_ATLAS: u32 = 1;
+
+/// Hollow-block cursor outline — the fragment keeps only pixels
+/// within [`HOLLOW_CURSOR_BORDER_PX`] of a cell edge (in local-cell
+/// coordinates) and `discard`s the interior so the cell's glyph
+/// beneath stays readable.  Emitted by the renderer only for
+/// unfocused windows with a Block cursor style.
+const HOLLOW_BLOCK_USE_ATLAS: u32 = 2;
+
+/// Thickness of the hollow-block cursor outline, in physical
+/// pixels.  `1.5` reads as a single clean pixel on non-Retina
+/// displays and a crisp 3 px on 2× Retina; fine-tune if it looks
+/// too thin or too thick once running.  Kept in sync with the
+/// WGSL fragment shader's hollow-block branch.
+#[expect(dead_code, reason = "used in the shader; recorded here so both sides drift together")]
+const HOLLOW_CURSOR_BORDER_PX: f32 = 1.5;
+
 // ── Per-frame shader inputs ───────────────────────────────────────────────────
 
-/// The four per-frame values the caller feeds to `render` /
-/// `render_animation` — bundled into a struct so adding a fifth
-/// shader input (say, a cursor blink phase) doesn't push the render
-/// signature past clippy's 7-argument threshold or make the call site
-/// a forest of positional floats.
+/// Per-frame values the caller feeds to `render` / `render_animation`
+/// — bundled into a struct so adding another shader input doesn't push
+/// the render signature past clippy's 7-argument threshold or make
+/// the call site a forest of positional floats.
 ///
 /// Everything else the shader needs — viewport size, cell size, atlas
 /// contents — is derived from the renderer's own retained state and
 /// is not part of this struct.
+///
+/// Two distinct focus-derived flags live here:
+///
+/// - [`shader_focused`](Self::shader_focused) gates the shader's
+///   continuous time-based animations (gradient breath, colour
+///   rotation, electron pulses).  It's `true` only when the window
+///   has real keyboard focus *and* `--hot-cpu` is on, because those
+///   animations are unbounded and must stay opt-in.
+/// - [`window_focused`](Self::window_focused) tracks the real OS
+///   focus state, independent of `--hot-cpu`.  Used for the focus-
+///   aware cursor style (solid block when focused, hollow outline
+///   when blurred) and anything else that should follow real focus
+///   even when the shader clock is frozen.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameUniforms {
     /// Window-level alpha: how much of the desktop bleeds through.
@@ -68,18 +115,56 @@ pub struct FrameUniforms {
     /// Not applied to background cells — only to text.
     pub text_opacity: f32,
     /// Seconds since the window was created.  Drives the shader's
-    /// time-based animations (corner gradient breath, color pulse,
-    /// electron traces) when `focused` is true.
+    /// time-based animations (corner gradient breath, colour pulse,
+    /// electron traces) when `shader_focused` is true.
     pub time: f32,
-    /// Whether the shader's time-based animations should advance.
-    /// `false` pins the gradient/electrons at `t=0`, which is how
-    /// the `--hot-cpu`-off default runs even when the window has
-    /// real keyboard focus — keeps the event loop asleep at idle.
-    pub focused: bool,
+    /// Whether the shader's continuous time-based animations should
+    /// advance.  `false` pins the gradient/electrons at `t=0`.
+    /// `true` only when the window has OS focus **and** `--hot-cpu`
+    /// is on — the continuous animations are unbounded, so they
+    /// stay opt-in per `design/CPU-SPEC.md` rule 3.
+    pub shader_focused: bool,
+    /// Real OS keyboard focus state, independent of `--hot-cpu`.
+    /// Drives the solid-vs-hollow block cursor selection and other
+    /// signals that should reflect focus even in the quiet default
+    /// mode.  `true` when the window is the key window; `false`
+    /// when another window or app has focus.
+    pub window_focused: bool,
+    /// Progress through the focus-gain bloom animation, in
+    /// `[0.0, 1.0]`.  `0.0` before the bloom has committed or after
+    /// it has completed; fractional values during the ≈ 250 ms
+    /// animation window.  The shader applies a `sin(progress × π)`
+    /// envelope so the curve eases naturally into and out of peak.
+    /// See [`OpacityConfig::bloom_duration_ms`] for the timing.
+    ///
+    /// [`OpacityConfig::bloom_duration_ms`]: mechanic_config::theme::OpacityConfig::bloom_duration_ms
+    pub bloom_progress: f32,
+    /// Peak scale factor applied to the corner logo's display
+    /// opacity at the midpoint of the bloom curve.  Passed through
+    /// to the shader so the effect can be tuned from
+    /// `mechanic.toml` without a rebuild.  `1.0` disables the
+    /// visible bloom (scheduler still runs the animation but no
+    /// pixel difference appears); `1.4` is the default lift.
+    /// Mirrors [`OpacityConfig::bloom_peak_multiplier`].
+    ///
+    /// [`OpacityConfig::bloom_peak_multiplier`]: mechanic_config::theme::OpacityConfig::bloom_peak_multiplier
+    pub bloom_peak_multiplier: f32,
 }
 
 // ── Globals uniform ───────────────────────────────────────────────────────────
 
+/// GPU-side mirror of [`FrameUniforms`], laid out to match the
+/// `Globals` struct in `cell.wgsl`.
+///
+/// Layout: 48 bytes, 16-byte aligned.  The first 32 bytes are the
+/// original four-field layout (viewport, cell, time, content_opacity,
+/// shader_focused, text_opacity); the added 16 bytes hold
+/// `bloom_progress` plus three `f32` padding slots to keep the struct
+/// size a multiple of 16.  The padding is intentional headroom — the
+/// next shader input (say, a cursor blink phase, or a carousel tilt
+/// angle for Phase 6) can slot into one of those `_pad` positions
+/// without re-aligning the struct, avoiding a churn commit that
+/// renames every uniform binding.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Globals {
@@ -87,17 +172,23 @@ struct Globals {
     cell_size: [f32; 2],
     time: f32,
     content_opacity: f32,
-    /// 1.0 when the window has keyboard focus, 0.0 when blurred.  Gates the
-    /// corner-gradient color pulse so unfocused/faded windows stay static.
-    focused: f32,
-    /// Multiplier applied to glyph coverage in the text path.  1.0
-    /// when the window is focused; typically a lower value (e.g.
-    /// 0.55) when unfocused so text reads as ghosted toward its cell
-    /// background, giving an idle window a visibly quieter feel
-    /// without touching the overall window alpha.  Occupies the slot
-    /// that used to be alignment padding — the struct is still 32
-    /// bytes and 16-byte aligned.
+    /// 1.0 when the shader's continuous animations should advance,
+    /// 0.0 otherwise.  Derived from [`FrameUniforms::shader_focused`]
+    /// — OS focus AND `--hot-cpu`.  Not a raw focus bit.
+    shader_focused: f32,
+    /// Glyph-coverage multiplier for the text path.  1.0 for focused
+    /// windows; configurable idle value for blurred windows.  See
+    /// [`FrameUniforms::text_opacity`].
     text_opacity: f32,
+    /// Progress through the focus-gain bloom in `[0, 1]`.  See
+    /// [`FrameUniforms::bloom_progress`].
+    bloom_progress: f32,
+    /// Peak multiplier applied to logo opacity at bloom midpoint.
+    /// See [`FrameUniforms::bloom_peak_multiplier`].
+    bloom_peak_multiplier: f32,
+    /// Reserved for future per-frame uniforms.  Kept at end of
+    /// struct so adding a value is a rename, not a reshuffle.
+    _pad: [f32; 2],
 }
 
 // ── RenderState ───────────────────────────────────────────────────────────────
@@ -370,8 +461,16 @@ impl RenderState {
             cell_size: [cell_size.0, cell_size.1],
             time: 0.0,
             content_opacity: 1.0,
-            focused: 1.0,
+            shader_focused: 1.0,
             text_opacity: 1.0,
+            bloom_progress: 0.0,
+            // Sentinel `1.0` so the initial frame and any post-resize
+            // frame that arrives before `render()` repopulates the
+            // uniform render identically with or without the bloom
+            // field present — `mix(1.0, 1.0, anything) = 1.0`, so
+            // there's no visible effect until the real value lands.
+            bloom_peak_multiplier: 1.0,
+            _pad: [0.0; 2],
         };
 
         let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -512,8 +611,16 @@ impl RenderState {
             cell_size: [self.cell_size.0, self.cell_size.1],
             time: 0.0,
             content_opacity: 1.0,
-            focused: 1.0,
+            shader_focused: 1.0,
             text_opacity: 1.0,
+            bloom_progress: 0.0,
+            // Sentinel `1.0` so the initial frame and any post-resize
+            // frame that arrives before `render()` repopulates the
+            // uniform render identically with or without the bloom
+            // field present — `mix(1.0, 1.0, anything) = 1.0`, so
+            // there's no visible effect until the real value lands.
+            bloom_peak_multiplier: 1.0,
+            _pad: [0.0; 2],
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
@@ -553,8 +660,11 @@ impl RenderState {
             cell_size: [self.cell_size.0, self.cell_size.1],
             time: uniforms.time,
             content_opacity: uniforms.content_opacity,
-            focused: if uniforms.focused { 1.0 } else { 0.0 },
+            shader_focused: if uniforms.shader_focused { 1.0 } else { 0.0 },
             text_opacity: uniforms.text_opacity,
+            bloom_progress: uniforms.bloom_progress,
+            bloom_peak_multiplier: uniforms.bloom_peak_multiplier,
+            _pad: [0.0; 2],
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
@@ -644,32 +754,57 @@ impl RenderState {
         }
 
         // ── Draw cursor ───────────────────────────────────────────────────────
+        //
+        // Three paths, selected by `(cursor_style, window_focused)`:
+        //
+        // 1. Block + focused   → no quad here.  `convert.rs` has already
+        //                        recolored the cell's background to the
+        //                        cursor colour; the glyph remains visible
+        //                        through the solid block for free.
+        // 2. Block + unfocused → emit a full-cell quad with
+        //                        `use_atlas = 2u` ("hollow-block").  The
+        //                        fragment shader keeps only pixels within
+        //                        `HOLLOW_CURSOR_BORDER_PX` of a cell edge
+        //                        and discards the interior, so the cell's
+        //                        original glyph shows through the outline.
+        //                        Standard iTerm2 / Terminal.app convention.
+        // 3. Bar / Underline    → emit a sub-cell quad (2 px strip) in
+        //                        cursor colour.  Focus-state-independent —
+        //                        these cursor styles don't cover the glyph
+        //                        in either state, so there's no readable/
+        //                        unreadable distinction to make.
 
         {
             use crate::grid::CursorStyle;
             use mechanic_config::theme::palette;
 
-            // Block cursors are rendered by recoloring the cell itself in
-            // `convert.rs` (so the character stays visible), so nothing to
-            // draw here.  Bar and Underline don't overlap the glyph and are
-            // still drawn as separate quads on top.
-            let needs_quad = !matches!(grid.cursor_style, CursorStyle::Block);
+            let (cx, cy) = grid.cursor_position;
+            if grid.get(cx, cy).is_some() {
+                let cursor_color = palette::CELESTE;
+                let cell_w = self.cell_size.0;
+                let cell_h = self.cell_size.1;
 
-            if needs_quad {
-                let (cx, cy) = grid.cursor_position;
-                if grid.get(cx, cy).is_some() {
-                    let cursor_color = palette::CELESTE;
-                    let cell_w = self.cell_size.0;
-                    let cell_h = self.cell_size.1;
+                // Pick the quad geometry and shader-path discriminant for
+                // each (style, focus) combination, or `None` for the "no
+                // quad needed" case (focused block, handled in convert.rs).
+                let quad = match (grid.cursor_style, uniforms.window_focused) {
+                    // Hollow block — full-cell quad, shader outlines it.
+                    (CursorStyle::Block, false) => {
+                        Some(([0.0f32, 0.0f32], [cell_w, cell_h], HOLLOW_BLOCK_USE_ATLAS))
+                    }
+                    // Solid block, focused — cell already recoloured, skip.
+                    (CursorStyle::Block, true) => None,
+                    // Bar — 2 px strip at the left edge.
+                    (CursorStyle::Bar, _) => {
+                        Some(([0.0f32, 0.0f32], [2.0f32, cell_h], SOLID_USE_ATLAS))
+                    }
+                    // Underline — 2 px strip at the bottom edge.
+                    (CursorStyle::Underline, _) => {
+                        Some(([0.0f32, cell_h - 2.0f32], [cell_w, 2.0f32], SOLID_USE_ATLAS))
+                    }
+                };
 
-                    // Bar: 2px wide on the left edge.
-                    // Underline: full width, 2px tall at the bottom edge.
-                    let (glyph_offset, glyph_size) = match grid.cursor_style {
-                        CursorStyle::Bar => ([0.0f32, 0.0f32], [2.0f32, cell_h]),
-                        CursorStyle::Underline => ([0.0f32, cell_h - 2.0f32], [cell_w, 2.0f32]),
-                        CursorStyle::Block => unreachable!(),
-                    };
-
+                if let Some((glyph_offset, glyph_size, use_atlas)) = quad {
                     instances.push(GpuInstance {
                         cell_pos: [cx as u32, cy as u32],
                         atlas_uv: [0.0; 4],
@@ -677,7 +812,7 @@ impl RenderState {
                         bg_color: rgb_to_f32(cursor_color),
                         glyph_offset,
                         glyph_size,
-                        use_atlas: 0,
+                        use_atlas,
                         _pad: [0; 3],
                     });
                 }
@@ -807,8 +942,11 @@ impl RenderState {
             cell_size: [self.cell_size.0, self.cell_size.1],
             time: uniforms.time,
             content_opacity: uniforms.content_opacity,
-            focused: if uniforms.focused { 1.0 } else { 0.0 },
+            shader_focused: if uniforms.shader_focused { 1.0 } else { 0.0 },
             text_opacity: uniforms.text_opacity,
+            bloom_progress: uniforms.bloom_progress,
+            bloom_peak_multiplier: uniforms.bloom_peak_multiplier,
+            _pad: [0.0; 2],
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 

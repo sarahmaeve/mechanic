@@ -135,6 +135,44 @@ struct AppState {
     /// while it's non-zero.  Zero at steady state means no extra
     /// ticks and the event loop sleeps on [`ControlFlow::Wait`].
     focus_redraw_frames: u8,
+    /// When this window most recently gained keyboard focus, or
+    /// `None` if currently unfocused or the pending bloom has
+    /// already committed.  Acts as the debounce input to the
+    /// bloom-commit check.
+    ///
+    /// A bloom fires only once the focus has been held continuously
+    /// for [`OpacityConfig::bloom_dwell_ms`][dwell] — rapid Cmd+`
+    /// cycling through windows produces focus events on every
+    /// intermediate window but no bloom visibly commits, because
+    /// each window's `focus_gain_at` is cleared (by the next
+    /// `Focused(false)`) before the dwell elapses.  Only the window
+    /// the user settles on keeps `focus_gain_at` set long enough
+    /// for [`render_frame`] to commit its bloom.
+    ///
+    /// The commit check is intentionally piggybacked on the
+    /// frames that [`focus_redraw_frames`] is already keeping the
+    /// loop awake for — no new classifier arm or scheduler wake
+    /// is needed.  Invariant: `bloom_dwell_ms ≤
+    /// FOCUS_REDRAW_BURST_FRAMES × FRAME_INTERVAL`.  Unit-tested
+    /// in `mechanic-config` and `app.rs`.
+    ///
+    /// [dwell]: mechanic_config::theme::OpacityConfig::bloom_dwell_ms
+    /// [`focus_redraw_frames`]: AppState::focus_redraw_frames
+    focus_gain_at: Option<Instant>,
+    /// When the focus-gain bloom animation actually began rendering,
+    /// or `None` if no bloom is currently playing.  Populated by the
+    /// dwell-commit check in [`render_frame`] once
+    /// `focus_gain_at.elapsed() >= bloom_dwell_ms`; cleared by the
+    /// same function once `bloom_start.elapsed() >= bloom_duration_ms`.
+    ///
+    /// The classifier reads this to decide whether to schedule the
+    /// next bloom frame; [`render_frame`] reads it to compute the
+    /// `bloom_progress` uniform the shader uses to drive the logo
+    /// brightness lift.  Unaffected by `Focused(false)` events —
+    /// once a bloom has committed, it runs to completion even if
+    /// focus shifts away, per the design decision in
+    /// `design/CPU-SPEC.md`.
+    bloom_start: Option<Instant>,
 }
 
 /// Number of frames to force-redraw after a focus change.  At ~30 FPS
@@ -197,6 +235,21 @@ impl App {
         hot_cpu: bool,
         mouse_tracking: bool,
     ) -> Self {
+        // One-shot diagnostic at construction — makes the effective
+        // bloom configuration visible when the user runs with
+        // RUST_LOG=mechanic=info.  Catches stale-config and
+        // default-override surprises without requiring the user to
+        // `toml::from_str` their own file.  Left commented-out in
+        // mainline so the default warn-level output stays quiet;
+        // uncomment when debugging bloom visibility regressions.
+        //
+        // log::info!(
+        //     "bloom config: duration={} ms, dwell={} ms, peak={:.2}x, hot_cpu={}",
+        //     config.theme.opacity.bloom_duration_ms,
+        //     config.theme.opacity.bloom_dwell_ms,
+        //     config.theme.opacity.bloom_peak_multiplier,
+        //     hot_cpu,
+        // );
         Self { config, windows: HashMap::new(), proxy, hot_cpu, mouse_tracking }
     }
 
@@ -352,6 +405,12 @@ impl App {
             // initial `Focused(true)` arrives before the first
             // `RedrawRequested` (seen intermittently on macOS).
             focus_redraw_frames: FOCUS_REDRAW_BURST_FRAMES,
+            // Seed the bloom debounce so the opening window blooms
+            // naturally as it appears — the commit check inside
+            // `render_frame` will trip once `bloom_dwell_ms` has
+            // elapsed, which falls inside the focus-redraw burst.
+            focus_gain_at: Some(now),
+            bloom_start: None,
         };
 
         self.windows.insert(window_id, state);
@@ -513,6 +572,29 @@ impl ApplicationHandler<UserEvent> for App {
                 state.focused = focused;
                 state.content_dirty = true;
                 state.focus_redraw_frames = FOCUS_REDRAW_BURST_FRAMES;
+
+                // Bloom state machine, asymmetric by design:
+                //
+                // - Gain (`focused == true`): start the dwell timer.
+                //   `render_frame` will commit the bloom once the
+                //   dwell elapses, unless focus is lost first.  We
+                //   also reset `bloom_start` so a user who blurs and
+                //   re-focuses quickly gets a fresh bloom — no
+                //   lingering state from the previous focus cycle.
+                // - Loss (`focused == false`): clear only the pending-
+                //   commit timer.  Leave `bloom_start` alone — if a
+                //   bloom has already committed, it runs to completion
+                //   even as focus shifts away.  This is the "let it
+                //   complete" decision from the design discussion:
+                //   cleaner scheduler state (single timeout, no
+                //   mid-animation cancel) and aesthetically smoother.
+                if focused {
+                    state.focus_gain_at = Some(Instant::now());
+                    state.bloom_start = None;
+                } else {
+                    state.focus_gain_at = None;
+                }
+
                 state.window.request_redraw();
             }
 
@@ -1135,11 +1217,21 @@ impl ApplicationHandler<UserEvent> for App {
         let now = Instant::now();
         let mut earliest_deadline: Option<Instant> = None;
 
+        // Compute bloom duration once per scheduler tick — the classifier
+        // asks per window whether a bloom is still running, and all
+        // windows share the same configured duration.
+        let bloom_duration =
+            Duration::from_millis(self.config.theme.opacity.bloom_duration_ms as u64);
+
         for state in self.windows.values() {
+            let bloom_active = state.bloom_start.is_some_and(|t| {
+                now.saturating_duration_since(t) < bloom_duration
+            });
             let input = AnimationInputs {
                 is_alive: state.exit_status.is_none(),
                 focused: state.focused,
                 focus_redraw_frames: state.focus_redraw_frames,
+                bloom_active,
             };
             let anim = classify_animation(input, self.hot_cpu, now);
             match anim {
@@ -1404,6 +1496,46 @@ fn cmd_shortcut(c: &str) -> Option<CmdShortcut> {
 /// it while holding a `&mut AppState` borrowed out of `App::windows` —
 /// a method on `&mut App` would conflict with that borrow.
 fn render_frame(state: &mut AppState, config: &Config, hot_cpu: bool) {
+    let now = Instant::now();
+
+    // ── Bloom: commit-on-dwell, then compute progress ────────────────────
+    //
+    // If a focus gain has been held past the dwell and no bloom has
+    // committed yet, latch `bloom_start = Some(now)` and clear
+    // `focus_gain_at` so the check doesn't re-fire next frame.
+    //
+    // Runs every frame, which is cheap (two option checks + an
+    // Instant subtraction) and robust — the commit will fire on
+    // whichever of the focus-redraw-burst frames happens to be the
+    // first one past the dwell deadline.  Rapid Cmd+` cycling clears
+    // `focus_gain_at` before the dwell elapses, so those intermediate
+    // windows never commit a bloom; only the window the user settles
+    // on sees the check pass.
+    let dwell = Duration::from_millis(config.theme.opacity.bloom_dwell_ms as u64);
+    let duration = Duration::from_millis(config.theme.opacity.bloom_duration_ms as u64);
+    if let Some(start) = maybe_commit_bloom(state.focus_gain_at, state.bloom_start, dwell, now) {
+        // log::debug!("bloom: commit at {start:?}");
+        state.bloom_start = Some(start);
+        state.focus_gain_at = None;
+    }
+    let bloom_progress = compute_bloom_progress(state.bloom_start, duration, now);
+    // Per-frame progress log — uncomment in concert with the `bloom config`
+    // info! line in App::new when debugging bloom visibility / timing.
+    // Gated on `> 0.0` so it stays quiet in the (overwhelmingly common)
+    // no-bloom-in-flight state.  `bloom_progress` is consumed below by
+    // the FrameUniforms constructor regardless, so commenting out the
+    // block doesn't leave an unused-binding warning.
+    //
+    // if bloom_progress > 0.0 {
+    //     log::debug!(
+    //         "bloom: progress={bloom_progress:.3} peak_mul={:.2} dur={}ms",
+    //         config.theme.opacity.bloom_peak_multiplier,
+    //         config.theme.opacity.bloom_duration_ms,
+    //     );
+    // }
+
+    // ── Snap signals: opacity, text opacity, shader focus gate ───────────
+    //
     // Opacity snaps to active or idle on focus change — no fade, no
     // timer.  The alpha lands in two places on the GPU side: the
     // clear color for the next frame, and the fragment shader's
@@ -1420,8 +1552,8 @@ fn render_frame(state: &mut AppState, config: &Config, hot_cpu: bool) {
 
     // Shader-side animations (corner gradient brightness breath,
     // color pulse, electron traces on the logo) are all gated on the
-    // `focused` uniform.  Unless `--hot-cpu` was passed we force it
-    // to `false` regardless of real focus state — freezes the
+    // `shader_focused` uniform.  Unless `--hot-cpu` was passed we force
+    // it to `false` regardless of real focus state — freezes the
     // gradient at its midpoint color and constant brightness, and
     // suppresses electron pulses.  The gradient itself still renders
     // as a static corner accent.
@@ -1431,10 +1563,10 @@ fn render_frame(state: &mut AppState, config: &Config, hot_cpu: bool) {
     //
     // 1. Animation fast path — only the shader time/opacity/focused
     //    uniforms changed (focused pulse under `--hot-cpu`, or the
-    //    one-frame opacity snap on focus change).  Reissue the
-    //    previous frame's cached instance draw against a new globals
-    //    uniform.  Skips grid conversion and the ~200 KB instance
-    //    rebuild+upload per frame.
+    //    one-frame opacity snap on focus change, or a bloom frame).
+    //    Reissue the previous frame's cached instance draw against a
+    //    new globals uniform.  Skips grid conversion and the ~200 KB
+    //    instance rebuild+upload per frame.
     //
     // 2. Full render — grid state changed (PTY output, resize, scroll,
     //    selection, etc.) or no prior render has populated the
@@ -1448,16 +1580,36 @@ fn render_frame(state: &mut AppState, config: &Config, hot_cpu: bool) {
         content_opacity: opacity,
         text_opacity,
         time,
-        focused: shader_focused,
+        shader_focused,
+        window_focused: state.focused,
+        bloom_progress,
+        bloom_peak_multiplier: config.theme.opacity.bloom_peak_multiplier,
     };
 
     let did_animation_render =
         !state.content_dirty && state.renderer.render_animation(uniforms);
 
     if !did_animation_render {
-        let grid = crate::convert::convert_grid(&state.terminal, &config.theme);
+        let grid = crate::convert::convert_grid(&state.terminal, &config.theme, state.focused);
         state.renderer.render(&grid, uniforms);
         state.content_dirty = false;
+    }
+
+    // ── Bloom expiry ──────────────────────────────────────────────────────
+    //
+    // Clear `bloom_start` once we've rendered a frame whose progress
+    // reached 1.0 — i.e. the final frame of the animation has just
+    // landed on screen.  From here on `classify_animation` sees
+    // `bloom_start == None` and returns Idle (for the bloom rule),
+    // letting the loop sleep.  Clearing AFTER the render, not before,
+    // guarantees that exact-1.0 frame is still submitted — at which
+    // point `sin(1.0 × π) = 0` so no visible pixel change anyway, but
+    // the invariant is cleaner if we commit to "one frame at each
+    // progress step in [0, 1], inclusive".
+    if let Some(t) = state.bloom_start {
+        if now.saturating_duration_since(t) >= duration {
+            state.bloom_start = None;
+        }
     }
 
     // Title: base from the shell's OSC-set title (or "Mechanic" when
@@ -1473,6 +1625,61 @@ fn render_frame(state: &mut AppState, config: &Config, hot_cpu: bool) {
     state.window.set_title(&title_string);
 }
 
+// ── Bloom helpers ─────────────────────────────────────────────────────────────
+
+/// Decide whether the focus-gain bloom should commit this frame.
+///
+/// Returns `Some(now)` when the dwell has elapsed and no bloom is
+/// currently active — callers latch this value into
+/// [`AppState::bloom_start`] and clear [`AppState::focus_gain_at`].
+/// Returns `None` when the dwell hasn't elapsed, no focus gain is
+/// pending, or a bloom is already in flight (don't double-commit).
+///
+/// Pure.  Unit-testable without any renderer or Terminal setup — all
+/// four inputs are explicit.
+fn maybe_commit_bloom(
+    focus_gain_at: Option<Instant>,
+    bloom_start: Option<Instant>,
+    dwell: Duration,
+    now: Instant,
+) -> Option<Instant> {
+    if bloom_start.is_some() {
+        // A bloom has already committed this cycle.  Don't re-commit
+        // on subsequent frames — the progress computation handles
+        // completion via its own deadline.
+        return None;
+    }
+    focus_gain_at.and_then(|t| {
+        if now.saturating_duration_since(t) >= dwell {
+            Some(now)
+        } else {
+            None
+        }
+    })
+}
+
+/// Compute bloom progress for the current frame, in `[0.0, 1.0]`.
+///
+/// `0.0` when no bloom is active; clamped to `1.0` for the final
+/// frame (and any stray frame arriving past the deadline before the
+/// expiry check has cleared `bloom_start`).  Pure; the shader's
+/// `sin(progress × π)` envelope converts the linear progress into
+/// a smooth 0 → peak → 0 curve.
+fn compute_bloom_progress(
+    bloom_start: Option<Instant>,
+    duration: Duration,
+    now: Instant,
+) -> f32 {
+    match bloom_start {
+        None => 0.0,
+        Some(t) => {
+            let elapsed = now.saturating_duration_since(t).as_secs_f32();
+            let total = duration.as_secs_f32().max(f32::EPSILON);
+            (elapsed / total).clamp(0.0, 1.0)
+        }
+    }
+}
+
 // ── Animation scheduling ──────────────────────────────────────────────────────
 
 /// What a window needs from the event-loop scheduler for the next tick.
@@ -1486,7 +1693,7 @@ enum AnimationState {
 }
 
 /// Inputs to [`classify_animation`] — the minimal slice of `AppState`
-/// the scheduler actually needs.  A small struct (rather than two
+/// the scheduler actually needs.  A small struct (rather than four
 /// positional args) keeps call sites readable and makes unit tests
 /// self-documenting.
 #[derive(Debug, Clone, Copy)]
@@ -1501,6 +1708,18 @@ struct AnimationInputs {
     /// on screen — see [`AppState::focus_redraw_frames`] for why
     /// this exists at all (macOS AppKit quirks).
     focus_redraw_frames: u8,
+    /// `true` when the focus-gain bloom is currently playing (i.e.
+    /// `bloom_start` is set and the configured duration has not yet
+    /// elapsed).  The loop stays `Active` while this is true so the
+    /// shader can advance the `bloom_progress` uniform frame-to-
+    /// frame through the ≈ 250 ms curve.
+    ///
+    /// The caller is responsible for deciding what "in progress"
+    /// means — usually `state.bloom_start.is_some_and(|t|
+    /// t.elapsed() < duration)`.  Keeping the decision in the caller
+    /// avoids threading the duration into [`AnimationInputs`] just
+    /// to recompute it here.
+    bloom_active: bool,
 }
 
 /// Decide what scheduling a window needs right now.
@@ -1516,11 +1735,20 @@ struct AnimationInputs {
 ///    burst counter hits zero so the new state definitely lands on
 ///    screen.  Independent of `hot_cpu` — the snap has to work in
 ///    the quiet default too.
-/// 3. Focused + `hot_cpu` → `Active` every `FRAME_INTERVAL`.  The
+/// 3. `bloom_active` → `Active` every `FRAME_INTERVAL`.  The focus-
+///    gain bloom is playing; the shader needs each frame to advance
+///    the `bloom_progress` uniform through its curve.  Bounded —
+///    the caller clears the flag once the bloom duration elapses,
+///    so this rule never wakes the loop indefinitely.  Independent
+///    of `hot_cpu`: the bloom is the "subtle welcome" signal that
+///    should work in the quiet default too.  Outranked by Rule 1 so
+///    a bloom seeded just before shell exit doesn't keep the loop
+///    awake on a dead window.
+/// 4. Focused + `hot_cpu` → `Active` every `FRAME_INTERVAL`.  The
 ///    corner-gradient breath, color pulse, and electron traces are
 ///    continuous animations driven by the shader clock, so the event
 ///    loop has to keep rendering to move them forward.
-/// 4. Everything else (focused + quiet, or unfocused past the burst)
+/// 5. Everything else (focused + quiet, or unfocused past the burst)
 ///    → `Idle`.  No periodic ticks; the loop sleeps on
 ///    `ControlFlow::Wait` until the next user input or PTY output.
 fn classify_animation(
@@ -1537,10 +1765,14 @@ fn classify_animation(
         return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
     // Rule 3.
+    if input.bloom_active {
+        return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
+    }
+    // Rule 4.
     if input.focused && hot_cpu {
         return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
-    // Rule 4 — catches focused-but-quiet and all unfocused windows.
+    // Rule 5 — catches focused-but-quiet and all unfocused windows.
     AnimationState::Idle
 }
 
@@ -1815,7 +2047,12 @@ mod tests {
     // ── Animation scheduling ──────────────────────────────────────────────────
 
     fn inputs(is_alive: bool, focused: bool) -> AnimationInputs {
-        AnimationInputs { is_alive, focused, focus_redraw_frames: 0 }
+        AnimationInputs {
+            is_alive,
+            focused,
+            focus_redraw_frames: 0,
+            bloom_active: false,
+        }
     }
 
     /// Like [`inputs`] but seeds the post-focus-change burst counter.
@@ -1826,7 +2063,25 @@ mod tests {
         focused: bool,
         focus_redraw_frames: u8,
     ) -> AnimationInputs {
-        AnimationInputs { is_alive, focused, focus_redraw_frames }
+        AnimationInputs {
+            is_alive,
+            focused,
+            focus_redraw_frames,
+            bloom_active: false,
+        }
+    }
+
+    /// Like [`inputs`] but seeds the bloom-active flag.  Used by the
+    /// focus-gain bloom tests to pin the "Rule 3 fires Active
+    /// regardless of `hot_cpu`, but stays outranked by Rule 1
+    /// (frozen)" behaviour.
+    fn inputs_with_bloom(is_alive: bool, focused: bool) -> AnimationInputs {
+        AnimationInputs {
+            is_alive,
+            focused,
+            focus_redraw_frames: 0,
+            bloom_active: true,
+        }
     }
 
     #[test]
@@ -1938,6 +2193,221 @@ mod tests {
         );
     }
 
+    // ── Focus-gain bloom classification ───────────────────────────────────────
+
+    #[test]
+    fn anim_bloom_active_focused_is_active() {
+        // Canonical case: bloom is playing on the focused window.
+        // `hot_cpu` is off so Rule 4 doesn't contribute — any Active
+        // return has to come from the new Rule 3.
+        let now = Instant::now();
+        match classify_animation(inputs_with_bloom(true, true), false, now) {
+            AnimationState::Active { next_frame } => {
+                let delta = next_frame.saturating_duration_since(now);
+                assert!(delta >= FRAME_INTERVAL);
+                assert!(delta <= FRAME_INTERVAL + Duration::from_millis(5));
+            }
+            other => panic!("expected Active during bloom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anim_bloom_runs_to_completion_even_after_focus_loss() {
+        // Design decision from the redesign discussion: once a bloom
+        // has committed, it completes on schedule even if the user
+        // Cmd+Tabs away mid-animation.  `Focused(false)` clears
+        // `focus_gain_at` but not `bloom_start`, so
+        // `bloom_active` remains true and the classifier returns
+        // Active regardless of `focused`.  Aesthetically smoother
+        // than a mid-bloom snap-to-idle.
+        assert!(matches!(
+            classify_animation(inputs_with_bloom(true, false), false, Instant::now()),
+            AnimationState::Active { .. }
+        ));
+    }
+
+    #[test]
+    fn anim_bloom_overrides_hot_cpu_off_default() {
+        // Core win of Rule 3 being independent of `hot_cpu`: the
+        // bloom plays in the quiet default mode, not just under
+        // `--hot-cpu`.  The whole point of the bloom is to replace
+        // the flatness of the snap for users who don't run the
+        // shader light show.  If this test ever fails by returning
+        // Idle, the bloom is silently gated off in the common case.
+        assert!(matches!(
+            classify_animation(inputs_with_bloom(true, true), false, Instant::now()),
+            AnimationState::Active { .. }
+        ));
+    }
+
+    #[test]
+    fn anim_frozen_window_ignores_bloom() {
+        // Rule 1 (frozen → Idle) outranks the new bloom rule just
+        // as it outranks the focus-redraw burst.  A bloom seeded
+        // milliseconds before the shell exited shouldn't keep the
+        // event loop waking on a dead window to animate pixels no
+        // one is going to look at.
+        assert_eq!(
+            classify_animation(inputs_with_bloom(false, true), false, Instant::now()),
+            AnimationState::Idle
+        );
+    }
+
+    #[test]
+    fn anim_bloom_and_hot_cpu_compose_as_active() {
+        // Both reasons are individually sufficient; a focused
+        // window under `--hot-cpu` with a bloom in flight should
+        // return Active (from whichever rule fires first in order,
+        // but the observable behaviour is identical either way).
+        // The test pins that a future refactor that, say, converts
+        // these to `else if` chains doesn't accidentally skip the
+        // hot_cpu rule when bloom is also true.
+        assert!(matches!(
+            classify_animation(inputs_with_bloom(true, true), true, Instant::now()),
+            AnimationState::Active { .. }
+        ));
+    }
+
+    // ── maybe_commit_bloom ────────────────────────────────────────────────────
+
+    #[test]
+    fn commit_fires_when_dwell_elapsed() {
+        // Canonical case: focus has been held longer than the
+        // dwell and no bloom is pending — the commit fires and
+        // returns the new bloom_start value.
+        let now = Instant::now();
+        let gained = now - Duration::from_millis(200);
+        let dwell = Duration::from_millis(120);
+        let result = maybe_commit_bloom(Some(gained), None, dwell, now);
+        assert_eq!(result, Some(now));
+    }
+
+    #[test]
+    fn commit_waits_when_dwell_not_elapsed() {
+        // Focus is still within the dwell window — rapid-cycling
+        // guard.  Returning None here is what stops transient
+        // focuses from blooming.
+        let now = Instant::now();
+        let gained = now - Duration::from_millis(50);
+        let dwell = Duration::from_millis(120);
+        assert_eq!(maybe_commit_bloom(Some(gained), None, dwell, now), None);
+    }
+
+    #[test]
+    fn commit_declines_when_bloom_already_in_flight() {
+        // A bloom has already committed this cycle.  Don't double-
+        // commit even if `focus_gain_at` is still set to some past
+        // value (in practice the commit site clears it, but the
+        // guard must be in the commit fn itself so the invariant
+        // survives a future refactor).
+        let now = Instant::now();
+        let gained = now - Duration::from_millis(200);
+        let already = now - Duration::from_millis(50);
+        let dwell = Duration::from_millis(120);
+        assert_eq!(
+            maybe_commit_bloom(Some(gained), Some(already), dwell, now),
+            None
+        );
+    }
+
+    #[test]
+    fn commit_declines_without_focus_gain() {
+        // Unfocused window, never-focused window, or a window
+        // whose pending-commit was cleared by a subsequent
+        // `Focused(false)`.  No pending gain = nothing to commit.
+        let now = Instant::now();
+        let dwell = Duration::from_millis(120);
+        assert_eq!(maybe_commit_bloom(None, None, dwell, now), None);
+    }
+
+    #[test]
+    fn commit_fires_exactly_at_dwell_boundary() {
+        // `saturating_duration_since(t) >= dwell` — the boundary
+        // is inclusive.  Pinning this avoids an off-by-one that
+        // would shift the commit by one frame (~33 ms) across the
+        // whole lifecycle.
+        let now = Instant::now();
+        let gained = now - Duration::from_millis(120);
+        let dwell = Duration::from_millis(120);
+        assert_eq!(maybe_commit_bloom(Some(gained), None, dwell, now), Some(now));
+    }
+
+    // ── compute_bloom_progress ────────────────────────────────────────────────
+
+    #[test]
+    fn progress_is_zero_when_no_bloom() {
+        // No bloom running → uniform value 0.0 → shader's
+        // `sin(0 × π) = 0` → no visible effect.  The invariant
+        // that keeps the steady-state render identical to pre-
+        // bloom.
+        let now = Instant::now();
+        let duration = Duration::from_millis(250);
+        assert_eq!(compute_bloom_progress(None, duration, now), 0.0);
+    }
+
+    #[test]
+    fn progress_is_zero_at_bloom_start() {
+        // First frame of bloom: elapsed = 0, progress = 0 exactly.
+        // `sin(0 × π) = 0` — the curve is quiet at both endpoints
+        // and peaks in the middle, so the first frame reads
+        // identical to no-bloom and the lift ramps in.
+        let now = Instant::now();
+        let duration = Duration::from_millis(250);
+        assert_eq!(compute_bloom_progress(Some(now), duration, now), 0.0);
+    }
+
+    #[test]
+    fn progress_is_half_at_midpoint() {
+        // Midpoint of the curve is where `sin(π / 2) = 1` — peak
+        // brightness.  This is where the `bloom_peak_multiplier`
+        // value takes full effect, so the test exists to pin the
+        // curve's center of mass.
+        let now = Instant::now();
+        let start = now - Duration::from_millis(125);
+        let duration = Duration::from_millis(250);
+        let p = compute_bloom_progress(Some(start), duration, now);
+        assert!(
+            (p - 0.5).abs() < 0.01,
+            "midpoint progress should be ≈0.5, got {p}"
+        );
+    }
+
+    #[test]
+    fn progress_clamps_to_one_at_and_past_end() {
+        // End of the bloom: progress saturates at 1.0 and stays
+        // there.  `sin(1 × π) = 0`, so the last rendered frame is
+        // quiet (no visible pixel change from steady state) — and
+        // the caller clears `bloom_start` after this frame so the
+        // next classifier tick returns Idle.  Both the exact-end
+        // and past-end cases must clamp identically.
+        let now = Instant::now();
+        let duration = Duration::from_millis(250);
+        assert_eq!(
+            compute_bloom_progress(Some(now - duration), duration, now),
+            1.0
+        );
+        assert_eq!(
+            compute_bloom_progress(Some(now - duration * 2), duration, now),
+            1.0
+        );
+    }
+
+    #[test]
+    fn progress_is_monotonic_across_duration() {
+        // Sanity: strictly increasing as time advances.  If a
+        // future refactor introduces non-monotonic behaviour
+        // (say, a sine directly on `elapsed`), the test catches
+        // it — `bloom_progress` is the monotonic input that the
+        // shader envelope then re-shapes.
+        let now = Instant::now();
+        let duration = Duration::from_millis(250);
+        let start = now - Duration::from_millis(200);
+        let p_now = compute_bloom_progress(Some(start), duration, now);
+        let p_later =
+            compute_bloom_progress(Some(start), duration, now + Duration::from_millis(20));
+        assert!(p_later >= p_now, "progress must be monotonic: {p_later} < {p_now}");
+    }
+
     // ── Opacity selection ─────────────────────────────────────────────────────
 
     fn opacity_cfg(active: f32, idle: f32) -> mechanic_config::OpacityConfig {
@@ -1949,11 +2419,18 @@ mod tests {
         idle: f32,
         text_idle: f32,
     ) -> mechanic_config::OpacityConfig {
+        // Opacity tests don't exercise the bloom fields; fill them
+        // from the same defaults `OpacityConfig::default()` uses so
+        // the struct is constructed consistently with production.
+        let defaults = mechanic_config::OpacityConfig::default();
         mechanic_config::OpacityConfig {
             title_bar_opacity: 0.95,
             content_active_opacity: active,
             content_idle_opacity: idle,
             text_idle_opacity: text_idle,
+            bloom_duration_ms: defaults.bloom_duration_ms,
+            bloom_dwell_ms: defaults.bloom_dwell_ms,
+            bloom_peak_multiplier: defaults.bloom_peak_multiplier,
         }
     }
 

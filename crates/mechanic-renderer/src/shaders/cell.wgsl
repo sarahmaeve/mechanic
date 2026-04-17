@@ -16,15 +16,38 @@ struct Globals {
     time: f32,
     // Content opacity — window-level alpha (desktop bleed-through).
     content_opacity: f32,
-    // 1.0 when the window has keyboard focus, 0.0 when blurred.  Used to
-    // freeze the corner-gradient color pulse on unfocused windows.
-    focused: f32,
+    // 1.0 when the shader's continuous time-based animations should
+    // advance, 0.0 otherwise.  Corresponds to
+    // `FrameUniforms::shader_focused` — real OS focus AND `--hot-cpu`.
+    // When 0.0, the corner-gradient breath, color rotation, and
+    // electron pulses all hold at their t=0 state, which is what
+    // keeps the event loop asleep at idle in the default mode.
+    shader_focused: f32,
     // Multiplier applied to glyph coverage in the text path.  1.0 = text
     // renders at full contrast against its cell background; lower
     // values ghost the text toward the background so an idle window
     // reads as visibly quieter even when the window alpha itself is
     // high enough to keep the glyphs legible.
     text_opacity: f32,
+    // Focus-gain bloom progress in [0, 1].  0.0 when no bloom is
+    // running (steady state before or after the animation);
+    // fractional during the ≈250 ms rising/settling curve.  A
+    // `sin(progress * π)` envelope is applied in fs_main to produce
+    // a 0 → peak → 0 ease that biases toward the peak region
+    // rather than a linear ramp.
+    bloom_progress: f32,
+    // Peak scale factor for the logo's display opacity at the
+    // midpoint of the bloom curve.  Paired with `bloom_progress`:
+    // `mix(1.0, bloom_peak_multiplier, sin(progress * PI))` gives
+    // the instantaneous logo opacity multiplier.  1.0 disables the
+    // visible effect (no pixel change during bloom); 2.25 is the
+    // default lift.  Comes from `OpacityConfig::bloom_peak_multiplier`.
+    bloom_peak_multiplier: f32,
+    // Padding to keep the uniform struct size a multiple of 16
+    // bytes.  The next shader input slots in here without changing
+    // alignment.
+    _pad0: f32,
+    _pad1: f32,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -145,8 +168,42 @@ fn vs_main(
 // color we want to appear, alpha is the window opacity that tells the
 // compositor how much of our pixel vs the desktop to show.
 
+// Thickness of the hollow-block cursor outline, in physical pixels.
+// Must match `HOLLOW_CURSOR_BORDER_PX` on the Rust side — the two are
+// coupled so a change in one without the other produces either a too-
+// thick or too-thin outline.  1.5 px reads as 1 clean pixel on
+// standard DPI and 3 px on 2× Retina.
+const HOLLOW_CURSOR_BORDER_PX: f32 = 1.5;
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    if in.use_atlas == 2u {
+        // Hollow-block cursor: full-cell quad, keep only pixels within
+        // HOLLOW_CURSOR_BORDER_PX of a cell edge, discard the interior.
+        //
+        // `fract(pixel_pos / cell_size) * cell_size` gives the
+        // fragment's local position within the cell regardless of
+        // which grid cell it's in — the quad fills exactly one cell
+        // but the same helper would work if the hollow style ever
+        // covered multiple cells (it doesn't today).
+        //
+        // `discard` kills the fragment before blending, so the cell's
+        // background + glyph (drawn earlier in the same render pass
+        // via the earlier instances in the buffer) remain visible
+        // unaltered.  This is why the outline doesn't need to know
+        // the cell's real foreground/background colours — it lets
+        // them show through.
+        let cell_local = fract(in.pixel_pos / globals.cell_size) * globals.cell_size;
+        let d_left = cell_local.x;
+        let d_right = globals.cell_size.x - cell_local.x;
+        let d_top = cell_local.y;
+        let d_bot = globals.cell_size.y - cell_local.y;
+        let min_edge = min(min(d_left, d_right), min(d_top, d_bot));
+        if min_edge > HOLLOW_CURSOR_BORDER_PX {
+            discard;
+        }
+        return vec4<f32>(in.bg_color.rgb, globals.content_opacity);
+    }
     if in.use_atlas == 1u {
         // Glyph coverage from the atlas — 1.0 inside the glyph body,
         // 0.0 outside, fractional on antialiased edges.  Multiplying
@@ -177,13 +234,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // contribution at the corner center — kept deliberately subtle
         // so it reads as ambient shading rather than competing with
         // the logo for attention.
-        let breath: f32 = 1.0 + sin(globals.time * 2.1) * 0.18 * globals.focused;
+        let breath: f32 = 1.0 + sin(globals.time * 2.1) * 0.18 * globals.shader_focused;
         let gradient_strength = exp(-dist * dist / 0.08) * 0.10 * breath;
 
         // Animated color: rotating between electric cyan (#52E8FF) and
         // azure (#007FFF).  Phase multiplied by `focused` so unfocused
         // windows freeze at phase = 0 (static midpoint color).
-        let phase: f32 = globals.time * 0.5 * globals.focused;
+        let phase: f32 = globals.time * 0.5 * globals.shader_focused;
         let t: f32 = sin(phase) * 0.5 + 0.5;
         let gradient_r: f32 = mix(0.322, 0.0, t) * gradient_strength;
         let gradient_g: f32 = mix(0.910, 0.498, t) * gradient_strength;
@@ -199,11 +256,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // we composite with the standard "over" operator:
         //     out = src + dst * (1 - src.a)
         //
-        // `logo_opacity` controls how prominent the logo reads against
-        // the gradient — 1.0 is full strength, lower values blend in.
+        // `logo_opacity_base` controls how prominent the logo reads against
+        // the gradient at rest — 1.0 is full strength, lower values blend in.
+        //
+        // `logo_opacity` is the steady-state base multiplied by the
+        // focus-gain bloom envelope.  `sin(bloom_progress * π)` is a
+        // smooth 0→1→0 curve over `progress ∈ [0, 1]`, and
+        // `mix(1.0, peak, env)` rides from no-effect at the curve's
+        // edges up to `bloom_peak_multiplier` at the midpoint.  When
+        // no bloom is active `bloom_progress == 0`, `sin(0) == 0`,
+        // and the mix returns 1.0 — steady state, zero visible effect.
         let logo_size: f32 = 270.0;   // display size in physical pixels
         let logo_margin: f32 = 16.0;  // inset from the corner
-        let logo_opacity: f32 = 0.40;
+        let logo_opacity_base: f32 = 0.40;
+        let bloom_env: f32 = sin(globals.bloom_progress * 3.14159265);
+        let bloom_lift: f32 = mix(1.0, globals.bloom_peak_multiplier, bloom_env);
+        let logo_opacity: f32 = logo_opacity_base * bloom_lift;
 
         let logo_br = globals.viewport_size - vec2<f32>(logo_margin, logo_margin);
         let logo_tl = logo_br - vec2<f32>(logo_size, logo_size);
@@ -230,7 +298,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             //
             // Only drawn when focused — keeps background windows quiet.
             let pulse_glow = electron_pulses(logo_px, logo_size, globals.time)
-                * globals.focused;
+                * globals.shader_focused;
             // Celeste-white core with a hint of cyan — brighter than
             // the trace it rides on, so the trace visibly lights up.
             let electron_color = vec3<f32>(0.85, 1.0, 1.0);

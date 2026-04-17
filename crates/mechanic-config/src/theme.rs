@@ -167,12 +167,23 @@ impl Default for SelectionColors {
 /// (desktop bleed-through), one value for in-window text when the
 /// window is unfocused (dims the glyphs toward their cell background
 /// so an idle window reads as "not where the work is happening").  On
-/// focus change, all values snap immediately; there is no fade
+/// focus change, all opacity values snap immediately; there is no fade
 /// interpolation.  This keeps the event loop asleep when the user's
 /// attention is elsewhere (no per-frame redraws burning CPU on a
 /// countdown to transparency).
 ///
-/// All opacity values are in the range `[0.0, 1.0]`.
+/// A *single* exception to the "no animation" rule: when a window
+/// gains keyboard focus and the user holds it for at least
+/// [`bloom_dwell_ms`](OpacityConfig::bloom_dwell_ms), the corner
+/// logo brightens briefly via a [`bloom_duration_ms`](OpacityConfig::bloom_duration_ms)
+/// sin-envelope curve peaking at
+/// [`bloom_peak_multiplier`](OpacityConfig::bloom_peak_multiplier).
+/// The dwell filters transient focus (e.g. rapid Cmd+` cycling), so
+/// only the settled-on window blooms.  The animation is bounded —
+/// once it ends, the event loop returns to its usual idle state.
+///
+/// All opacity values are in the range `[0.0, 1.0]`.  Bloom durations
+/// are in milliseconds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OpacityConfig {
@@ -192,6 +203,43 @@ pub struct OpacityConfig {
     /// 1.0); only the idle side is configurable because a lower-
     /// than-1.0 active value is rarely what anyone wants.
     pub text_idle_opacity: f32,
+    /// Total duration of the focus-gain bloom animation, in
+    /// milliseconds.  The bloom follows a `sin(progress * π)` curve
+    /// from 0 → peak → 0 over this window, so a larger value gives
+    /// a slower, more lingering brightening.  250 ms sits comfortably
+    /// in the "deliberate animation" perception band (≥ 100 ms to
+    /// avoid reading as a one-frame flash; < 500 ms to avoid reading
+    /// as sluggish).
+    pub bloom_duration_ms: u32,
+    /// How long a newly-focused window must hold focus before the
+    /// bloom commits, in milliseconds.  Rapid Cmd+` cycling produces
+    /// back-to-back focus changes on each intermediate window; the
+    /// dwell gates the bloom so only the window the user *settles*
+    /// on blooms, not every window they briefly touch.
+    ///
+    /// Invariant: must be less than or equal to
+    /// `FOCUS_REDRAW_BURST_FRAMES × FRAME_INTERVAL` (165 ms at the
+    /// current 5-frame, 33 ms cadence).  The burst already keeps the
+    /// event loop awake for that window, so the bloom commit check
+    /// piggybacks on frames the loop pays for anyway.  If the dwell
+    /// exceeds the burst, the loop sleeps before the check fires and
+    /// the bloom never starts.  The invariant is unit-tested.
+    pub bloom_dwell_ms: u32,
+    /// Peak scale factor applied to the corner logo's display
+    /// opacity at the midpoint of the bloom curve.  `1.0` disables
+    /// the visible effect (the bloom would still run as a scheduler
+    /// event but produce no visible change).  `2.25` is the default:
+    /// lifts the logo to 225% of its steady-state `0.40` base =
+    /// `0.90` peak opacity — clearly visible against the terminal
+    /// background without saturating.
+    ///
+    /// Safe upper bound is `1 / logo_opacity_base = 2.5` at the
+    /// current `0.40` base; past that the shader's `a = logo.a *
+    /// logo_opacity` expression can exceed 1.0 and the `(1 - a)`
+    /// term in the over-composite goes negative, producing visual
+    /// artefacts.  Keep to `<= 2.5` unless the logo base is also
+    /// lowered.
+    pub bloom_peak_multiplier: f32,
 }
 
 impl Default for OpacityConfig {
@@ -201,6 +249,16 @@ impl Default for OpacityConfig {
             content_active_opacity: 0.85,
             content_idle_opacity: 0.65,
             text_idle_opacity: 0.55,
+            bloom_duration_ms: 250,
+            bloom_dwell_ms: 120,
+            // 2.25 was selected empirically after 1.4 proved too
+            // subtle on a logo that's already rendered at 0.40
+            // opacity (ambient accent, not primary content).  The
+            // 40% lift from 1.4 peaked at logo_opacity = 0.56 —
+            // readable only if you were looking directly at the
+            // corner and knew what to expect.  2.25 peaks at 0.90,
+            // unambiguous without saturating.
+            bloom_peak_multiplier: 2.25,
         }
     }
 }
@@ -293,6 +351,35 @@ mod tests {
         assert!((op.content_active_opacity - 0.85).abs() < f32::EPSILON);
         assert!((op.content_idle_opacity - 0.65).abs() < f32::EPSILON);
         assert!((op.text_idle_opacity - 0.55).abs() < f32::EPSILON);
+        assert_eq!(op.bloom_duration_ms, 250);
+        assert_eq!(op.bloom_dwell_ms, 120);
+        assert!((op.bloom_peak_multiplier - 2.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn bloom_dwell_fits_within_focus_redraw_burst() {
+        // The bloom commit check runs opportunistically on frames
+        // that the focus-redraw burst is already paying for
+        // (FOCUS_REDRAW_BURST_FRAMES = 5 × FRAME_INTERVAL = 33 ms →
+        // 165 ms of guaranteed frames after a focus event).  If the
+        // default dwell ever exceeds that window, the commit check
+        // never fires because the loop sleeps before the dwell
+        // elapses — silent "bloom never plays" regression.
+        //
+        // Constants duplicated here to avoid adding a dependency
+        // from mechanic-config back to mechanic-app.  If the app's
+        // burst parameters change, this number needs to change too
+        // — and the test failure surfaces the coupling explicitly.
+        const FOCUS_REDRAW_BURST_MS: u32 = 5 * 33;
+        let op = OpacityConfig::default();
+        assert!(
+            op.bloom_dwell_ms <= FOCUS_REDRAW_BURST_MS,
+            "bloom_dwell_ms ({}) must be ≤ focus-redraw-burst duration ({} ms) \
+             — otherwise the bloom-commit check never fires.  See OpacityConfig \
+             docs for the invariant.",
+            op.bloom_dwell_ms,
+            FOCUS_REDRAW_BURST_MS
+        );
     }
 
     #[test]

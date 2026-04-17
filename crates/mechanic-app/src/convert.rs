@@ -27,7 +27,17 @@ use mechanic_renderer::{CellFlags, CursorStyle, RenderCell, RenderGrid};
 /// column is a spacer placeholder with `Flags::WIDE_CHAR_SPACER` set.  This
 /// function skips spacer cells so the renderer never sees them — the wide
 /// character itself is written to its own cell with the normal column index.
-pub fn convert_grid(terminal: &Terminal, theme: &Theme) -> RenderGrid {
+/// Convert a live [`Terminal`] grid into the renderer's [`RenderGrid`]
+/// representation.
+///
+/// `focused` controls the block-cursor rendering: when `true`, the
+/// cell under the cursor is recoloured to the cursor's solid-block
+/// form (same path as before).  When `false`, the recolour is
+/// skipped and the cursor is rendered as a hollow outline quad by
+/// the renderer pipeline — matching the iTerm2 / Terminal.app
+/// convention that unfocused windows show a hollow cursor so the
+/// user can tell at a glance which window has keyboard focus.
+pub fn convert_grid(terminal: &Terminal, theme: &Theme, focused: bool) -> RenderGrid {
     let grid = terminal.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
@@ -118,19 +128,30 @@ pub fn convert_grid(terminal: &Terminal, theme: &Theme) -> RenderGrid {
 
     // ── Block-cursor cell recolor ─────────────────────────────────────────────
     //
-    // For Block cursors, repaint the cell under the cursor directly rather
-    // than drawing an opaque block on top: set its background to the cursor
-    // color and its foreground to `theme.cursor_text`.  This keeps the
-    // character under the cursor visible through the cursor block instead of
-    // hiding it behind a solid square.
+    // For Block cursors on a FOCUSED window, repaint the cell under the
+    // cursor directly rather than drawing an opaque block on top: set its
+    // background to the cursor color and its foreground to
+    // `theme.cursor_text`.  This keeps the character under the cursor
+    // visible through the cursor block instead of hiding it behind a
+    // solid square.
     //
     // When the cursor sits *inside* a selection, the celeste cursor color
     // blends visually with the bright cyan selection highlight.  Switch to
     // amber in that case so the cursor stays clearly distinguishable.
     //
-    // Bar and Underline cursors don't cover the character, so they remain
-    // rendered as separate quads by the pipeline's cursor pass.
-    if matches!(render_grid.cursor_style, CursorStyle::Block) {
+    // When the window is UNFOCUSED, we skip the recolor entirely.  The
+    // cell keeps its natural colors, and the renderer pipeline draws a
+    // hollow outline quad on top instead — the iTerm2 / Terminal.app
+    // convention for indicating "this window doesn't have focus".  The
+    // two paths are mutually exclusive on purpose: a hollow outline
+    // around a recoloured cell would read as a solid block with a
+    // different-coloured border, defeating the "you can see the
+    // underlying text" signal that hollow cursors exist to convey.
+    //
+    // Bar and Underline cursors don't cover the character in either
+    // focus state, so they remain rendered as separate quads by the
+    // pipeline's cursor pass regardless of `focused`.
+    if matches!(render_grid.cursor_style, CursorStyle::Block) && focused {
         let cursor_in_selection = sel_range.as_ref().is_some_and(|r| {
             let p = grid.cursor.point;
             p >= r.start && p <= r.end
