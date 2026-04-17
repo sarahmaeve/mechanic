@@ -29,7 +29,7 @@ fn main() {
         .expect("failed to build event loop");
     let proxy = event_loop.create_proxy();
 
-    let mut app = app::App::new(config, proxy, cli.animate, cli.mouse_tracking);
+    let mut app = app::App::new(config, proxy, cli.hot_cpu, cli.mouse_tracking);
     event_loop.run_app(&mut app).expect("event loop exited with error");
 }
 
@@ -38,11 +38,18 @@ fn main() {
 /// Parsed command-line options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cli {
-    /// Whether time-based visual effects should run.  `--no-animation`
-    /// forces this to `false`; absent the flag it's `true` and the
-    /// corner-gradient pulse, electron animation, and opacity fade all
-    /// run normally.
-    animate: bool,
+    /// Whether to run the shader-side animations (corner-gradient
+    /// breath / color pulse, electron traces on the logo).  Default
+    /// is `false`: the gradient and logo render as a static corner
+    /// accent, and the focused window costs nothing to hold open.
+    /// `--hot-cpu` flips this to `true` for users who want the full
+    /// light show and don't mind paying the CPU bill.
+    ///
+    /// The opacity fade-in / fade-out is independent of this flag and
+    /// always runs — it's driven by user-interaction timing, not the
+    /// shader clock, so its CPU cost is bounded to the few seconds
+    /// after a blur rather than forever while focused.
+    hot_cpu: bool,
     /// Whether to honour programs' mouse-reporting requests (DECSET
     /// 1000/1002/1003/1006).  `--no-mouse-tracking` forces this to
     /// `false`; absent the flag it's `true` and programs like vim,
@@ -54,7 +61,7 @@ struct Cli {
 
 impl Default for Cli {
     fn default() -> Self {
-        Self { animate: true, mouse_tracking: true }
+        Self { hot_cpu: false, mouse_tracking: true }
     }
 }
 
@@ -70,7 +77,7 @@ where
     let mut cli = Cli::default();
     for arg in args {
         match arg.as_str() {
-            "--no-animation" => cli.animate = false,
+            "--hot-cpu" => cli.hot_cpu = true,
             "--no-mouse-tracking" => cli.mouse_tracking = false,
             "-h" | "--help" => {
                 print_help();
@@ -97,10 +104,13 @@ fn print_help() {
     println!("    mechanic [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    --no-animation         Disable all time-based visual effects");
-    println!("                           (opacity fade, corner gradient pulse,");
-    println!("                           electron traces).  Useful on battery,");
-    println!("                           on low-end GPUs, or for recording demos.");
+    println!("    --hot-cpu              Enable the shader light show: corner-gradient");
+    println!("                           breath, color pulse, and electron traces on");
+    println!("                           the logo.  Looks cool, costs a few percent");
+    println!("                           CPU while the window is focused.  Off by");
+    println!("                           default — the gradient still renders, it");
+    println!("                           just doesn't animate.  Opacity fade is");
+    println!("                           unaffected and always runs.");
     println!("    --no-mouse-tracking    Ignore programs' DECSET 1000/1002/1003/1006");
     println!("                           mouse-reporting requests.  Drag-select and");
     println!("                           middle-click-paste always work locally, at");
@@ -162,17 +172,19 @@ mod tests {
     // ── CLI parsing ───────────────────────────────────────────────────────────
 
     #[test]
-    fn cli_default_enables_animation() {
-        // No arguments: animation on.
+    fn cli_default_has_hot_cpu_off() {
+        // No arguments: shader animations off (the quiet default).
         let cli = parse_args(Vec::<String>::new());
-        assert!(cli.animate);
+        assert!(!cli.hot_cpu);
+        // Mouse tracking defaults to on.
+        assert!(cli.mouse_tracking);
     }
 
     #[test]
-    fn cli_no_animation_disables() {
-        let cli = parse_args(vec!["--no-animation".to_string()]);
-        assert!(!cli.animate);
-        // --no-animation alone should NOT touch mouse tracking.
+    fn cli_hot_cpu_enables() {
+        let cli = parse_args(vec!["--hot-cpu".to_string()]);
+        assert!(cli.hot_cpu);
+        // --hot-cpu alone should NOT touch mouse tracking.
         assert!(cli.mouse_tracking);
     }
 
@@ -180,22 +192,22 @@ mod tests {
     fn cli_no_mouse_tracking_disables() {
         let cli = parse_args(vec!["--no-mouse-tracking".to_string()]);
         assert!(!cli.mouse_tracking);
-        // --no-mouse-tracking alone should NOT touch animation.
-        assert!(cli.animate);
+        // --no-mouse-tracking alone should NOT touch hot_cpu.
+        assert!(!cli.hot_cpu);
     }
 
     #[test]
     fn cli_both_flags_combine() {
         let cli = parse_args(vec![
-            "--no-animation".to_string(),
+            "--hot-cpu".to_string(),
             "--no-mouse-tracking".to_string(),
         ]);
-        assert!(!cli.animate);
+        assert!(cli.hot_cpu);
         assert!(!cli.mouse_tracking);
     }
 
     #[test]
-    fn cli_default_is_animate() {
+    fn cli_default_matches_no_args() {
         // Default-constructed Cli matches the no-args case.
         assert_eq!(Cli::default(), parse_args(Vec::<String>::new()));
     }

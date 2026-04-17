@@ -96,6 +96,15 @@ pub struct RenderState {
     /// When this diverges from `TextRenderer::atlas_generation()` the bind
     /// group is rebuilt to point at the new atlas texture.
     last_atlas_generation: u64,
+    /// Count of instances uploaded by the most recent full [`Self::render`]
+    /// call.  Zero before the first full render.
+    ///
+    /// [`Self::render_animation`] uses this to know how many instances
+    /// to draw from the retained `instance_buf` on frames where only
+    /// the time/opacity/focused uniforms changed — the grid itself is
+    /// unchanged, so we skip the ~200 KB instance rebuild+upload and
+    /// just re-issue the same draw against a new globals uniform.
+    last_instance_count: u32,
 }
 
 /// Initialise the wgpu instance, adapter, device, queue, and configured
@@ -383,6 +392,7 @@ impl RenderState {
             size,
             clear_color: background::clear_color(bg),
             last_atlas_generation: atlas_generation,
+            last_instance_count: 0,
         })
     }
 
@@ -465,6 +475,13 @@ impl RenderState {
             _pad: 0.0,
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+
+        // The retained instance buffer was built against the previous
+        // grid dimensions — redrawing it under a new viewport would
+        // leave cells mispositioned.  Zero the count so
+        // `render_animation` returns false until the next full render
+        // refills the cache at the new size.
+        self.last_instance_count = 0;
     }
 
     /// Update the cell size used by the pipeline's globals uniform.
@@ -474,6 +491,10 @@ impl RenderState {
     /// at a new point size.
     pub fn set_cell_size(&mut self, cell_size: (f32, f32)) {
         self.cell_size = cell_size;
+        // Instance cache is keyed to the old cell size via glyph offsets
+        // / sizes in pixels — invalidate so the next frame rebuilds
+        // against the new metrics.
+        self.last_instance_count = 0;
     }
 
     /// Render a single frame.
@@ -708,6 +729,105 @@ impl RenderState {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
+
+        // Record the instance count so a subsequent `render_animation`
+        // frame knows how many instances to re-draw from the retained
+        // `instance_buf`.  Updated after submit so a failed surface
+        // acquisition above doesn't leave us with a bogus count.
+        self.last_instance_count = instances.len() as u32;
+    }
+
+    /// Fast-path frame: re-issue the previous full render's draw with
+    /// a fresh globals uniform.
+    ///
+    /// Used for frames driven purely by animation cadence — the corner
+    /// gradient pulse and electron traces in the shader are functions
+    /// of the `time` and `focused` uniforms only.  The per-cell
+    /// instance data (foreground/background colors, glyph UVs, cursor
+    /// position) doesn't change frame-to-frame when the user is idle
+    /// and the shell is quiet, so rebuilding ~4000 `GpuInstance`s and
+    /// re-uploading ~200 KB per frame is pure waste.
+    ///
+    /// Returns `false` if no prior full render has populated the
+    /// instance buffer — in that case the caller must fall back to
+    /// [`Self::render`] with a freshly-converted grid.  Returns `true`
+    /// on success (a frame was submitted and presented).
+    ///
+    /// Atlas and bind group are left untouched.  This path never
+    /// triggers an atlas grow because it rasterises no glyphs.
+    pub fn render_animation(
+        &mut self,
+        content_opacity: f32,
+        time: f32,
+        focused: bool,
+    ) -> bool {
+        if self.last_instance_count == 0 {
+            // Nothing cached yet — first frame of the window's life, or
+            // after a resize that hasn't been followed by a full render.
+            return false;
+        }
+
+        // Update only the globals uniform.
+        let globals = Globals {
+            viewport_size: [self.size.0 as f32, self.size.1 as f32],
+            cell_size: [self.cell_size.0, self.cell_size.1],
+            time,
+            content_opacity,
+            focused: if focused { 1.0 } else { 0.0 },
+            _pad: 0.0,
+        };
+        self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+
+        let surface_texture = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return true;
+            }
+            _ => return true,
+        };
+
+        let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("anim_frame_encoder"),
+        });
+
+        let clear_color = wgpu::Color {
+            r: self.clear_color.r,
+            g: self.clear_color.g,
+            b: self.clear_color.b,
+            a: content_opacity as f64,
+        };
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("anim_cell_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.instance_buf.slice(..));
+            pass.draw(0..6, 0..self.last_instance_count);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        surface_texture.present();
+        true
     }
 }
 

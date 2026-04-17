@@ -90,6 +90,22 @@ impl Renderer {
         self.state.render(grid, &mut self.text, &self.font_config, content_opacity, time, focused);
     }
 
+    /// Re-render the previous frame's instance data against a new
+    /// globals uniform.
+    ///
+    /// Fast path for animation-cadence frames where the terminal grid
+    /// has not changed — only the shader time/focus/opacity inputs need
+    /// refreshing.  Skips grid conversion, atlas population, instance
+    /// construction, and instance upload entirely.
+    ///
+    /// Returns `false` if no prior [`Self::render`] call has populated
+    /// the instance buffer (e.g. immediately after construction or a
+    /// resize).  Callers should fall back to [`Self::render`] with a
+    /// freshly-converted grid in that case.
+    pub fn render_animation(&mut self, content_opacity: f32, time: f32, focused: bool) -> bool {
+        self.state.render_animation(content_opacity, time, focused)
+    }
+
     /// Change the font size and rebuild text rendering state.
     ///
     /// The new size is clamped to `[6.0, 72.0]` points.  The `TextRenderer`

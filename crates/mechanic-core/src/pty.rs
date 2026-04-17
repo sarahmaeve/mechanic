@@ -5,6 +5,8 @@
 //! can read output bytes and write keyboard input.
 
 use std::io::{self, Read, Write};
+use std::os::unix::process::ExitStatusExt as _;
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
@@ -45,6 +47,20 @@ pub struct PtyHandle {
     writer: std::fs::File,
     /// Receiver side of the channel that carries PTY output to the main thread.
     pub(crate) rx: Receiver<Vec<u8>>,
+    /// One-shot channel carrying the child's exit status, populated by
+    /// the reader thread after it sees EOF on the PTY master and reaps
+    /// the child with `waitpid`.
+    ///
+    /// Without this channel the child-exit event was lost: we don't run
+    /// `alacritty_terminal`'s own event loop, so no `ChildExit` event is
+    /// ever synthesised for us.  The main loop would see a silent EOF
+    /// and leave the window open forever when the user typed `exit`.
+    ///
+    /// Capacity 1 because the shell can only exit once.  The inner
+    /// `Option` is `None` if `waitpid` failed (should be impossible in
+    /// practice — if it does, callers treat it the same as a successful
+    /// exit with no status).
+    pub(crate) exit_rx: Receiver<Option<ExitStatus>>,
     /// Background reader thread handle (kept alive for Drop purposes).
     _reader_thread: JoinHandle<()>,
 }
@@ -115,10 +131,11 @@ impl PtyHandle {
         })?;
 
         let (tx, rx) = bounded::<Vec<u8>>(CHANNEL_CAPACITY);
+        let (exit_tx, exit_rx) = bounded::<Option<ExitStatus>>(1);
 
-        let reader_thread = Self::start_reader(pty, tx, waker);
+        let reader_thread = Self::start_reader(pty, tx, exit_tx, waker);
 
-        Ok(Self { writer, rx, _reader_thread: reader_thread })
+        Ok(Self { writer, rx, exit_rx, _reader_thread: reader_thread })
     }
 
     /// Write `data` to the PTY (keyboard / paste input).
@@ -135,24 +152,41 @@ impl PtyHandle {
     // ── Private ──────────────────────────────────────────────────────────────
 
     /// Spin up the background reader thread.
+    ///
+    /// When the PTY master returns EOF — the canonical signal that the
+    /// child shell has closed its end and exited — the thread reaps the
+    /// child via `waitpid` so the exit status is recovered before
+    /// `Pty::drop` calls `Child::wait` and discards it.  The status is
+    /// delivered to the main thread via `exit_tx` and a final `waker()`
+    /// call ensures the main loop wakes promptly to observe it rather
+    /// than waiting for the user to bump the mouse.
     fn start_reader(
         mut pty: tty::Pty,
         tx: Sender<Vec<u8>>,
+        exit_tx: Sender<Option<ExitStatus>>,
         waker: PtyWaker,
     ) -> JoinHandle<()> {
+        // Capture the child PID before moving `pty` into the thread.
+        // `Pty::child()` returns `&Child`, so we can't call
+        // `Child::wait` (which needs `&mut`); `waitpid` on the PID works
+        // on any thread and reaps the process correctly.
+        let child_pid = pty.child().id() as libc::pid_t;
+
         let id = PTY_READER_ID.fetch_add(1, Ordering::Relaxed);
         thread::Builder::new()
             .name(format!("mechanic-pty-reader-{id}"))
             .spawn(move || {
                 let mut buf = vec![0u8; READ_BUF_SIZE];
+                // `saw_eof` distinguishes "shell exited, capture status"
+                // from "receiver dropped / fatal read error" — in the
+                // latter the main thread is tearing down and there's no
+                // point reaping or notifying.
+                let mut saw_eof = false;
                 loop {
                     match pty.reader().read(&mut buf) {
                         Ok(0) => {
-                            // EOF — the shell has exited.  Fire the waker
-                            // one last time so the main loop redraws and
-                            // observes the resulting Exit event this frame
-                            // rather than waiting for user input.
-                            waker();
+                            // EOF — the shell has exited.
+                            saw_eof = true;
                             break;
                         }
                         Ok(n) => {
@@ -179,6 +213,7 @@ impl PtyHandle {
                             // closes before SIGCHLD; treat it as EOF.
                             #[cfg(target_os = "linux")]
                             if e.raw_os_error() == Some(libc::EIO) {
+                                saw_eof = true;
                                 break;
                             }
                             error!("PTY read error: {e}");
@@ -186,9 +221,47 @@ impl PtyHandle {
                         }
                     }
                 }
+
+                if saw_eof {
+                    let status = reap_child(child_pid);
+                    // Send is best-effort: if the receiver has dropped
+                    // (Terminal being torn down) we just discard.  The
+                    // waker call still fires so any still-live main loop
+                    // gets one chance to observe the exit.
+                    let _ = exit_tx.send(status);
+                    waker();
+                }
             })
             .expect("failed to spawn PTY reader thread")
     }
+}
+
+// ── Child reaping ─────────────────────────────────────────────────────────────
+
+/// Reap the child at `pid` and return its exit status.
+///
+/// Called after the PTY master returns EOF — at that point the child
+/// has closed its slave fd, which on Unix means it has exited (or at
+/// least detached from the session we care about), so `waitpid` will
+/// not block meaningfully.  Once this call succeeds the kernel has
+/// released the zombie; `Pty::drop` subsequently calls `Child::wait`,
+/// which will return `ECHILD` (already reaped) and be silently
+/// discarded — harmless.
+///
+/// Returns `None` if `waitpid` fails (e.g. another thread already
+/// reaped the child, or the PID was never alive).  Callers treat
+/// `None` the same as "shell exited, status unavailable".
+fn reap_child(pid: libc::pid_t) -> Option<ExitStatus> {
+    let mut raw_status: libc::c_int = 0;
+    // Safety: `raw_status` is a local variable, pointer is valid for
+    // the duration of the call; `waitpid` is a standard libc call.
+    let res = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
+    if res <= 0 {
+        // -1 = error (e.g. ECHILD); 0 = no status available.  Neither
+        // gives us a usable status.
+        return None;
+    }
+    Some(ExitStatus::from_raw(raw_status))
 }
 
 // ── TerminalSize helpers ───────────────────────────────────────────────────────

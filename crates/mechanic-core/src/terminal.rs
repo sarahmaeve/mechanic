@@ -43,6 +43,18 @@ pub struct ProcessOutcome {
     /// payload — `Some(status)` for a real child exit, `None` for the
     /// library-internal `AlacrittyEvent::Exit` which carries no status.
     pub child_exit: Option<Option<std::process::ExitStatus>>,
+
+    /// `true` if any PTY bytes were drained through the VTE parser
+    /// during this call (i.e. the grid *may* have changed).  Callers
+    /// use this to decide whether to do a full grid-conversion render
+    /// or a cheap animation-only render that re-uses the previous
+    /// frame's instance buffer.
+    ///
+    /// Conservative: set whenever the parser was fed anything, without
+    /// diffing cells — a CSI query that produces a PtyWrite response
+    /// and no visible change still trips the flag.  That's fine; the
+    /// worst case is one wasted full render.
+    pub grid_maybe_changed: bool,
 }
 
 // ── MouseProtocol ─────────────────────────────────────────────────────────────
@@ -181,12 +193,13 @@ impl Terminal {
     ///   can be surfaced here when the app needs them — wire into
     ///   `ProcessOutcome`).
     pub fn process_input(&mut self) -> ProcessOutcome {
+        let mut outcome = ProcessOutcome::default();
+
         // Drain all pending byte chunks from the reader thread.
         while let Ok(chunk) = self.pty.rx.try_recv() {
             self.parser.advance(&mut self.term, &chunk);
+            outcome.grid_maybe_changed = true;
         }
-
-        let mut outcome = ProcessOutcome::default();
 
         // Drain terminal events and update our cached title.  Exit
         // events are returned via `outcome` so the caller decides
@@ -200,6 +213,23 @@ impl Terminal {
                 // Bell / Wakeup / PtyWrite — not yet plumbed.  Dropping
                 // them here matches previous behaviour.
                 _ => {}
+            }
+        }
+
+        // Poll the PTY reader's exit channel.  When the child shell
+        // exits, the reader thread sees EOF on the PTY master, reaps
+        // the child with `waitpid`, and pushes the status here.  We
+        // don't run `alacritty_terminal`'s own event loop, so without
+        // this bridge no `ChildExit` event would ever fire and the
+        // window would stay open after the user typed `exit`.
+        //
+        // `try_recv` is non-blocking; a populated event from the event
+        // proxy above (unlikely in practice) takes precedence via the
+        // `is_none` guard so we don't clobber a real `ChildExit`
+        // status with our waitpid-derived one.
+        if outcome.child_exit.is_none() {
+            if let Ok(status) = self.pty.exit_rx.try_recv() {
+                outcome.child_exit = Some(status);
             }
         }
 
@@ -648,6 +678,110 @@ mod tests {
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
         term.paste("").expect("empty paste should succeed");
+    }
+
+    #[test]
+    fn process_input_no_input_reports_clean_outcome() {
+        // Freshly-spawned terminal with no shell output yet: the
+        // outcome should report no grid change and no exit.  This
+        // underpins the animation-fast-path — if this fired
+        // spuriously we'd do a full render every frame forever.
+        let mut config = Config::default();
+        config.shell.program = "/bin/sh".into();
+
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
+
+        // Immediately, before the shell has produced anything: nothing
+        // to drain.
+        let outcome = term.process_input();
+        assert!(!outcome.grid_maybe_changed);
+        assert!(outcome.child_exit.is_none());
+    }
+
+    #[test]
+    fn process_input_flags_grid_change_after_shell_output() {
+        // After the shell prints its prompt (or any output), a
+        // subsequent `process_input` call should report
+        // `grid_maybe_changed == true` exactly once — successive
+        // calls with no new output report `false` again.
+        let mut config = Config::default();
+        config.shell.program = "/bin/sh".into();
+
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
+
+        // Nudge the shell to produce deterministic output.  `echo hi`
+        // + newline yields at least an echo back and an "hi" line on
+        // most sh implementations.
+        term.write_to_pty(b"echo hi\n").expect("write should succeed");
+
+        // Poll until we see the grid change flag trip.  3 s is
+        // generous; /bin/sh responds in milliseconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut saw_change = false;
+        while std::time::Instant::now() < deadline {
+            let outcome = term.process_input();
+            if outcome.grid_maybe_changed {
+                saw_change = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(saw_change, "grid_maybe_changed should trip after shell output");
+
+        // Drain any remaining bytes, then assert steady state reports false.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = term.process_input(); // drain leftovers
+        let outcome = term.process_input();
+        assert!(
+            !outcome.grid_maybe_changed,
+            "no new bytes → grid_maybe_changed should be false"
+        );
+    }
+
+    #[test]
+    fn process_input_reports_child_exit_after_shell_exits() {
+        // Regression test for the "typing `exit` leaves the window
+        // open" bug: when the child shell exits, the PTY master
+        // observes EOF and the reader thread must reap the child so
+        // the next `process_input` call surfaces a populated
+        // `child_exit` in the outcome.
+        //
+        // Uses `/bin/sh` explicitly rather than `Config::default()`'s
+        // `$SHELL` so the test is deterministic across developer
+        // machines where `$SHELL` may point at zsh/fish/nushell with
+        // different startup-file side effects.
+        let mut config = Config::default();
+        config.shell.program = "/bin/sh".into();
+
+        let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
+        let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
+
+        // Give the shell a moment to start, then ask it to exit.
+        // `exit 0\n` is understood by every POSIX sh.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        term.write_to_pty(b"exit 0\n").expect("write should succeed");
+
+        // Poll `process_input` until we see the exit or time out.
+        // 3 seconds is generous — `sh` exits in milliseconds.  The
+        // loop keeps the grid up to date so we don't miss a fast
+        // exit that lands between sleeps.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut observed = None;
+        while std::time::Instant::now() < deadline {
+            let outcome = term.process_input();
+            if let Some(status) = outcome.child_exit {
+                observed = Some(status);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let status = observed.expect("child_exit should be populated after shell exits");
+        // `exit 0` → a real ExitStatus with code 0.
+        let status = status.expect("status should carry a real waitpid result, not None");
+        assert!(status.success(), "expected success, got {status:?}");
     }
 
     #[test]

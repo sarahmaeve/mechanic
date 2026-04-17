@@ -101,6 +101,19 @@ struct AppState {
     /// running inside only cares about cell-level granularity.  Reset
     /// to `None` when no forwarded drag is in progress.
     last_mouse_report: Option<(u32, u32)>,
+    /// `true` when the renderable grid state (cells, cursor, selection,
+    /// display offset, terminal size) has changed since the last full
+    /// render.  Gates the [`Renderer::render`] vs.
+    /// [`Renderer::render_animation`] choice in the redraw handler:
+    /// dirty frames rebuild the instance buffer; clean frames re-issue
+    /// the cached draw with only the globals uniform refreshed.
+    ///
+    /// Conservatively set to `true` by every event that alters grid
+    /// content (PTY output, resize, scroll, selection change, font
+    /// size, respawn, exit banner).  Cleared back to `false` after a
+    /// full render completes.  Initialised to `true` so the first
+    /// frame of a new window is always a full render.
+    content_dirty: bool,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -117,14 +130,25 @@ pub struct App {
     /// wake the main loop via `UserEvent::PtyOutput` when new bytes
     /// arrive.  Cheap to clone (internally an `Arc`).
     proxy: EventLoopProxy<UserEvent>,
-    /// Master switch for time-based visual effects.  `false` when the
-    /// user passed `--no-animation`.  When off: opacity stays at
-    /// `content_active_opacity` forever (no fade), the shader's
-    /// `focused` uniform is forced to `0.0` (freezing the corner
-    /// gradient and electron pulses), and `about_to_wait` never asks
-    /// for periodic redraws — the loop sleeps entirely until input
-    /// or PTY output arrives.
-    animate: bool,
+    /// Master switch for the shader-side animations: the corner
+    /// gradient's brightness breath and color pulse, and the electron
+    /// traces that ride the logo's circuit lines.  `true` only when
+    /// the user passed `--hot-cpu`.
+    ///
+    /// When `false` (the default) the shader's `focused` uniform is
+    /// forced to `0.0` every frame — the gradient still renders but
+    /// holds a constant midpoint color and brightness, and the
+    /// electron pulses are suppressed.  Crucially, this also lets
+    /// `classify_animation` return `Idle` for focused windows, so the
+    /// event loop actually sleeps at idle instead of rendering 30 FPS
+    /// of a barely-moving gradient.
+    ///
+    /// The opacity fade-in / fade-out is decoupled from this flag —
+    /// it's driven by user-interaction timing rather than the shader
+    /// clock, and runs regardless.  The fade's animation cost is
+    /// bounded: it only fires during the `fade_begin_secs` →
+    /// `fade_end_secs` window after a blur, then settles into `Idle`.
+    hot_cpu: bool,
     /// Master switch for honouring programs' mouse-tracking requests.
     /// `false` when the user passed `--no-mouse-tracking`.  When off,
     /// DECSET 1000/1002/1003/1006 are silently ignored at the routing
@@ -137,8 +161,9 @@ impl App {
     /// Create a new `App` with the given configuration.
     ///
     /// `proxy` is the event-loop proxy used by PTY reader threads to
-    /// wake the main loop.  `animate` controls time-based visual
-    /// effects (`false` when `--no-animation` was passed).
+    /// wake the main loop.  `hot_cpu` enables the shader's
+    /// corner-gradient breath / color pulse and electron traces
+    /// (`true` when `--hot-cpu` was passed; `false` by default).
     /// `mouse_tracking` controls whether programs' DECSET mouse
     /// requests are honoured (`false` when `--no-mouse-tracking` was
     /// passed).
@@ -147,10 +172,10 @@ impl App {
     pub fn new(
         config: Config,
         proxy: EventLoopProxy<UserEvent>,
-        animate: bool,
+        hot_cpu: bool,
         mouse_tracking: bool,
     ) -> Self {
-        Self { config, windows: HashMap::new(), proxy, animate, mouse_tracking }
+        Self { config, windows: HashMap::new(), proxy, hot_cpu, mouse_tracking }
     }
 
     /// Build a [`PtyWaker`] for the given window using `self.proxy`.
@@ -189,6 +214,9 @@ impl App {
         let term_size = Self::terminal_size_from_metrics(inner.width, inner.height, &new_metrics);
         state.terminal.resize(term_size);
 
+        // Cell metrics and grid dimensions changed — cached instance
+        // data is stale.
+        state.content_dirty = true;
         state.window.request_redraw();
     }
 
@@ -297,6 +325,7 @@ impl App {
             current_font_size: self.config.font.size,
             exit_status: None,
             last_mouse_report: None,
+            content_dirty: true,
         };
 
         self.windows.insert(window_id, state);
@@ -350,13 +379,13 @@ impl ApplicationHandler<UserEvent> for App {
 
         if self.spawn_window(event_loop).is_none() {
             event_loop.exit();
-            return;
         }
 
-        // Continuous polling so the fade animation renders smoothly.  With
-        // ControlFlow::Wait the event loop can sleep indefinitely when no
-        // events arrive, which makes the opacity fade jerky or frozen.
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        // Control flow is managed by `about_to_wait`, which picks
+        // `WaitUntil(next_frame)` while any window is animating and
+        // falls through to `Wait` when every window is idle.  No need
+        // to seed a value here — `about_to_wait` fires before the
+        // first sleep.
     }
 
     /// Handles all windowing events for a single window.
@@ -411,6 +440,10 @@ impl ApplicationHandler<UserEvent> for App {
                     Self::terminal_size_from_metrics(size.width, size.height, &state.cell_metrics);
                 state.terminal.resize(new_term_size);
 
+                // Grid dimensions changed — the retained instance
+                // buffer references cells by (col, row) against the
+                // previous size.  Force a full render next frame.
+                state.content_dirty = true;
                 state.window.request_redraw();
             }
 
@@ -498,6 +531,10 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Key::Character(c) = &key_event.logical_key {
                         match c.as_str() {
                             "c" => {
+                                // Copy to clipboard only — no grid
+                                // state changes, no redraw needed.  The
+                                // selection is already highlighted from
+                                // whatever drag produced it.
                                 if let Some(text) = state.terminal.selection_text() {
                                     if let Some(cb) = state.clipboard.as_mut() {
                                         if let Err(e) = cb.set_text(text) {
@@ -505,7 +542,6 @@ impl ApplicationHandler<UserEvent> for App {
                                         }
                                     }
                                 }
-                                state.window.request_redraw();
                                 return;
                             }
                             "v" => {
@@ -530,12 +566,16 @@ impl ApplicationHandler<UserEvent> for App {
                                         }
                                     }
                                 }
+                                // `paste` snaps display to the bottom —
+                                // display_offset changed.
+                                state.content_dirty = true;
                                 state.window.request_redraw();
                                 return;
                             }
                             "k" => {
                                 // Cmd+K — clear scrollback (matches iTerm2).
                                 state.terminal.clear_history();
+                                state.content_dirty = true;
                                 state.window.request_redraw();
                                 return;
                             }
@@ -543,6 +583,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // Cmd+A — select the full terminal buffer
                                 // including scrollback.
                                 state.terminal.select_all();
+                                state.content_dirty = true;
                                 state.window.request_redraw();
                                 return;
                             }
@@ -574,6 +615,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 if let Err(e) = state.terminal.write_to_pty(b"\x1f") {
                                     log::warn!("PTY undo write failed: {e}");
                                 }
+                                // write_to_pty snaps display to bottom.
+                                state.content_dirty = true;
                                 state.window.request_redraw();
                                 return;
                             }
@@ -605,6 +648,10 @@ impl ApplicationHandler<UserEvent> for App {
                         log::warn!("PTY write failed: {e}");
                     }
                 }
+                // Selection may have cleared and/or display snapped to
+                // bottom via `write_to_pty`; either way the render
+                // output differs from the cached one.
+                state.content_dirty = true;
                 state.window.request_redraw();
             }
 
@@ -640,6 +687,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Ime::Enabled | Ime::Disabled => {}
                 }
+                // Ime::Commit wrote to PTY; Ime::Preedit updated the IME
+                // candidate area.  In either case the upcoming frame may
+                // differ from the cached one — conservatively dirty.
+                state.content_dirty = true;
                 state.window.request_redraw();
             }
 
@@ -689,6 +740,9 @@ impl ApplicationHandler<UserEvent> for App {
                     if matches!(btn_state, ElementState::Released) {
                         state.last_mouse_report = None;
                     }
+                    // Forwarded mouse event wrote to PTY — display
+                    // snapped to bottom and the program may echo.
+                    state.content_dirty = true;
                     state.window.request_redraw();
                     return;
                 }
@@ -775,6 +829,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                             }
                         }
+                        // Selection state changed (start/clear) and/or
+                        // a click-to-move wrote to the PTY.
+                        state.content_dirty = true;
                         state.window.request_redraw();
                     }
 
@@ -784,6 +841,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Err(e) = state.terminal.paste(text) {
                                 log::warn!("PTY middle-click paste failed: {e}");
                             }
+                            state.content_dirty = true;
                             state.window.request_redraw();
                         }
                     }
@@ -867,6 +925,8 @@ impl ApplicationHandler<UserEvent> for App {
                         display_offset,
                     );
                     state.terminal.update_selection(point, side);
+                    // Selection range changed — highlighted cells differ.
+                    state.content_dirty = true;
                     state.window.request_redraw();
                 }
             }
@@ -918,6 +978,9 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
+                    // Forwarded wheel wrote to PTY (display snapped to
+                    // bottom).
+                    state.content_dirty = true;
                     state.window.request_redraw();
                     return;
                 }
@@ -928,6 +991,9 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if lines < 0 {
                     state.terminal.scroll_down((-lines) as usize);
                 }
+                // display_offset changed — the visible slice of
+                // scrollback is different from the cached frame.
+                state.content_dirty = true;
                 state.window.request_redraw();
             }
 
@@ -935,6 +1001,14 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 // Drain PTY bytes, update grid, collect outcome events.
                 let outcome = state.terminal.process_input();
+
+                // Any bytes fed to the VTE parser may have changed the
+                // grid — force the full-render branch below so the new
+                // content shows up this frame rather than waiting for
+                // another event to dirty the cache.
+                if outcome.grid_maybe_changed {
+                    state.content_dirty = true;
+                }
 
                 // If the shell exited this frame, decide close-vs-freeze
                 // and (on freeze) write a banner line the user can read.
@@ -968,30 +1042,62 @@ impl ApplicationHandler<UserEvent> for App {
                         // dismissal-key policy.
                         inject_exit_banner(&mut state.terminal, status);
                         state.exit_status = Some(status);
+                        // Banner wrote to the grid via inject_local —
+                        // cached instances are stale.
+                        state.content_dirty = true;
                         state.window.request_redraw();
                     }
                 }
 
-                let grid = crate::convert::convert_grid(&state.terminal, &self.config.theme);
-
                 // Opacity: fade interpolation uses wall-clock elapsed
-                // since last input.  --no-animation forces the window
-                // to stay at active opacity forever — no fade at all.
-                let opacity = if self.animate {
+                // since last input.  Always runs — the fade is cheap
+                // (only ticks during the few seconds between
+                // `fade_begin_secs` and `fade_end_secs` after a blur,
+                // then settles) and is a genuinely useful signal
+                // about which window was most recently active.
+                let opacity = {
                     let elapsed_secs = state.last_input_time.elapsed().as_secs_f32();
                     compute_opacity(elapsed_secs, &self.config.theme.opacity)
-                } else {
-                    self.config.theme.opacity.content_active_opacity
                 };
 
                 let time = state.start_time.elapsed().as_secs_f32();
 
-                // Shader animations (corner gradient pulse, electron
-                // traces) are all gated on the `focused` uniform.  When
-                // --no-animation is set we pass `false` regardless of
-                // real focus state, freezing them at their midpoint.
-                let shader_focused = state.focused && self.animate;
-                state.renderer.render(&grid, opacity, time, shader_focused);
+                // Shader animations (corner gradient brightness breath,
+                // color pulse, electron traces on the logo) are all
+                // gated on the `focused` uniform.  Unless `--hot-cpu`
+                // was passed we force it to `false` regardless of real
+                // focus state — freezes the gradient at its midpoint
+                // color and constant brightness, and suppresses
+                // electron pulses.  The gradient itself still renders
+                // as a static corner accent.
+                let shader_focused = state.focused && self.hot_cpu;
+
+                // Two render paths:
+                //
+                // 1. Animation fast path — only the shader
+                //    time/opacity/focused uniforms changed (focused
+                //    pulse, idle fade).  Reissue the previous frame's
+                //    cached instance draw against a new globals
+                //    uniform.  Skips grid conversion and the ~200 KB
+                //    instance rebuild+upload per frame.
+                //
+                // 2. Full render — grid state changed (PTY output,
+                //    resize, scroll, selection, etc.) or no prior
+                //    render has populated the instance cache yet.
+                //    Convert the grid, build instances, upload, draw.
+                //
+                // Short-circuit: attempt path 1 only when
+                // `!content_dirty`; fall through to path 2 when
+                // `render_animation` reports no cached instances (first
+                // frame, or post-resize before a full render).
+                let did_animation_render = !state.content_dirty
+                    && state.renderer.render_animation(opacity, time, shader_focused);
+
+                if !did_animation_render {
+                    let grid = crate::convert::convert_grid(&state.terminal, &self.config.theme);
+                    state.renderer.render(&grid, opacity, time, shader_focused);
+                    state.content_dirty = false;
+                }
 
                 // Title: base from the shell's OSC-set title (or "Mechanic"
                 // when unset), suffixed with exit info when the window is
@@ -1042,7 +1148,7 @@ impl ApplicationHandler<UserEvent> for App {
             let anim = classify_animation(
                 input,
                 &self.config.theme.opacity,
-                self.animate,
+                self.hot_cpu,
                 now,
             );
             match anim {
@@ -1223,34 +1329,37 @@ struct AnimationInputs {
 /// windowing.  Rules:
 ///
 /// 1. Frozen window (shell exited, awaiting dismissal) → `Idle`.
-/// 2. `animate == false` (user passed `--no-animation`) → `Idle` for
-///    every window.  The shader's focused uniform is already forced to
-///    0 in the render path, so nothing time-dependent is running.
-/// 3. Focused, animating → `Active` every `FRAME_INTERVAL` (the corner
-///    gradient and electron pulses animate continuously while focused).
+/// 2. Focused + `hot_cpu` → `Active` every `FRAME_INTERVAL`.  The
+///    corner-gradient breath, color pulse, and electron traces are
+///    continuous animations driven by the shader clock, so the event
+///    loop has to keep rendering to move them forward.
+/// 3. Focused + `!hot_cpu` → `Idle`.  The shader `focused` uniform is
+///    forced to 0 in the render path so nothing time-dependent is
+///    running — there's no reason to wake up.  This is the default
+///    and the main win: a focused idle window costs nothing.
 /// 4. Unfocused, `elapsed < fade_begin` → `WakeAt(last_input + fade_begin)`.
 ///    Nothing is animating yet, but the fade will start at that instant.
 /// 5. Unfocused, `fade_begin <= elapsed <= fade_end` → `Active` (mid-fade).
+///    The opacity fade is independent of `hot_cpu` and always runs.
 /// 6. Unfocused, `elapsed > fade_end` → `Idle`.  Opacity has settled at
-///    `content_idle_opacity` and the shader `focused` uniform is 0, so
-///    there's nothing to redraw.
+///    `content_idle_opacity`; the shader is static; nothing to redraw.
 fn classify_animation(
     input: AnimationInputs,
     opacity_cfg: &mechanic_config::OpacityConfig,
-    animate: bool,
+    hot_cpu: bool,
     now: Instant,
 ) -> AnimationState {
     // Rule 1.
     if !input.is_alive {
         return AnimationState::Idle;
     }
-    // Rule 2.
-    if !animate {
-        return AnimationState::Idle;
-    }
-    // Rule 3.
+    // Rule 2 / 3: focused → depends on hot_cpu.
     if input.focused {
-        return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
+        if hot_cpu {
+            return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
+        }
+        // Focused and quiet — nothing time-dependent is rendered.
+        return AnimationState::Idle;
     }
 
     // Unfocused — check fade state.  `saturating_duration_since` handles
@@ -1316,6 +1425,8 @@ fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId, waker: Pty
             state.terminal = new_term;
             state.exit_status = None;
             state.last_input_time = std::time::Instant::now();
+            // Fresh terminal → fresh grid → cached instances are stale.
+            state.content_dirty = true;
             state.window.request_redraw();
             log::info!("window {id:?} shell respawned");
         }
@@ -1656,9 +1767,11 @@ mod tests {
     }
 
     #[test]
-    fn anim_no_animation_flag_forces_idle() {
-        // Rule 2: --no-animation overrides everything else.  Even a
-        // focused window reports idle so the event loop can sleep.
+    fn anim_focused_quiet_default_is_idle() {
+        // Rule 3 (the new default): focused but hot_cpu=false → Idle.
+        // This is the main CPU-savings win — a focused idle window
+        // should not wake the event loop 30 times a second just to
+        // redraw pixels that don't change.
         let cfg = default_opacity_cfg();
         let input = inputs(true, true, Duration::ZERO);
         assert_eq!(
@@ -1668,8 +1781,10 @@ mod tests {
     }
 
     #[test]
-    fn anim_focused_window_is_active() {
-        // Rule 3: focused windows always have shader animations running.
+    fn anim_focused_hot_cpu_is_active() {
+        // Rule 2: focused + --hot-cpu → continuous animation at
+        // FRAME_INTERVAL so the shader time-based effects actually
+        // advance frame-to-frame.
         let cfg = default_opacity_cfg();
         let input = inputs(true, true, Duration::from_secs(1000));
         let now = Instant::now();
@@ -1687,11 +1802,13 @@ mod tests {
     #[test]
     fn anim_unfocused_pre_fade_wakes_later() {
         // Rule 4: unfocused + before fade_begin → WakeAt(fade_begin).
+        // `hot_cpu` should not affect this — pass `false` to prove
+        // the fade's redraw scheduling is independent.
         let cfg = default_opacity_cfg();
         let elapsed = Duration::from_secs(10); // well before fade_begin = 30
         let input = inputs(true, false, elapsed);
         let now = Instant::now();
-        match classify_animation(input, &cfg, true, now) {
+        match classify_animation(input, &cfg, false, now) {
             AnimationState::WakeAt(deadline) => {
                 // Deadline should be ~20s from now (fade_begin 30 - elapsed 10).
                 let delta = deadline.saturating_duration_since(now);
@@ -1703,15 +1820,17 @@ mod tests {
     }
 
     #[test]
-    fn anim_unfocused_mid_fade_is_active() {
-        // Rule 5: unfocused + elapsed between fade_begin and fade_end →
-        // animate at FRAME_INTERVAL.
+    fn anim_unfocused_mid_fade_is_active_without_hot_cpu() {
+        // Rule 5: unfocused + mid-fade → Active regardless of
+        // `hot_cpu`.  The fade is our one unconditional animation —
+        // it communicates "this window is going idle" and is cheap
+        // (runs only for a few seconds per blur).
         let cfg = default_opacity_cfg();
         let elapsed = Duration::from_secs(45); // between 30 and 60
         let input = inputs(true, false, elapsed);
         let now = Instant::now();
         assert!(matches!(
-            classify_animation(input, &cfg, true, now),
+            classify_animation(input, &cfg, false, now),
             AnimationState::Active { .. }
         ));
     }
@@ -1723,7 +1842,7 @@ mod tests {
         let elapsed = Duration::from_secs(120); // well past fade_end = 60
         let input = inputs(true, false, elapsed);
         assert_eq!(
-            classify_animation(input, &cfg, true, Instant::now()),
+            classify_animation(input, &cfg, false, Instant::now()),
             AnimationState::Idle
         );
     }
@@ -1739,7 +1858,7 @@ mod tests {
         let now = Instant::now();
         let input = inputs_at(now, true, false, Duration::from_secs(60));
         assert!(matches!(
-            classify_animation(input, &cfg, true, now),
+            classify_animation(input, &cfg, false, now),
             AnimationState::Active { .. }
         ));
     }
