@@ -74,13 +74,29 @@ pub struct Config {
 impl Config {
     /// Load configuration from a TOML file at `path`.
     ///
-    /// If the file cannot be read or parsed for any reason, a warning is
-    /// logged and the full default configuration is returned — the terminal
-    /// always starts even with a broken config file.
+    /// Missing-file is the expected path for users who never wrote a
+    /// config — the built-in defaults are the intended UX, and there
+    /// is nothing wrong to report.  That case returns silently.
+    ///
+    /// Any other read failure (permission denied, I/O error) or a
+    /// TOML parse error does warrant a warning: the file exists but
+    /// we couldn't honour it, so the user might be confused by their
+    /// settings silently not taking effect.  Those paths log at
+    /// `warn` level and fall back to the full default configuration
+    /// so the terminal always starts.
     pub fn load(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         let raw = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Missing file is an expected, zero-config first run.
+                // Nothing to say — defaults are what the user wanted.
+                log::debug!(
+                    "mechanic-config: no config file at '{}' — using defaults",
+                    path.display()
+                );
+                return Self::default();
+            }
             Err(err) => {
                 log::warn!(
                     "mechanic-config: could not read '{}': {err} — using defaults",
@@ -183,8 +199,8 @@ program = "/bin/bash"
         assert!((0.0..=1.0).contains(&o.title_bar_opacity));
         assert!((0.0..=1.0).contains(&o.content_active_opacity));
         assert!((0.0..=1.0).contains(&o.content_idle_opacity));
+        assert!((0.0..=1.0).contains(&o.text_idle_opacity));
         assert!(o.content_idle_opacity <= o.content_active_opacity);
-        assert!(o.fade_begin_secs < o.fade_end_secs);
     }
 
     #[test]

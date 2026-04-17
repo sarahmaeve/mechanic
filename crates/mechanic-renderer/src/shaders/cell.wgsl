@@ -14,12 +14,17 @@ struct Globals {
     cell_size: vec2<f32>,
     // Elapsed seconds since app start (for animation).
     time: f32,
-    // Content opacity (activity-based fade).
+    // Content opacity — window-level alpha (desktop bleed-through).
     content_opacity: f32,
     // 1.0 when the window has keyboard focus, 0.0 when blurred.  Used to
     // freeze the corner-gradient color pulse on unfocused windows.
     focused: f32,
-    _pad: f32,
+    // Multiplier applied to glyph coverage in the text path.  1.0 = text
+    // renders at full contrast against its cell background; lower
+    // values ghost the text toward the background so an idle window
+    // reads as visibly quieter even when the window alpha itself is
+    // high enough to keep the glyphs legible.
+    text_opacity: f32,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -143,10 +148,17 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if in.use_atlas == 1u {
-        let alpha = textureSample(atlas_texture, atlas_sampler, in.uv).r;
-        // Mix fg and bg based on glyph coverage — this gives us the final
+        // Glyph coverage from the atlas — 1.0 inside the glyph body,
+        // 0.0 outside, fractional on antialiased edges.  Multiplying
+        // by `text_opacity` ghosts unfocused text toward its cell
+        // background without touching the cell background itself,
+        // so an idle window stays fully opaque (within
+        // `content_opacity`) but the text inside it reads as muted.
+        let glyph_coverage = textureSample(atlas_texture, atlas_sampler, in.uv).r;
+        let effective_coverage = glyph_coverage * globals.text_opacity;
+        // Mix fg and bg based on coverage — this gives us the final
         // on-screen color for this pixel, before compositing with the desktop.
-        let color_rgb = mix(in.bg_color.rgb, in.fg_color.rgb, alpha);
+        let color_rgb = mix(in.bg_color.rgb, in.fg_color.rgb, effective_coverage);
         return vec4<f32>(color_rgb, globals.content_opacity);
     } else {
         // Background cell — apply gradient.
@@ -160,8 +172,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // ~3 second cycle.  Gated by `focused` so unfocused windows hold
         // a constant brightness rather than quietly pulsing in the
         // background.
+        //
+        // The 0.10 base multiplier is the gradient's peak additive
+        // contribution at the corner center — kept deliberately subtle
+        // so it reads as ambient shading rather than competing with
+        // the logo for attention.
         let breath: f32 = 1.0 + sin(globals.time * 2.1) * 0.18 * globals.focused;
-        let gradient_strength = exp(-dist * dist / 0.08) * 0.22 * breath;
+        let gradient_strength = exp(-dist * dist / 0.08) * 0.10 * breath;
 
         // Animated color: rotating between electric cyan (#52E8FF) and
         // azure (#007FFF).  Phase multiplied by `focused` so unfocused
@@ -186,7 +203,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // the gradient — 1.0 is full strength, lower values blend in.
         let logo_size: f32 = 270.0;   // display size in physical pixels
         let logo_margin: f32 = 16.0;  // inset from the corner
-        let logo_opacity: f32 = 0.60;
+        let logo_opacity: f32 = 0.40;
 
         let logo_br = globals.viewport_size - vec2<f32>(logo_margin, logo_margin);
         let logo_tl = logo_br - vec2<f32>(logo_size, logo_size);

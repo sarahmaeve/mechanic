@@ -161,7 +161,16 @@ impl Default for SelectionColors {
 
 // ── Window opacity ────────────────────────────────────────────────────────────
 
-/// Opacity / fade settings for the terminal window.
+/// Opacity settings for the terminal window.
+///
+/// Flat opacity values — one pair for the overall window content area
+/// (desktop bleed-through), one value for in-window text when the
+/// window is unfocused (dims the glyphs toward their cell background
+/// so an idle window reads as "not where the work is happening").  On
+/// focus change, all values snap immediately; there is no fade
+/// interpolation.  This keeps the event loop asleep when the user's
+/// attention is elsewhere (no per-frame redraws burning CPU on a
+/// countdown to transparency).
 ///
 /// All opacity values are in the range `[0.0, 1.0]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,20 +182,25 @@ pub struct OpacityConfig {
     pub content_active_opacity: f32,
     /// Opacity of the content area when the window is in the background.
     pub content_idle_opacity: f32,
-    /// Seconds of inactivity before the fade-out animation begins.
-    pub fade_begin_secs: u32,
-    /// Seconds after which the fade reaches `content_idle_opacity`.
-    pub fade_end_secs: u32,
+    /// Multiplier applied to glyph coverage when the window is
+    /// unfocused.  1.0 means unfocused text reads the same as
+    /// focused text (full contrast against its cell background); 0.0
+    /// makes text invisible in an unfocused window.  Values around
+    /// 0.5 produce a ghosted, "this is where I'm not looking" feel
+    /// without sacrificing legibility if you glance at the window.
+    /// Focused text is always rendered at full strength (implicit
+    /// 1.0); only the idle side is configurable because a lower-
+    /// than-1.0 active value is rarely what anyone wants.
+    pub text_idle_opacity: f32,
 }
 
 impl Default for OpacityConfig {
     fn default() -> Self {
         Self {
             title_bar_opacity: 0.95,
-            content_active_opacity: 0.90,
-            content_idle_opacity: 0.75,
-            fade_begin_secs: 30,
-            fade_end_secs: 60,
+            content_active_opacity: 0.85,
+            content_idle_opacity: 0.65,
+            text_idle_opacity: 0.55,
         }
     }
 }
@@ -276,10 +290,9 @@ mod tests {
     fn opacity_defaults_are_correct() {
         let op = OpacityConfig::default();
         assert!((op.title_bar_opacity - 0.95).abs() < f32::EPSILON);
-        assert!((op.content_active_opacity - 0.90).abs() < f32::EPSILON);
-        assert!((op.content_idle_opacity - 0.75).abs() < f32::EPSILON);
-        assert_eq!(op.fade_begin_secs, 30);
-        assert_eq!(op.fade_end_secs, 60);
+        assert!((op.content_active_opacity - 0.85).abs() < f32::EPSILON);
+        assert!((op.content_idle_opacity - 0.65).abs() < f32::EPSILON);
+        assert!((op.text_idle_opacity - 0.55).abs() < f32::EPSILON);
     }
 
     #[test]

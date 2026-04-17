@@ -11,6 +11,7 @@ pub mod text;
 
 // Re-export the public surface of the renderer.
 pub use grid::{CellFlags, CursorStyle, RenderCell, RenderGrid};
+pub use pipeline::FrameUniforms;
 pub use text::CellMetrics;
 
 use mechanic_config::{font::FontConfig, theme::Theme};
@@ -83,11 +84,11 @@ impl Renderer {
 
     /// Render one frame from the given terminal grid.
     ///
-    /// `focused` gates the corner-gradient color animation — `false` freezes
-    /// it on unfocused windows so fading / background windows don't
-    /// visibly pulse.
-    pub fn render(&mut self, grid: &RenderGrid, content_opacity: f32, time: f32, focused: bool) {
-        self.state.render(grid, &mut self.text, &self.font_config, content_opacity, time, focused);
+    /// `uniforms` bundles the per-frame shader inputs (window alpha,
+    /// text dimming, shader clock, focus gate).  See [`FrameUniforms`]
+    /// for what each field means and when you'd set it.
+    pub fn render(&mut self, grid: &RenderGrid, uniforms: FrameUniforms) {
+        self.state.render(grid, &mut self.text, &self.font_config, uniforms);
     }
 
     /// Re-render the previous frame's instance data against a new
@@ -102,8 +103,8 @@ impl Renderer {
     /// the instance buffer (e.g. immediately after construction or a
     /// resize).  Callers should fall back to [`Self::render`] with a
     /// freshly-converted grid in that case.
-    pub fn render_animation(&mut self, content_opacity: f32, time: f32, focused: bool) -> bool {
-        self.state.render_animation(content_opacity, time, focused)
+    pub fn render_animation(&mut self, uniforms: FrameUniforms) -> bool {
+        self.state.render_animation(uniforms)
     }
 
     /// Change the font size and rebuild text rendering state.

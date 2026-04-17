@@ -44,6 +44,40 @@ fn rgb_to_f32(c: Rgb) -> [f32; 4] {
     [f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0, 1.0]
 }
 
+// ── Per-frame shader inputs ───────────────────────────────────────────────────
+
+/// The four per-frame values the caller feeds to `render` /
+/// `render_animation` — bundled into a struct so adding a fifth
+/// shader input (say, a cursor blink phase) doesn't push the render
+/// signature past clippy's 7-argument threshold or make the call site
+/// a forest of positional floats.
+///
+/// Everything else the shader needs — viewport size, cell size, atlas
+/// contents — is derived from the renderer's own retained state and
+/// is not part of this struct.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameUniforms {
+    /// Window-level alpha: how much of the desktop bleeds through.
+    /// `1.0` = fully opaque window; `0.0` = fully transparent.
+    /// Applied to every pixel the surface emits.
+    pub content_opacity: f32,
+    /// Multiplier on glyph coverage in the text path.  `1.0` = text
+    /// renders at full contrast against its cell background; lower
+    /// values ghost text toward the background so an unfocused
+    /// window reads as idle without touching `content_opacity`.
+    /// Not applied to background cells — only to text.
+    pub text_opacity: f32,
+    /// Seconds since the window was created.  Drives the shader's
+    /// time-based animations (corner gradient breath, color pulse,
+    /// electron traces) when `focused` is true.
+    pub time: f32,
+    /// Whether the shader's time-based animations should advance.
+    /// `false` pins the gradient/electrons at `t=0`, which is how
+    /// the `--hot-cpu`-off default runs even when the window has
+    /// real keyboard focus — keeps the event loop asleep at idle.
+    pub focused: bool,
+}
+
 // ── Globals uniform ───────────────────────────────────────────────────────────
 
 #[repr(C)]
@@ -56,7 +90,14 @@ struct Globals {
     /// 1.0 when the window has keyboard focus, 0.0 when blurred.  Gates the
     /// corner-gradient color pulse so unfocused/faded windows stay static.
     focused: f32,
-    _pad: f32, // keep 16-byte aligned
+    /// Multiplier applied to glyph coverage in the text path.  1.0
+    /// when the window is focused; typically a lower value (e.g.
+    /// 0.55) when unfocused so text reads as ghosted toward its cell
+    /// background, giving an idle window a visibly quieter feel
+    /// without touching the overall window alpha.  Occupies the slot
+    /// that used to be alignment padding — the struct is still 32
+    /// bytes and 16-byte aligned.
+    text_opacity: f32,
 }
 
 // ── RenderState ───────────────────────────────────────────────────────────────
@@ -330,7 +371,7 @@ impl RenderState {
             time: 0.0,
             content_opacity: 1.0,
             focused: 1.0,
-            _pad: 0.0,
+            text_opacity: 1.0,
         };
 
         let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -472,7 +513,7 @@ impl RenderState {
             time: 0.0,
             content_opacity: 1.0,
             focused: 1.0,
-            _pad: 0.0,
+            text_opacity: 1.0,
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
@@ -503,19 +544,17 @@ impl RenderState {
         grid: &RenderGrid,
         text_renderer: &mut TextRenderer,
         font_config: &mechanic_config::font::FontConfig,
-        content_opacity: f32,
-        time: f32,
-        focused: bool,
+        uniforms: FrameUniforms,
     ) {
         // ── Update globals uniform ────────────────────────────────────────────
 
         let globals = Globals {
             viewport_size: [self.size.0 as f32, self.size.1 as f32],
             cell_size: [self.cell_size.0, self.cell_size.1],
-            time,
-            content_opacity,
-            focused: if focused { 1.0 } else { 0.0 },
-            _pad: 0.0,
+            time: uniforms.time,
+            content_opacity: uniforms.content_opacity,
+            focused: if uniforms.focused { 1.0 } else { 0.0 },
+            text_opacity: uniforms.text_opacity,
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
@@ -699,7 +738,7 @@ impl RenderState {
             r: self.clear_color.r,
             g: self.clear_color.g,
             b: self.clear_color.b,
-            a: content_opacity as f64,
+            a: uniforms.content_opacity as f64,
         };
 
         {
@@ -755,12 +794,7 @@ impl RenderState {
     ///
     /// Atlas and bind group are left untouched.  This path never
     /// triggers an atlas grow because it rasterises no glyphs.
-    pub fn render_animation(
-        &mut self,
-        content_opacity: f32,
-        time: f32,
-        focused: bool,
-    ) -> bool {
+    pub fn render_animation(&mut self, uniforms: FrameUniforms) -> bool {
         if self.last_instance_count == 0 {
             // Nothing cached yet — first frame of the window's life, or
             // after a resize that hasn't been followed by a full render.
@@ -771,10 +805,10 @@ impl RenderState {
         let globals = Globals {
             viewport_size: [self.size.0 as f32, self.size.1 as f32],
             cell_size: [self.cell_size.0, self.cell_size.1],
-            time,
-            content_opacity,
-            focused: if focused { 1.0 } else { 0.0 },
-            _pad: 0.0,
+            time: uniforms.time,
+            content_opacity: uniforms.content_opacity,
+            focused: if uniforms.focused { 1.0 } else { 0.0 },
+            text_opacity: uniforms.text_opacity,
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
@@ -798,7 +832,7 @@ impl RenderState {
             r: self.clear_color.r,
             g: self.clear_color.g,
             b: self.clear_color.b,
-            a: content_opacity as f64,
+            a: uniforms.content_opacity as f64,
         };
 
         {

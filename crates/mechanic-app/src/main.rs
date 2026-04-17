@@ -45,10 +45,9 @@ struct Cli {
     /// `--hot-cpu` flips this to `true` for users who want the full
     /// light show and don't mind paying the CPU bill.
     ///
-    /// The opacity fade-in / fade-out is independent of this flag and
-    /// always runs — it's driven by user-interaction timing, not the
-    /// shader clock, so its CPU cost is bounded to the few seconds
-    /// after a blur rather than forever while focused.
+    /// Window opacity (focused vs. unfocused) is independent of this
+    /// flag — it snaps immediately on focus change and never runs an
+    /// animation, so blur/focus transitions are free regardless.
     hot_cpu: bool,
     /// Whether to honour programs' mouse-reporting requests (DECSET
     /// 1000/1002/1003/1006).  `--no-mouse-tracking` forces this to
@@ -109,8 +108,8 @@ fn print_help() {
     println!("                           the logo.  Looks cool, costs a few percent");
     println!("                           CPU while the window is focused.  Off by");
     println!("                           default — the gradient still renders, it");
-    println!("                           just doesn't animate.  Opacity fade is");
-    println!("                           unaffected and always runs.");
+    println!("                           just doesn't animate.  Window opacity snaps");
+    println!("                           instantly on focus change either way.");
     println!("    --no-mouse-tracking    Ignore programs' DECSET 1000/1002/1003/1006");
     println!("                           mouse-reporting requests.  Drag-select and");
     println!("                           middle-click-paste always work locally, at");

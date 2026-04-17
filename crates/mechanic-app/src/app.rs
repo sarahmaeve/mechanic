@@ -13,7 +13,7 @@ use mechanic_config::Config;
 use mechanic_core::{
     GridColumn, GridLine, GridPoint, GridSide, MouseProtocol, PtyWaker, Terminal, TerminalSize,
 };
-use mechanic_renderer::{CellMetrics, Renderer};
+use mechanic_renderer::{CellMetrics, FrameUniforms, Renderer};
 
 use crate::mouse as mouse_enc;
 use winit::application::ApplicationHandler;
@@ -28,9 +28,11 @@ use winit::window::{Window, WindowAttributes, WindowId};
 /// Target interval between animation frames (~30 FPS).
 ///
 /// 30 FPS is visually indistinguishable from 60 FPS for the animations
-/// we run (opacity fade over 30 s, corner gradient oscillation with a
-/// 3-s period, electron pulses with 2–3 s periods — all far too slow
-/// for the extra frames to matter) while halving the CPU/GPU cost.
+/// we run (corner gradient oscillation with a 3-s period, electron
+/// pulses with 2–3 s periods — all far too slow for the extra frames to
+/// matter) while halving the CPU/GPU cost.  Only consumed when the
+/// shader light show is on (`--hot-cpu`); at rest the event loop sleeps
+/// on `ControlFlow::Wait`.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 // ── User events ───────────────────────────────────────────────────────────────
@@ -78,12 +80,11 @@ struct AppState {
     modifiers: ModifiersState,
     /// Clipboard handle for copy/paste operations.
     clipboard: Option<arboard::Clipboard>,
-    /// Instant of the last user interaction (key press, mouse click, etc.).
-    last_input_time: std::time::Instant,
     /// Instant when this window was created (used to compute the `time` uniform).
     start_time: std::time::Instant,
-    /// Whether the window currently has keyboard focus.  When unfocused the
-    /// window fades toward `content_idle_opacity`.
+    /// Whether the window currently has keyboard focus.  The window
+    /// snaps between `content_active_opacity` and `content_idle_opacity`
+    /// based on this flag — no fade, no timer, no per-frame interpolation.
     focused: bool,
     /// Current font size in points, tracked so Cmd++/Cmd+-/Cmd+0 can step
     /// relative to the live value (not the config default).
@@ -114,7 +115,32 @@ struct AppState {
     /// full render completes.  Initialised to `true` so the first
     /// frame of a new window is always a full render.
     content_dirty: bool,
+    /// Non-zero for a short burst of frames after a focus change, so
+    /// the scheduler keeps the event loop active long enough for the
+    /// opacity/text-opacity snap to reliably land on screen.
+    ///
+    /// The macOS quirk we're working around: `setNeedsDisplay:` on a
+    /// window that's just lost key status can be coalesced by AppKit
+    /// and delivered past the next `ControlFlow::Wait` sleep — in
+    /// practice, a one-shot `request_redraw()` from the `Focused`
+    /// handler is sometimes swallowed entirely, leaving the losing
+    /// window frozen at its old alpha until the user touches it
+    /// again.  The old fade code masked this by scheduling
+    /// continuous `Active` ticks for the fade window, so even a
+    /// swallowed first draw was quickly followed by a dozen more.
+    /// This counter is the minimal-state recreation of that guard:
+    /// [`WindowEvent::Focused`] seeds it to
+    /// [`FOCUS_REDRAW_BURST_FRAMES`], every `RedrawRequested`
+    /// decrements it, and [`classify_animation`] forces `Active`
+    /// while it's non-zero.  Zero at steady state means no extra
+    /// ticks and the event loop sleeps on [`ControlFlow::Wait`].
+    focus_redraw_frames: u8,
 }
+
+/// Number of frames to force-redraw after a focus change.  At ~30 FPS
+/// this is ~165 ms — below any reasonable perception of "delayed",
+/// above the ~50 ms AppKit window-focus coalescing window on macOS.
+const FOCUS_REDRAW_BURST_FRAMES: u8 = 5;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -139,15 +165,11 @@ pub struct App {
     /// forced to `0.0` every frame — the gradient still renders but
     /// holds a constant midpoint color and brightness, and the
     /// electron pulses are suppressed.  Crucially, this also lets
-    /// `classify_animation` return `Idle` for focused windows, so the
+    /// `classify_animation` return `Idle` for every window, so the
     /// event loop actually sleeps at idle instead of rendering 30 FPS
-    /// of a barely-moving gradient.
-    ///
-    /// The opacity fade-in / fade-out is decoupled from this flag —
-    /// it's driven by user-interaction timing rather than the shader
-    /// clock, and runs regardless.  The fade's animation cost is
-    /// bounded: it only fires during the `fade_begin_secs` →
-    /// `fade_end_secs` window after a blur, then settles into `Idle`.
+    /// of a barely-moving gradient.  Window opacity snaps instantly
+    /// between the focused and idle values on blur/focus, so the
+    /// transition requires no per-frame redraws either.
     hot_cpu: bool,
     /// Master switch for honouring programs' mouse-tracking requests.
     /// `false` when the user passed `--no-mouse-tracking`.  When off,
@@ -319,13 +341,17 @@ impl App {
             primary_selection: None,
             modifiers: ModifiersState::empty(),
             clipboard,
-            last_input_time: now,
             start_time: now,
             focused: true,
             current_font_size: self.config.font.size,
             exit_status: None,
             last_mouse_report: None,
             content_dirty: true,
+            // Seed a focus-redraw burst on the very first frame so the
+            // window comes up at the right active opacity even if the
+            // initial `Focused(true)` arrives before the first
+            // `RedrawRequested` (seen intermittently on macOS).
+            focus_redraw_frames: FOCUS_REDRAW_BURST_FRAMES,
         };
 
         self.windows.insert(window_id, state);
@@ -390,9 +416,14 @@ impl ApplicationHandler<UserEvent> for App {
 
     /// Handles all windowing events for a single window.
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        // Intercept window-management shortcuts (Cmd+N, Cmd+W) before the
-        // per-window state lookup so we can mutate `self.windows`.  Both
-        // need `&mut self`, which would conflict with a borrowed AppState.
+        // Intercept app-level Cmd shortcuts (Cmd+N, Cmd+W) before the
+        // per-window state lookup so we can mutate `self.windows`.
+        // Both need `&mut self`, which would conflict with a borrowed
+        // AppState.  Window-level Cmd shortcuts fall through to the
+        // per-window handler below, and any character the classifier
+        // doesn't claim (including Cmd+`, which macOS reserves for
+        // its system-level window-cycle) falls all the way through to
+        // the PTY translation layer.
         if let WindowEvent::KeyboardInput { event: ref key_event, .. } = event {
             if key_event.state == ElementState::Pressed {
                 let modifiers_snapshot = self.windows.get(&id).map(|s| s.modifiers);
@@ -400,17 +431,27 @@ impl ApplicationHandler<UserEvent> for App {
                     (modifiers_snapshot, &key_event.logical_key)
                 {
                     if modifiers.super_key() {
-                        match c.as_str() {
-                            "n" => {
-                                let _ = self.spawn_window(event_loop);
+                        if let Some(shortcut) = cmd_shortcut(c.as_str()) {
+                            if shortcut.is_app_level() {
+                                match shortcut {
+                                    CmdShortcut::SpawnWindow => {
+                                        let _ = self.spawn_window(event_loop);
+                                    }
+                                    CmdShortcut::CloseWindow => {
+                                        self.close_window(id, event_loop);
+                                    }
+                                    // Window-level variants return false
+                                    // from `is_app_level`, so this branch
+                                    // cannot run.
+                                    other => {
+                                        debug_assert!(!other.is_app_level());
+                                    }
+                                }
                                 return;
                             }
-                            "w" => {
-                                // Close the window that received the event.
-                                self.close_window(id, event_loop);
-                                return;
-                            }
-                            _ => {}
+                            // Window-level shortcut: fall through to the
+                            // per-window KeyboardInput arm below, which
+                            // dispatches it with access to `state`.
                         }
                     }
                 }
@@ -454,22 +495,24 @@ impl ApplicationHandler<UserEvent> for App {
 
             // ── Window focus changes ──────────────────────────────────────────
             //
-            // On blur, kickstart the fade to idle by pretending the last input
-            // happened `fade_begin_secs` ago.  On focus, reset the timer.
+            // Flip the focused bit, mark the cached frame stale, ask
+            // for a redraw, and seed a short burst of forced frames
+            // via `focus_redraw_frames` so the scheduler keeps waking
+            // us until the new alpha has definitively landed on screen.
+            //
+            // We do NOT render inline here — doing GPU work inside the
+            // focus handler stalled AppKit's window-cycle pipeline on
+            // macOS (the next window never became key), which killed
+            // Cmd+` and Cmd+Tab responsiveness.  The forced-frames
+            // burst is the equivalent guarantee from the other end:
+            // no blocking on GPU work, but the loop is obligated to
+            // pump a handful of frames past the focus edge regardless
+            // of whether macOS's display link wants to cooperate.
             WindowEvent::Focused(focused) => {
+                log::debug!("window {id:?} focused: {focused}");
                 state.focused = focused;
-                // On blur, kickstart the fade to idle by pretending the last
-                // input happened `fade_begin_secs` ago.  On focus, reset the
-                // timer so any subsequent period of inactivity restarts the
-                // fade from the active opacity.
-                if focused {
-                    state.last_input_time = std::time::Instant::now();
-                } else {
-                    let fade_begin = self.config.theme.opacity.fade_begin_secs;
-                    state.last_input_time = std::time::Instant::now()
-                        .checked_sub(std::time::Duration::from_secs(fade_begin as u64))
-                        .unwrap_or_else(std::time::Instant::now);
-                }
+                state.content_dirty = true;
+                state.focus_redraw_frames = FOCUS_REDRAW_BURST_FRAMES;
                 state.window.request_redraw();
             }
 
@@ -524,108 +567,119 @@ impl ApplicationHandler<UserEvent> for App {
                     // else: fall through to the Cmd+C / Cmd+A handler below.
                 }
 
-                // Handle Cmd+C (copy) and Cmd+V (paste) before the normal
-                // key translation, so these shortcuts are not forwarded to the PTY.
-                // (Cmd+N was handled above, before the state lookup.)
+                // Dispatch window-level Cmd shortcuts (Cmd+C, Cmd+V, …)
+                // before the normal key translation so they never reach
+                // the PTY as typed characters.  Unclaimed Cmd+X keys —
+                // including Cmd+` — fall through to `translate_key`
+                // below, and the OS-level window-cycle that macOS runs
+                // on Cmd+` via AppKit is free to operate in parallel.
+                // Cmd+N / Cmd+W were already handled above, so the
+                // `match` below will not see their variants.
                 if key_event.state == ElementState::Pressed && state.modifiers.super_key() {
                     if let Key::Character(c) = &key_event.logical_key {
-                        match c.as_str() {
-                            "c" => {
-                                // Copy to clipboard only — no grid
-                                // state changes, no redraw needed.  The
-                                // selection is already highlighted from
-                                // whatever drag produced it.
-                                if let Some(text) = state.terminal.selection_text() {
+                        if let Some(shortcut) = cmd_shortcut(c.as_str()) {
+                            match shortcut {
+                                CmdShortcut::SpawnWindow | CmdShortcut::CloseWindow => {
+                                    // Handled by the top-level dispatch
+                                    // before the state lookup; cannot
+                                    // reach here in practice.
+                                    debug_assert!(shortcut.is_app_level());
+                                }
+                                CmdShortcut::Copy => {
+                                    // Copy to clipboard only — no grid
+                                    // state changes, no redraw needed.
+                                    // The selection is already
+                                    // highlighted from whatever drag
+                                    // produced it.
+                                    if let Some(text) = state.terminal.selection_text() {
+                                        if let Some(cb) = state.clipboard.as_mut() {
+                                            if let Err(e) = cb.set_text(text) {
+                                                log::warn!("clipboard set failed: {e}");
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
+                                CmdShortcut::Paste => {
+                                    // Delegate clipboard → PTY entirely to
+                                    // `Terminal::paste`, which applies the
+                                    // safety filter (strip bracketed-paste
+                                    // markers, normalize CR/CRLF, strip
+                                    // trailing newline when DECSET 2004 is
+                                    // off) and then wraps in `\x1b[200~…~`
+                                    // when bracketed paste is active so
+                                    // readline treats the whole paste as
+                                    // one edit (one Cmd+Z, no history
+                                    // expansion).
+                                    //
+                                    // The filter is crucial: a clipboard
+                                    // payload containing `\x1b[201~` would
+                                    // otherwise escape the wrap and
+                                    // smuggle keystrokes into the shell.
                                     if let Some(cb) = state.clipboard.as_mut() {
-                                        if let Err(e) = cb.set_text(text) {
-                                            log::warn!("clipboard set failed: {e}");
+                                        if let Ok(text) = cb.get_text() {
+                                            if let Err(e) = state.terminal.paste(&text) {
+                                                log::warn!("PTY paste failed: {e}");
+                                            }
                                         }
                                     }
+                                    // `paste` snaps display to bottom —
+                                    // display_offset changed.
+                                    state.content_dirty = true;
+                                    state.window.request_redraw();
+                                    return;
                                 }
-                                return;
-                            }
-                            "v" => {
-                                // Delegate clipboard → PTY entirely to
-                                // `Terminal::paste`, which applies the
-                                // safety filter (strip bracketed-paste
-                                // markers, normalize CR/CRLF, strip
-                                // trailing newline when DECSET 2004 is
-                                // off) and then wraps in `\x1b[200~…~`
-                                // when bracketed paste is active so
-                                // readline treats the whole paste as one
-                                // edit (one Cmd+Z, no history expansion).
-                                //
-                                // The filter is crucial: a clipboard
-                                // payload containing `\x1b[201~` would
-                                // otherwise escape the wrap and smuggle
-                                // keystrokes into the shell.
-                                if let Some(cb) = state.clipboard.as_mut() {
-                                    if let Ok(text) = cb.get_text() {
-                                        if let Err(e) = state.terminal.paste(&text) {
-                                            log::warn!("PTY paste failed: {e}");
-                                        }
+                                CmdShortcut::ClearScrollback => {
+                                    // Cmd+K — clear scrollback (iTerm2 convention).
+                                    state.terminal.clear_history();
+                                    state.content_dirty = true;
+                                    state.window.request_redraw();
+                                    return;
+                                }
+                                CmdShortcut::SelectAll => {
+                                    // Cmd+A — select the full terminal
+                                    // buffer including scrollback.
+                                    state.terminal.select_all();
+                                    state.content_dirty = true;
+                                    state.window.request_redraw();
+                                    return;
+                                }
+                                CmdShortcut::FontSizeIncrease => {
+                                    let new_size = (state.current_font_size + 1.0).min(72.0);
+                                    Self::apply_font_size(state, new_size);
+                                    return;
+                                }
+                                CmdShortcut::FontSizeDecrease => {
+                                    let new_size = (state.current_font_size - 1.0).max(6.0);
+                                    Self::apply_font_size(state, new_size);
+                                    return;
+                                }
+                                CmdShortcut::FontSizeReset => {
+                                    // Reset to the configured default size.
+                                    Self::apply_font_size(state, self.config.font.size);
+                                    return;
+                                }
+                                CmdShortcut::ReadlineUndo => {
+                                    // Cmd+Z — undo the last edit on the
+                                    // current shell input line.  Maps to
+                                    // readline's undo (Ctrl+_ = 0x1F),
+                                    // which unwinds recent insertions,
+                                    // deletions, pastes, etc.  Only
+                                    // affects the line being edited;
+                                    // doesn't touch executed commands
+                                    // or scrollback.
+                                    if let Err(e) = state.terminal.write_to_pty(b"\x1f") {
+                                        log::warn!("PTY undo write failed: {e}");
                                     }
+                                    // write_to_pty snaps display to bottom.
+                                    state.content_dirty = true;
+                                    state.window.request_redraw();
+                                    return;
                                 }
-                                // `paste` snaps display to the bottom —
-                                // display_offset changed.
-                                state.content_dirty = true;
-                                state.window.request_redraw();
-                                return;
                             }
-                            "k" => {
-                                // Cmd+K — clear scrollback (matches iTerm2).
-                                state.terminal.clear_history();
-                                state.content_dirty = true;
-                                state.window.request_redraw();
-                                return;
-                            }
-                            "a" => {
-                                // Cmd+A — select the full terminal buffer
-                                // including scrollback.
-                                state.terminal.select_all();
-                                state.content_dirty = true;
-                                state.window.request_redraw();
-                                return;
-                            }
-                            // Cmd++ requires Shift on US keyboards (Shift+=),
-                            // which the OS delivers as "+".  Cmd+= without
-                            // Shift is accepted too for convenience.
-                            "+" | "=" => {
-                                let new_size = (state.current_font_size + 1.0).min(72.0);
-                                Self::apply_font_size(state, new_size);
-                                return;
-                            }
-                            "-" => {
-                                let new_size = (state.current_font_size - 1.0).max(6.0);
-                                Self::apply_font_size(state, new_size);
-                                return;
-                            }
-                            "0" => {
-                                // Reset to the configured default size.
-                                Self::apply_font_size(state, self.config.font.size);
-                                return;
-                            }
-                            "z" => {
-                                // Cmd+Z — undo last edit on the current shell
-                                // input line.  Maps to readline's undo
-                                // (Ctrl+_ = 0x1F), which unwinds recent
-                                // insertions, deletions, pastes, etc.  Only
-                                // affects the line being edited; doesn't
-                                // touch executed commands or scrollback.
-                                if let Err(e) = state.terminal.write_to_pty(b"\x1f") {
-                                    log::warn!("PTY undo write failed: {e}");
-                                }
-                                // write_to_pty snaps display to bottom.
-                                state.content_dirty = true;
-                                state.window.request_redraw();
-                                return;
-                            }
-                            _ => {}
                         }
                     }
                 }
-
-                state.last_input_time = std::time::Instant::now();
 
                 if let Some(bytes) = crate::input::translate_key(&key_event, state.modifiers, state.terminal.cursor_app_mode()) {
                     // Clear any visible selection as a side effect of typing.
@@ -701,8 +755,6 @@ impl ApplicationHandler<UserEvent> for App {
             // once at the top of the arm by `route_mouse`, then each button
             // / state combination takes the appropriate branch.
             WindowEvent::MouseInput { state: btn_state, button: win_button, .. } => {
-                state.last_input_time = std::time::Instant::now();
-
                 let route = route_mouse(
                     state.terminal.mouse_protocol(),
                     self.mouse_tracking,
@@ -933,7 +985,6 @@ impl ApplicationHandler<UserEvent> for App {
 
             // ── Mouse wheel / scroll ──────────────────────────────────────────
             WindowEvent::MouseWheel { delta, .. } => {
-                state.last_input_time = std::time::Instant::now();
                 let cell_height = state.cell_metrics.cell_height;
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as i32,
@@ -1049,67 +1100,12 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // Opacity: fade interpolation uses wall-clock elapsed
-                // since last input.  Always runs — the fade is cheap
-                // (only ticks during the few seconds between
-                // `fade_begin_secs` and `fade_end_secs` after a blur,
-                // then settles) and is a genuinely useful signal
-                // about which window was most recently active.
-                let opacity = {
-                    let elapsed_secs = state.last_input_time.elapsed().as_secs_f32();
-                    compute_opacity(elapsed_secs, &self.config.theme.opacity)
-                };
+                render_frame(state, &self.config, self.hot_cpu);
 
-                let time = state.start_time.elapsed().as_secs_f32();
-
-                // Shader animations (corner gradient brightness breath,
-                // color pulse, electron traces on the logo) are all
-                // gated on the `focused` uniform.  Unless `--hot-cpu`
-                // was passed we force it to `false` regardless of real
-                // focus state — freezes the gradient at its midpoint
-                // color and constant brightness, and suppresses
-                // electron pulses.  The gradient itself still renders
-                // as a static corner accent.
-                let shader_focused = state.focused && self.hot_cpu;
-
-                // Two render paths:
-                //
-                // 1. Animation fast path — only the shader
-                //    time/opacity/focused uniforms changed (focused
-                //    pulse, idle fade).  Reissue the previous frame's
-                //    cached instance draw against a new globals
-                //    uniform.  Skips grid conversion and the ~200 KB
-                //    instance rebuild+upload per frame.
-                //
-                // 2. Full render — grid state changed (PTY output,
-                //    resize, scroll, selection, etc.) or no prior
-                //    render has populated the instance cache yet.
-                //    Convert the grid, build instances, upload, draw.
-                //
-                // Short-circuit: attempt path 1 only when
-                // `!content_dirty`; fall through to path 2 when
-                // `render_animation` reports no cached instances (first
-                // frame, or post-resize before a full render).
-                let did_animation_render = !state.content_dirty
-                    && state.renderer.render_animation(opacity, time, shader_focused);
-
-                if !did_animation_render {
-                    let grid = crate::convert::convert_grid(&state.terminal, &self.config.theme);
-                    state.renderer.render(&grid, opacity, time, shader_focused);
-                    state.content_dirty = false;
-                }
-
-                // Title: base from the shell's OSC-set title (or "Mechanic"
-                // when unset), suffixed with exit info when the window is
-                // frozen so the user can see exit status at a glance even
-                // when the grid has scrolled past the banner line.
-                let base_title = state.terminal.title();
-                let base = if base_title.is_empty() { "Mechanic" } else { base_title };
-                let title_string = match state.exit_status {
-                    Some(status) => format!("{base} — {}", format_title_suffix(status)),
-                    None => base.to_string(),
-                };
-                state.window.set_title(&title_string);
+                // A frame just landed — tick the post-focus-change
+                // burst counter down so the scheduler eventually
+                // returns to Idle instead of ticking forever.
+                state.focus_redraw_frames = state.focus_redraw_frames.saturating_sub(1);
             }
 
             _ => {}
@@ -1121,15 +1117,15 @@ impl ApplicationHandler<UserEvent> for App {
     /// Decides control flow for the next iteration based on what each
     /// window needs:
     ///
-    /// - Any window currently animating (focused gradient, or mid-fade)
+    /// - A focused window running the `--hot-cpu` shader light show
     ///   gets a redraw request; we set `ControlFlow::WaitUntil(now + 33ms)`
     ///   to wake for the next ~30 FPS frame.
-    /// - Any window whose animation will *start* later (unfocused, fade
-    ///   not yet begun) schedules a wake at that future moment.
-    /// - Windows that are fully static (frozen shell, or unfocused past
-    ///   fade-end, or `--no-animation`) contribute no deadline and no
-    ///   redraw — the loop sleeps on `ControlFlow::Wait` until user
-    ///   input or a PTY-output user event arrives.
+    /// - Every other window (unfocused, focused-but-quiet, or frozen
+    ///   shell) contributes no deadline and no redraw — the loop
+    ///   sleeps on `ControlFlow::Wait` until user input or a
+    ///   PTY-output user event arrives.  The focus/blur opacity snap
+    ///   is driven by the redraw the `Focused` handler requests
+    ///   directly; no scheduler tick is needed for it.
     ///
     /// We take the earliest deadline across all windows so a single
     /// global timer drives everyone.  Simpler than per-window vsync
@@ -1143,21 +1139,13 @@ impl ApplicationHandler<UserEvent> for App {
             let input = AnimationInputs {
                 is_alive: state.exit_status.is_none(),
                 focused: state.focused,
-                last_input_time: state.last_input_time,
+                focus_redraw_frames: state.focus_redraw_frames,
             };
-            let anim = classify_animation(
-                input,
-                &self.config.theme.opacity,
-                self.hot_cpu,
-                now,
-            );
+            let anim = classify_animation(input, self.hot_cpu, now);
             match anim {
                 AnimationState::Active { next_frame } => {
                     state.window.request_redraw();
                     merge_deadline(&mut earliest_deadline, next_frame);
-                }
-                AnimationState::WakeAt(deadline) => {
-                    merge_deadline(&mut earliest_deadline, deadline);
                 }
                 AnimationState::Idle => {
                     // No redraw, no deadline contribution.
@@ -1293,6 +1281,198 @@ fn make_waker_for(proxy: &EventLoopProxy<UserEvent>, window_id: WindowId) -> Pty
     })
 }
 
+// ── Pure helpers: opacity selection + Cmd-shortcut classification ─────────────
+
+/// Which content-area opacity to use right now, purely as a function
+/// of focus state.  Extracted so the `Focused`/`RedrawRequested`
+/// dispatch remains a no-brainer — and so a unit test can pin the
+/// policy ("focused → active, blurred → idle, no interpolation in
+/// between") as a spec rather than leaving it implicit in the render
+/// body.
+fn opacity_for_focus(focused: bool, config: &mechanic_config::OpacityConfig) -> f32 {
+    if focused {
+        config.content_active_opacity
+    } else {
+        config.content_idle_opacity
+    }
+}
+
+/// Per-frame multiplier for glyph coverage, as a function of focus.
+///
+/// Focused windows always render text at full strength (`1.0`) —
+/// there's no point making the user squint at the window they're
+/// actively using.  Unfocused windows get `config.text_idle_opacity`,
+/// which ghosts the glyphs toward their cell background.  Combined
+/// with the `content_idle_opacity` window alpha, this gives an idle
+/// Mechanic a visibly quieter presence without making the text
+/// illegible if the user glances across.
+fn text_opacity_for_focus(focused: bool, config: &mechanic_config::OpacityConfig) -> f32 {
+    if focused {
+        1.0
+    } else {
+        config.text_idle_opacity
+    }
+}
+
+/// One of the Cmd-keyed shortcuts Mechanic intercepts before routing
+/// a key event to the PTY.  Pure classification — [`cmd_shortcut`]
+/// maps a character string to a variant and nothing else; the actual
+/// side effects (spawning a window, writing to the PTY, etc.) are
+/// performed by the dispatch site once it sees the variant.
+///
+/// Keeping this as an enum + classifier means:
+/// - A unit test can pin the entire shortcut table, so adding,
+///   removing, or renaming a shortcut is guaranteed to show up in CI.
+/// - Cmd+` and any other unclaimed character produces [`None`] in a
+///   single well-tested path, so there's no risk of a stray arm
+///   swallowing an OS-level key combo like macOS's "Move focus to
+///   next window" (Cmd+`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmdShortcut {
+    /// Cmd+N — spawn a new Mechanic window.
+    SpawnWindow,
+    /// Cmd+W — close the current window.
+    CloseWindow,
+    /// Cmd+C — copy the current selection to the system clipboard.
+    Copy,
+    /// Cmd+V — paste from the system clipboard into the PTY.
+    Paste,
+    /// Cmd+K — clear the scrollback buffer (iTerm2 convention).
+    ClearScrollback,
+    /// Cmd+A — select the entire terminal buffer including scrollback.
+    SelectAll,
+    /// Cmd++ / Cmd+= — step the font size up by 1 point.
+    FontSizeIncrease,
+    /// Cmd+- — step the font size down by 1 point.
+    FontSizeDecrease,
+    /// Cmd+0 — reset font size to the configured default.
+    FontSizeReset,
+    /// Cmd+Z — send readline's undo sequence (`Ctrl+_`, 0x1F).
+    ReadlineUndo,
+}
+
+impl CmdShortcut {
+    /// `true` for shortcuts that mutate the set of open windows
+    /// ([`Self::SpawnWindow`], [`Self::CloseWindow`]) and therefore
+    /// need dispatching before the per-window state lookup runs —
+    /// doing it afterward would hold a `&mut AppState` borrow that
+    /// conflicts with the `&mut self.windows` write the action needs.
+    fn is_app_level(self) -> bool {
+        matches!(self, Self::SpawnWindow | Self::CloseWindow)
+    }
+}
+
+/// Map a Cmd-modified character to a [`CmdShortcut`].
+///
+/// Returns [`None`] for any character Mechanic doesn't claim, which
+/// includes the backtick (so macOS's system-level Cmd+` window-cycle
+/// is allowed to take precedence via AppKit) and any unrecognised
+/// key.  The caller in the dispatch path interprets [`None`] as
+/// "let the key fall through to the PTY translation layer".
+fn cmd_shortcut(c: &str) -> Option<CmdShortcut> {
+    match c {
+        "n" => Some(CmdShortcut::SpawnWindow),
+        "w" => Some(CmdShortcut::CloseWindow),
+        "c" => Some(CmdShortcut::Copy),
+        "v" => Some(CmdShortcut::Paste),
+        "k" => Some(CmdShortcut::ClearScrollback),
+        "a" => Some(CmdShortcut::SelectAll),
+        // Cmd++ requires Shift on US keyboards (Shift+=), which the OS
+        // delivers as "+".  Cmd+= without Shift is accepted too for
+        // convenience — same action.
+        "+" | "=" => Some(CmdShortcut::FontSizeIncrease),
+        "-" => Some(CmdShortcut::FontSizeDecrease),
+        "0" => Some(CmdShortcut::FontSizeReset),
+        "z" => Some(CmdShortcut::ReadlineUndo),
+        _ => None,
+    }
+}
+
+// ── Per-window render helper ──────────────────────────────────────────────────
+
+/// Render one frame for `state` using the current focus / grid state.
+///
+/// Picks the active-vs-idle opacity based on `state.focused`, chooses
+/// the fast animation path vs. the full grid-rebuild path based on
+/// `state.content_dirty`, and updates the window title with any frozen-
+/// shell exit suffix.  Does not drain the PTY or handle child-exit
+/// transitions — those belong in the `RedrawRequested` arm of the
+/// event loop; this helper is just the pixels-to-screen half of a
+/// redraw, factored out so the redraw handler reads top-to-bottom.
+///
+/// A free function rather than a method so the call site can invoke
+/// it while holding a `&mut AppState` borrowed out of `App::windows` —
+/// a method on `&mut App` would conflict with that borrow.
+fn render_frame(state: &mut AppState, config: &Config, hot_cpu: bool) {
+    // Opacity snaps to active or idle on focus change — no fade, no
+    // timer.  The alpha lands in two places on the GPU side: the
+    // clear color for the next frame, and the fragment shader's
+    // final-alpha uniform.  Both take effect as soon as this
+    // function's render call submits and presents.
+    let opacity = opacity_for_focus(state.focused, &config.theme.opacity);
+    // Text opacity tracks real focus state, independently of `hot_cpu`.
+    // Unfocused windows ghost their text toward the cell background so
+    // the window reads as visibly idle even when its overall alpha
+    // alone isn't enough to carry that signal.
+    let text_opacity = text_opacity_for_focus(state.focused, &config.theme.opacity);
+
+    let time = state.start_time.elapsed().as_secs_f32();
+
+    // Shader-side animations (corner gradient brightness breath,
+    // color pulse, electron traces on the logo) are all gated on the
+    // `focused` uniform.  Unless `--hot-cpu` was passed we force it
+    // to `false` regardless of real focus state — freezes the
+    // gradient at its midpoint color and constant brightness, and
+    // suppresses electron pulses.  The gradient itself still renders
+    // as a static corner accent.
+    let shader_focused = state.focused && hot_cpu;
+
+    // Two render paths:
+    //
+    // 1. Animation fast path — only the shader time/opacity/focused
+    //    uniforms changed (focused pulse under `--hot-cpu`, or the
+    //    one-frame opacity snap on focus change).  Reissue the
+    //    previous frame's cached instance draw against a new globals
+    //    uniform.  Skips grid conversion and the ~200 KB instance
+    //    rebuild+upload per frame.
+    //
+    // 2. Full render — grid state changed (PTY output, resize, scroll,
+    //    selection, etc.) or no prior render has populated the
+    //    instance cache yet.  Convert the grid, build instances,
+    //    upload, draw.
+    //
+    // Short-circuit: attempt path 1 only when `!content_dirty`; fall
+    // through to path 2 when `render_animation` reports no cached
+    // instances (first frame, or post-resize before a full render).
+    let uniforms = FrameUniforms {
+        content_opacity: opacity,
+        text_opacity,
+        time,
+        focused: shader_focused,
+    };
+
+    let did_animation_render =
+        !state.content_dirty && state.renderer.render_animation(uniforms);
+
+    if !did_animation_render {
+        let grid = crate::convert::convert_grid(&state.terminal, &config.theme);
+        state.renderer.render(&grid, uniforms);
+        state.content_dirty = false;
+    }
+
+    // Title: base from the shell's OSC-set title (or "Mechanic" when
+    // unset), suffixed with exit info when the window is frozen so
+    // the user can see exit status at a glance even when the grid
+    // has scrolled past the banner line.
+    let base_title = state.terminal.title();
+    let base = if base_title.is_empty() { "Mechanic" } else { base_title };
+    let title_string = match state.exit_status {
+        Some(status) => format!("{base} — {}", format_title_suffix(status)),
+        None => base.to_string(),
+    };
+    state.window.set_title(&title_string);
+}
+
 // ── Animation scheduling ──────────────────────────────────────────────────────
 
 /// What a window needs from the event-loop scheduler for the next tick.
@@ -1300,17 +1480,13 @@ fn make_waker_for(proxy: &EventLoopProxy<UserEvent>, window_id: WindowId) -> Pty
 enum AnimationState {
     /// Window has active animation.  Redraw now; next frame at `next_frame`.
     Active { next_frame: Instant },
-    /// Window is static right now but animation will start at `deadline`
-    /// (e.g. fade-begin for an unfocused window that's still in its
-    /// pre-fade grace period).  Don't redraw yet — just schedule a wake.
-    WakeAt(Instant),
     /// Window is fully static with no scheduled future animation.
     /// Only user input or PTY output should wake us on its behalf.
     Idle,
 }
 
 /// Inputs to [`classify_animation`] — the minimal slice of `AppState`
-/// the scheduler actually needs.  A small struct (rather than three
+/// the scheduler actually needs.  A small struct (rather than two
 /// positional args) keeps call sites readable and makes unit tests
 /// self-documenting.
 #[derive(Debug, Clone, Copy)]
@@ -1319,33 +1495,36 @@ struct AnimationInputs {
     is_alive: bool,
     /// Does the window currently hold keyboard focus?
     focused: bool,
-    /// When was the last user interaction in this window?
-    last_input_time: Instant,
+    /// Frames remaining in the post-focus-change forced-redraw
+    /// burst.  Non-zero forces `Active` regardless of focus /
+    /// `hot_cpu` so the opacity + text-opacity snap reliably lands
+    /// on screen — see [`AppState::focus_redraw_frames`] for why
+    /// this exists at all (macOS AppKit quirks).
+    focus_redraw_frames: u8,
 }
 
 /// Decide what scheduling a window needs right now.
 ///
 /// Pure function — unit-testable without GPU, Terminal, or real
-/// windowing.  Rules:
+/// windowing.  Rules, evaluated in order:
 ///
 /// 1. Frozen window (shell exited, awaiting dismissal) → `Idle`.
-/// 2. Focused + `hot_cpu` → `Active` every `FRAME_INTERVAL`.  The
+///    Overrides everything else: there's no surface to animate and
+///    a burst on a frozen window would just spin the CPU.
+/// 2. `focus_redraw_frames > 0` → `Active` every `FRAME_INTERVAL`.
+///    A focus change just happened; keep pumping frames until the
+///    burst counter hits zero so the new state definitely lands on
+///    screen.  Independent of `hot_cpu` — the snap has to work in
+///    the quiet default too.
+/// 3. Focused + `hot_cpu` → `Active` every `FRAME_INTERVAL`.  The
 ///    corner-gradient breath, color pulse, and electron traces are
 ///    continuous animations driven by the shader clock, so the event
 ///    loop has to keep rendering to move them forward.
-/// 3. Focused + `!hot_cpu` → `Idle`.  The shader `focused` uniform is
-///    forced to 0 in the render path so nothing time-dependent is
-///    running — there's no reason to wake up.  This is the default
-///    and the main win: a focused idle window costs nothing.
-/// 4. Unfocused, `elapsed < fade_begin` → `WakeAt(last_input + fade_begin)`.
-///    Nothing is animating yet, but the fade will start at that instant.
-/// 5. Unfocused, `fade_begin <= elapsed <= fade_end` → `Active` (mid-fade).
-///    The opacity fade is independent of `hot_cpu` and always runs.
-/// 6. Unfocused, `elapsed > fade_end` → `Idle`.  Opacity has settled at
-///    `content_idle_opacity`; the shader is static; nothing to redraw.
+/// 4. Everything else (focused + quiet, or unfocused past the burst)
+///    → `Idle`.  No periodic ticks; the loop sleeps on
+///    `ControlFlow::Wait` until the next user input or PTY output.
 fn classify_animation(
     input: AnimationInputs,
-    opacity_cfg: &mechanic_config::OpacityConfig,
     hot_cpu: bool,
     now: Instant,
 ) -> AnimationState {
@@ -1353,32 +1532,16 @@ fn classify_animation(
     if !input.is_alive {
         return AnimationState::Idle;
     }
-    // Rule 2 / 3: focused → depends on hot_cpu.
-    if input.focused {
-        if hot_cpu {
-            return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
-        }
-        // Focused and quiet — nothing time-dependent is rendered.
-        return AnimationState::Idle;
+    // Rule 2.
+    if input.focus_redraw_frames > 0 {
+        return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
-
-    // Unfocused — check fade state.  `saturating_duration_since` handles
-    // the (impossible-in-practice) case where `last_input_time > now`.
-    let elapsed = now.saturating_duration_since(input.last_input_time);
-    let fade_begin = Duration::from_secs(u64::from(opacity_cfg.fade_begin_secs));
-    let fade_end = Duration::from_secs(u64::from(opacity_cfg.fade_end_secs));
-
-    if elapsed < fade_begin {
-        // Rule 4 — wake when the fade is due to start.
-        let wake_in = fade_begin - elapsed;
-        AnimationState::WakeAt(now + wake_in)
-    } else if elapsed <= fade_end {
-        // Rule 5 — mid-fade, animate continuously.
-        AnimationState::Active { next_frame: now + FRAME_INTERVAL }
-    } else {
-        // Rule 6 — past fade end, nothing moves.
-        AnimationState::Idle
+    // Rule 3.
+    if input.focused && hot_cpu {
+        return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
+    // Rule 4 — catches focused-but-quiet and all unfocused windows.
+    AnimationState::Idle
 }
 
 /// Keep the earlier of two deadlines.
@@ -1424,7 +1587,6 @@ fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId, waker: Pty
         Ok(new_term) => {
             state.terminal = new_term;
             state.exit_status = None;
-            state.last_input_time = std::time::Instant::now();
             // Fresh terminal → fresh grid → cached instances are stale.
             state.content_dirty = true;
             state.window.request_redraw();
@@ -1527,80 +1689,11 @@ fn format_exit_status(status: Option<std::process::ExitStatus>) -> String {
     }
 }
 
-// ── Opacity computation ───────────────────────────────────────────────────────
-
-/// Compute content opacity based on seconds since last user interaction.
-///
-/// Returns `content_active_opacity` during active use, smoothly fading
-/// to `content_idle_opacity` between `fade_begin_secs` and `fade_end_secs`.
-fn compute_opacity(elapsed_secs: f32, config: &mechanic_config::OpacityConfig) -> f32 {
-    let begin = config.fade_begin_secs as f32;
-    let end = config.fade_end_secs as f32;
-
-    if elapsed_secs <= begin {
-        config.content_active_opacity
-    } else if elapsed_secs >= end {
-        config.content_idle_opacity
-    } else {
-        let t = (elapsed_secs - begin) / (end - begin);
-        let smooth_t = t * t * (3.0 - 2.0 * t);
-        config.content_active_opacity
-            + (config.content_idle_opacity - config.content_active_opacity) * smooth_t
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mechanic_config::OpacityConfig;
-
-    fn default_opacity() -> OpacityConfig {
-        OpacityConfig {
-            title_bar_opacity: 0.95,
-            content_active_opacity: 0.95,
-            content_idle_opacity: 0.80,
-            fade_begin_secs: 30,
-            fade_end_secs: 60,
-        }
-    }
-
-    #[test]
-    fn opacity_active_during_interaction() {
-        let config = default_opacity();
-        let opacity = compute_opacity(0.0, &config);
-        assert!((opacity - 0.95).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn opacity_still_active_at_fade_begin() {
-        let config = default_opacity();
-        let opacity = compute_opacity(30.0, &config);
-        assert!((opacity - 0.95).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn opacity_idle_after_fade_end() {
-        let config = default_opacity();
-        let opacity = compute_opacity(60.0, &config);
-        assert!((opacity - 0.80).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn opacity_idle_well_past_fade_end() {
-        let config = default_opacity();
-        let opacity = compute_opacity(300.0, &config);
-        assert!((opacity - 0.80).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn opacity_midpoint_is_between_active_and_idle() {
-        let config = default_opacity();
-        let opacity = compute_opacity(45.0, &config);
-        assert!(opacity < 0.95);
-        assert!(opacity > 0.80);
-    }
 
     // ── Exit-status formatting ────────────────────────────────────────────────
 
@@ -1721,74 +1814,54 @@ mod tests {
 
     // ── Animation scheduling ──────────────────────────────────────────────────
 
-    fn default_opacity_cfg() -> mechanic_config::OpacityConfig {
-        mechanic_config::OpacityConfig {
-            title_bar_opacity: 0.95,
-            content_active_opacity: 0.95,
-            content_idle_opacity: 0.80,
-            fade_begin_secs: 30,
-            fade_end_secs: 60,
-        }
+    fn inputs(is_alive: bool, focused: bool) -> AnimationInputs {
+        AnimationInputs { is_alive, focused, focus_redraw_frames: 0 }
     }
 
-    /// Build inputs where `last_input_time` is exactly `last_input_ago`
-    /// before `now`.  Both the inputs and the caller-visible `now`
-    /// share the same reference instant so boundary tests aren't
-    /// subject to a race between two independent `Instant::now()`
-    /// calls.
-    fn inputs_at(
-        now: Instant,
+    /// Like [`inputs`] but seeds the post-focus-change burst counter.
+    /// Used by the tests that pin the "force `Active` for a few frames
+    /// after every focus change" behaviour.
+    fn inputs_with_burst(
         is_alive: bool,
         focused: bool,
-        last_input_ago: Duration,
+        focus_redraw_frames: u8,
     ) -> AnimationInputs {
-        AnimationInputs {
-            is_alive,
-            focused,
-            last_input_time: now.checked_sub(last_input_ago).unwrap_or(now),
-        }
-    }
-
-    /// Convenience wrapper that uses `Instant::now()` for tests that
-    /// don't care about sub-microsecond timing.
-    fn inputs(is_alive: bool, focused: bool, last_input_ago: Duration) -> AnimationInputs {
-        inputs_at(Instant::now(), is_alive, focused, last_input_ago)
+        AnimationInputs { is_alive, focused, focus_redraw_frames }
     }
 
     #[test]
     fn anim_frozen_window_is_idle() {
-        // Rule 1: shell exited → nothing to render.
-        let cfg = default_opacity_cfg();
-        let input = inputs(false, true, Duration::ZERO);
+        // Rule 1: shell exited → nothing to render.  `hot_cpu` is
+        // irrelevant once the shell is gone.
         assert_eq!(
-            classify_animation(input, &cfg, true, Instant::now()),
+            classify_animation(inputs(false, true), true, Instant::now()),
+            AnimationState::Idle
+        );
+        assert_eq!(
+            classify_animation(inputs(false, false), true, Instant::now()),
             AnimationState::Idle
         );
     }
 
     #[test]
     fn anim_focused_quiet_default_is_idle() {
-        // Rule 3 (the new default): focused but hot_cpu=false → Idle.
+        // Rule 3 (the default): focused but `hot_cpu == false` → Idle.
         // This is the main CPU-savings win — a focused idle window
         // should not wake the event loop 30 times a second just to
         // redraw pixels that don't change.
-        let cfg = default_opacity_cfg();
-        let input = inputs(true, true, Duration::ZERO);
         assert_eq!(
-            classify_animation(input, &cfg, false, Instant::now()),
+            classify_animation(inputs(true, true), false, Instant::now()),
             AnimationState::Idle
         );
     }
 
     #[test]
     fn anim_focused_hot_cpu_is_active() {
-        // Rule 2: focused + --hot-cpu → continuous animation at
+        // Rule 2: focused + `--hot-cpu` → continuous animation at
         // FRAME_INTERVAL so the shader time-based effects actually
         // advance frame-to-frame.
-        let cfg = default_opacity_cfg();
-        let input = inputs(true, true, Duration::from_secs(1000));
         let now = Instant::now();
-        match classify_animation(input, &cfg, true, now) {
+        match classify_animation(inputs(true, true), true, now) {
             AnimationState::Active { next_frame } => {
                 // next_frame should be roughly one FRAME_INTERVAL out.
                 let delta = next_frame.saturating_duration_since(now);
@@ -1800,67 +1873,257 @@ mod tests {
     }
 
     #[test]
-    fn anim_unfocused_pre_fade_wakes_later() {
-        // Rule 4: unfocused + before fade_begin → WakeAt(fade_begin).
-        // `hot_cpu` should not affect this — pass `false` to prove
-        // the fade's redraw scheduling is independent.
-        let cfg = default_opacity_cfg();
-        let elapsed = Duration::from_secs(10); // well before fade_begin = 30
-        let input = inputs(true, false, elapsed);
-        let now = Instant::now();
-        match classify_animation(input, &cfg, false, now) {
-            AnimationState::WakeAt(deadline) => {
-                // Deadline should be ~20s from now (fade_begin 30 - elapsed 10).
-                let delta = deadline.saturating_duration_since(now);
-                assert!(delta >= Duration::from_secs(19));
-                assert!(delta <= Duration::from_secs(21));
-            }
-            other => panic!("expected WakeAt, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn anim_unfocused_mid_fade_is_active_without_hot_cpu() {
-        // Rule 5: unfocused + mid-fade → Active regardless of
-        // `hot_cpu`.  The fade is our one unconditional animation —
-        // it communicates "this window is going idle" and is cheap
-        // (runs only for a few seconds per blur).
-        let cfg = default_opacity_cfg();
-        let elapsed = Duration::from_secs(45); // between 30 and 60
-        let input = inputs(true, false, elapsed);
-        let now = Instant::now();
-        assert!(matches!(
-            classify_animation(input, &cfg, false, now),
-            AnimationState::Active { .. }
-        ));
-    }
-
-    #[test]
-    fn anim_unfocused_past_fade_end_is_idle() {
-        // Rule 6: unfocused + elapsed > fade_end → fully static.
-        let cfg = default_opacity_cfg();
-        let elapsed = Duration::from_secs(120); // well past fade_end = 60
-        let input = inputs(true, false, elapsed);
+    fn anim_unfocused_is_always_idle() {
+        // Rule 4: unfocused windows are Idle regardless of `hot_cpu`
+        // once the post-focus burst has drained.
         assert_eq!(
-            classify_animation(input, &cfg, false, Instant::now()),
+            classify_animation(inputs(true, false), false, Instant::now()),
+            AnimationState::Idle
+        );
+        assert_eq!(
+            classify_animation(inputs(true, false), true, Instant::now()),
             AnimationState::Idle
         );
     }
 
     #[test]
-    fn anim_unfocused_exactly_at_fade_end_still_active() {
-        // Boundary: elapsed == fade_end is treated as "still fading"
-        // (rule 5's `<= fade_end`) so the last frame of the fade
-        // actually renders before we go idle.  Use `inputs_at` so the
-        // inputs and classifier's `now` share a reference instant —
-        // otherwise nanoseconds of drift push us past fade_end.
-        let cfg = default_opacity_cfg();
+    fn anim_focus_redraw_burst_forces_active_regardless_of_focus() {
+        // Rule 2: non-zero `focus_redraw_frames` forces Active even
+        // for an unfocused window with `hot_cpu` off.  This is the
+        // guarantee that keeps the opacity/text-opacity snap from
+        // getting swallowed by macOS AppKit right after a blur.
         let now = Instant::now();
-        let input = inputs_at(now, true, false, Duration::from_secs(60));
+        match classify_animation(
+            inputs_with_burst(true, false, 5),
+            false,
+            now,
+        ) {
+            AnimationState::Active { next_frame } => {
+                let delta = next_frame.saturating_duration_since(now);
+                assert!(delta >= FRAME_INTERVAL);
+                assert!(delta <= FRAME_INTERVAL + Duration::from_millis(5));
+            }
+            other => panic!("expected Active during focus burst, got {other:?}"),
+        }
+
+        // Same behaviour for a focused window — the burst applies
+        // regardless of which direction the transition went.
         assert!(matches!(
-            classify_animation(input, &cfg, false, now),
+            classify_animation(inputs_with_burst(true, true, 3), false, now),
             AnimationState::Active { .. }
         ));
+    }
+
+    #[test]
+    fn anim_focus_redraw_burst_drains_to_idle() {
+        // When the counter reaches zero the window returns to its
+        // normal classification — here, unfocused + no hot_cpu → Idle.
+        // Guards against a regression where the burst gate becomes
+        // "anything non-strict-zero" or similar.
+        assert_eq!(
+            classify_animation(inputs_with_burst(true, false, 0), false, Instant::now()),
+            AnimationState::Idle
+        );
+    }
+
+    #[test]
+    fn anim_frozen_window_ignores_focus_redraw_burst() {
+        // Rule 1 (frozen → Idle) outranks the burst: rendering a
+        // frozen window is pointless, and a burst left over from a
+        // focus event that raced the shell exit shouldn't keep the
+        // event loop spinning.
+        assert_eq!(
+            classify_animation(inputs_with_burst(false, true, 5), true, Instant::now()),
+            AnimationState::Idle
+        );
+    }
+
+    // ── Opacity selection ─────────────────────────────────────────────────────
+
+    fn opacity_cfg(active: f32, idle: f32) -> mechanic_config::OpacityConfig {
+        opacity_cfg_full(active, idle, 0.55)
+    }
+
+    fn opacity_cfg_full(
+        active: f32,
+        idle: f32,
+        text_idle: f32,
+    ) -> mechanic_config::OpacityConfig {
+        mechanic_config::OpacityConfig {
+            title_bar_opacity: 0.95,
+            content_active_opacity: active,
+            content_idle_opacity: idle,
+            text_idle_opacity: text_idle,
+        }
+    }
+
+    #[test]
+    fn opacity_focused_picks_active_value() {
+        let cfg = opacity_cfg(0.85, 0.65);
+        assert!((opacity_for_focus(true, &cfg) - 0.85).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn opacity_unfocused_picks_idle_value() {
+        let cfg = opacity_cfg(0.85, 0.65);
+        assert!((opacity_for_focus(false, &cfg) - 0.65).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn opacity_follows_config_values() {
+        // No magic numbers — whatever the config says is what the
+        // function returns.  Catches regressions that sneak in a
+        // hardcoded constant on the way through.
+        let cfg = opacity_cfg(0.42, 0.13);
+        assert!((opacity_for_focus(true, &cfg) - 0.42).abs() < f32::EPSILON);
+        assert!((opacity_for_focus(false, &cfg) - 0.13).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn opacity_snap_is_discontinuous_at_focus_edge() {
+        // Sanity: there is no interpolation between the two values.
+        // Any two distinct active/idle pairs should produce exactly
+        // those values and nothing in between — no smoothstep, no
+        // fade, no averaging.  This is the spec the fade-removal
+        // commit is pinning.
+        let cfg = opacity_cfg(0.9, 0.5);
+        let focused = opacity_for_focus(true, &cfg);
+        let blurred = opacity_for_focus(false, &cfg);
+        assert_eq!(focused, 0.9);
+        assert_eq!(blurred, 0.5);
+        assert!((focused - blurred - 0.4).abs() < f32::EPSILON);
+    }
+
+    // ── Text opacity selection ────────────────────────────────────────────────
+
+    #[test]
+    fn text_opacity_focused_is_full_strength() {
+        // Focused text is always 1.0 — we never dim the window the
+        // user is actively working in, regardless of what the config
+        // says for the idle side.
+        let cfg = opacity_cfg_full(0.85, 0.65, 0.55);
+        assert_eq!(text_opacity_for_focus(true, &cfg), 1.0);
+    }
+
+    #[test]
+    fn text_opacity_unfocused_uses_config_value() {
+        let cfg = opacity_cfg_full(0.85, 0.65, 0.55);
+        assert!((text_opacity_for_focus(false, &cfg) - 0.55).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn text_opacity_ignores_window_alpha_values() {
+        // Text opacity is independent of `content_*_opacity` — an
+        // unfocused window with 0.9 alpha still ghosts its text at
+        // `text_idle_opacity`, and a focused window with 0.5 alpha
+        // still renders text at full strength.  Different axes.
+        let cfg = opacity_cfg_full(0.5, 0.9, 0.3);
+        assert_eq!(text_opacity_for_focus(true, &cfg), 1.0);
+        assert!((text_opacity_for_focus(false, &cfg) - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn text_opacity_edge_values_pass_through() {
+        // 0.0 (fully invisible unfocused text) and 1.0 (no dimming)
+        // are both legal — serve as the "off" switches for the
+        // feature, so the classifier must honour them verbatim.
+        let cfg_off = opacity_cfg_full(0.85, 0.65, 1.0);
+        assert_eq!(text_opacity_for_focus(false, &cfg_off), 1.0);
+
+        let cfg_invisible = opacity_cfg_full(0.85, 0.65, 0.0);
+        assert_eq!(text_opacity_for_focus(false, &cfg_invisible), 0.0);
+    }
+
+    // ── Cmd-shortcut classification ───────────────────────────────────────────
+
+    #[test]
+    fn cmd_shortcut_known_keys_map_to_actions() {
+        // Pins the full shortcut table.  If you add, remove, or
+        // rename an arm in `cmd_shortcut`, this test must change
+        // with it — keeps the mapping honest across refactors.
+        assert_eq!(cmd_shortcut("n"), Some(CmdShortcut::SpawnWindow));
+        assert_eq!(cmd_shortcut("w"), Some(CmdShortcut::CloseWindow));
+        assert_eq!(cmd_shortcut("c"), Some(CmdShortcut::Copy));
+        assert_eq!(cmd_shortcut("v"), Some(CmdShortcut::Paste));
+        assert_eq!(cmd_shortcut("k"), Some(CmdShortcut::ClearScrollback));
+        assert_eq!(cmd_shortcut("a"), Some(CmdShortcut::SelectAll));
+        assert_eq!(cmd_shortcut("+"), Some(CmdShortcut::FontSizeIncrease));
+        assert_eq!(cmd_shortcut("="), Some(CmdShortcut::FontSizeIncrease));
+        assert_eq!(cmd_shortcut("-"), Some(CmdShortcut::FontSizeDecrease));
+        assert_eq!(cmd_shortcut("0"), Some(CmdShortcut::FontSizeReset));
+        assert_eq!(cmd_shortcut("z"), Some(CmdShortcut::ReadlineUndo));
+    }
+
+    #[test]
+    fn cmd_shortcut_backtick_is_unclaimed() {
+        // Crucial: Cmd+` must fall through so macOS's system-level
+        // window-cycle (Move focus to next window) is not swallowed
+        // by our dispatch.  This is a regression guard — an
+        // accidental arm for "`" would silently break window
+        // switching.
+        assert_eq!(cmd_shortcut("`"), None);
+    }
+
+    #[test]
+    fn cmd_shortcut_unknown_characters_are_none() {
+        // Any character we haven't explicitly claimed returns None so
+        // the caller falls through to `translate_key` and ultimately
+        // the PTY.  Sampling representative unclaimed keys; exhaustive
+        // coverage would just re-state the `match` in the classifier.
+        for unclaimed in ["b", "d", "e", "f", "g", "h", "i", "j", "l", "m",
+                          "o", "p", "q", "r", "s", "t", "u", "x", "y",
+                          "1", "2", "9", "!", "@", "#", "~", ".", "/", ""] {
+            assert_eq!(cmd_shortcut(unclaimed), None, "{unclaimed:?} should be unclaimed");
+        }
+    }
+
+    #[test]
+    fn cmd_shortcut_is_case_sensitive_lowercase_only() {
+        // winit delivers Cmd+letter as lowercase when Shift isn't
+        // held.  The classifier matches lowercase only; Shift+Cmd+C
+        // (uppercase "C") falls through, which is the same thing
+        // iTerm2 and Terminal.app do.  If this changes, update both
+        // the arm and this test deliberately.
+        assert_eq!(cmd_shortcut("C"), None);
+        assert_eq!(cmd_shortcut("V"), None);
+        assert_eq!(cmd_shortcut("N"), None);
+    }
+
+    #[test]
+    fn cmd_shortcut_multi_character_strings_are_none() {
+        // Key::Character can carry multi-char strings for some IME
+        // inputs and dead-key sequences.  None of our shortcuts are
+        // multi-char, so any such string must decline.
+        assert_eq!(cmd_shortcut("nn"), None);
+        assert_eq!(cmd_shortcut(" c"), None);
+        assert_eq!(cmd_shortcut("c "), None);
+    }
+
+    #[test]
+    fn cmd_shortcut_is_app_level_only_for_window_lifecycle() {
+        // SpawnWindow and CloseWindow mutate `App::windows` — the
+        // top-level dispatch has to handle them before borrowing an
+        // AppState.  Everything else runs per-window.  This invariant
+        // is what keeps the two dispatch sites from stepping on each
+        // other's borrows.
+        assert!(CmdShortcut::SpawnWindow.is_app_level());
+        assert!(CmdShortcut::CloseWindow.is_app_level());
+
+        for window_level in [
+            CmdShortcut::Copy,
+            CmdShortcut::Paste,
+            CmdShortcut::ClearScrollback,
+            CmdShortcut::SelectAll,
+            CmdShortcut::FontSizeIncrease,
+            CmdShortcut::FontSizeDecrease,
+            CmdShortcut::FontSizeReset,
+            CmdShortcut::ReadlineUndo,
+        ] {
+            assert!(
+                !window_level.is_app_level(),
+                "{window_level:?} must not be app-level"
+            );
+        }
     }
 
     // ── Mouse routing ─────────────────────────────────────────────────────────
@@ -2013,18 +2276,5 @@ mod tests {
         assert_eq!(format_exit_status(Some(status_from_code(0))), "code 0");
         assert_eq!(format_exit_status(Some(status_from_signal(9))), "signal 9");
         assert_eq!(format_exit_status(None), "no status");
-    }
-
-    // ── Opacity ───────────────────────────────────────────────────────────────
-
-    #[test]
-    fn opacity_monotonically_decreases_during_fade() {
-        let config = default_opacity();
-        let mut prev = compute_opacity(30.0, &config);
-        for secs in 31..=60 {
-            let current = compute_opacity(secs as f32, &config);
-            assert!(current <= prev, "opacity should decrease: {prev} -> {current} at {secs}s");
-            prev = current;
-        }
     }
 }

@@ -280,10 +280,8 @@ Render Thread (optional, can start on main)
   name = "stark"
   
   [window]
-  opacity_active = 0.95
-  opacity_idle = 0.80
-  fade_begin_secs = 30
-  fade_end_secs = 60
+  opacity_active = 0.85
+  opacity_idle = 0.65
   
   [shell]
   program = "/bin/zsh"
