@@ -1,0 +1,13 @@
+   Compiling mechanic-core v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-core)
+   Compiling mechanic-app v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-app)
+    Finished `release` profile [optimized] target(s) in 4.38s
+     Running unittests src/main.rs (target/release/deps/mechanic-90241c9b910d416b)
+
+running 1 test
+test input::kitty::tests::benchmark_keyboard_encoding ... keyboard_encoding legacy: events=500000 bytes=500000 elapsed_us=14137 ns_per_event=28.3
+keyboard_encoding kitty_disambiguated: events=500000 bytes=3500000 elapsed_us=24490 ns_per_event=49.0
+keyboard_encoding kitty_all: events=500000 bytes=5000000 elapsed_us=21747 ns_per_event=43.5
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 366 filtered out; finished in 0.06s
+

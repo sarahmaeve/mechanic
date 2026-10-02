@@ -377,6 +377,28 @@ It checks AppKit edits, Match case toggles without losing query/focus, navigatio
 actions, keyboard equivalents, close and callback teardown. It does not capture
 the screen or send text to a shell.
 
+## TUI protocols
+
+```sh
+cargo test --release --locked -p mechanic-core synchronized_parser_benchmark -- --ignored --nocapture --test-threads=1
+cargo test --release --locked -p mechanic-app --bin mechanic input::kitty::tests::benchmark_keyboard_encoding -- --exact --ignored --nocapture --test-threads=1
+cargo rustc --locked -p mechanic-app --example protocol_native_smoke -- --cfg test
+./target/debug/examples/protocol_native_smoke
+```
+
+Run benchmarks serially. The parser test measures ASCII, dense title updates,
+and color queries in ordinary, expired synchronized, and explicitly ended
+synchronized output. Each case has 16 warmup batches and 128 measured batches;
+timeout expiry is invoked directly, excluding the 150 ms wait. Replies use a
+buffered test transport. The keyboard test measures 500,000 Ctrl+A encodings
+per mode after 10,000 warmups. Both exclude rendering and input-to-screen latency.
+
+The hidden native check uses isolated `/bin/sh` PTYs. It verifies Kitty
+negotiation/input/pop, OSC 52 pane-local selection replies, and synchronized
+timeout recovery in a zoom-hidden, occluded pane through the app event loop.
+It checks native approval construction and callback teardown without presenting
+a dialog or accessing the system clipboard. No screen capture is used.
+
 ## Panes and completion notifications
 
 ```sh

@@ -1,5 +1,6 @@
 //! TOML configuration with defaults for missing fields and ignored unknown keys.
 
+pub mod clipboard;
 pub mod control;
 pub mod font;
 pub mod notifications;
@@ -7,6 +8,7 @@ pub mod session;
 pub mod terminal;
 pub mod theme;
 
+pub use clipboard::{ClipboardConfig, ClipboardPolicy};
 pub use control::ControlConfig;
 pub use font::FontConfig;
 pub use notifications::NotificationsConfig;
@@ -46,6 +48,8 @@ pub struct Config {
     pub shell: ShellConfig,
     /// Scrollback and shell-exit settings.
     pub terminal: TerminalConfig,
+    /// Permissions for clipboard access requested by terminal programs (OSC 52).
+    pub clipboard: ClipboardConfig,
     /// Optional command-completion alerts for unfocused windows.
     pub notifications: NotificationsConfig,
     /// Restore the last workspace's layout and pane directories.

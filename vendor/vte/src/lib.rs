@@ -44,6 +44,8 @@ pub use params::{Params, ParamsIter};
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC_PARAMS: usize = 16;
 const MAX_OSC_RAW: usize = 1024;
+// Base64 for 1 MiB of clipboard text plus the OSC command and selection fields.
+const MAX_CLIPBOARD_OSC_RAW: usize = ((1024 * 1024 + 2) / 3) * 4 + 32;
 
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
 ///
@@ -541,7 +543,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
             // Only process up to MAX_OSC_PARAMS.
             MAX_OSC_PARAMS => {
-                if matches!(&self.osc_raw[self.osc_params[0].0..self.osc_params[0].1], b"7" | b"133") {
+                if matches!(&self.osc_raw[self.osc_params[0].0..self.osc_params[0].1], b"7" | b"133" | b"52") {
                     self.shell_osc_overflow = true;
                 }
                 return;
@@ -561,16 +563,25 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     #[inline(always)]
     fn action_osc_put(&mut self, byte: u8) {
         if self.shell_osc_overflow { return; }
-        if self.osc_num_params > 0
-            && matches!(&self.osc_raw[self.osc_params[0].0..self.osc_params[0].1], b"7" | b"133")
-            && self.osc_raw.len() >= 8192
-        {
-            self.shell_osc_overflow = true;
-            return;
+        if self.osc_num_params > 0 {
+            let command = &self.osc_raw[self.osc_params[0].0..self.osc_params[0].1];
+            let limit = match command {
+                b"7" | b"133" => Some(8192),
+                b"52" => Some(MAX_CLIPBOARD_OSC_RAW),
+                _ => None,
+            };
+            if limit.is_some_and(|limit| self.osc_raw.len() >= limit) {
+                self.shell_osc_overflow = true;
+                return;
+            }
         }
         #[cfg(not(feature = "std"))]
         {
             if self.osc_raw.is_full() {
+                if self.osc_num_params > 0
+                    && &self.osc_raw[self.osc_params[0].0..self.osc_params[0].1] == b"52" {
+                    self.shell_osc_overflow = true;
+                }
                 return;
             }
         }
@@ -580,7 +591,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         self.action_osc_put_param();
         let shell = self.osc_num_params > 0
-            && matches!(&self.osc_raw[self.osc_params[0].0..self.osc_params[0].1], b"7" | b"133");
+            && matches!(&self.osc_raw[self.osc_params[0].0..self.osc_params[0].1], b"7" | b"133" | b"52");
         if shell {
             if !self.shell_osc_overflow && byte == 0x1b {
                 self.pending_shell_osc = true;

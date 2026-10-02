@@ -1,0 +1,1 @@
+protocol native smoke passed: Kitty negotiation/input/pop via real PTY, OSC52 pane selection read/write/reply, native approval lifecycle without pasteboard access, hidden synchronized output timeout and return to idle

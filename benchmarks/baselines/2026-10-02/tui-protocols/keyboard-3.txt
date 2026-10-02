@@ -1,0 +1,11 @@
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running unittests src/main.rs (target/release/deps/mechanic-90241c9b910d416b)
+
+running 1 test
+test input::kitty::tests::benchmark_keyboard_encoding ... keyboard_encoding legacy: events=500000 bytes=500000 elapsed_us=5314 ns_per_event=10.6
+keyboard_encoding kitty_disambiguated: events=500000 bytes=3500000 elapsed_us=12692 ns_per_event=25.4
+keyboard_encoding kitty_all: events=500000 bytes=5000000 elapsed_us=14652 ns_per_event=29.3
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 366 filtered out; finished in 0.03s
+

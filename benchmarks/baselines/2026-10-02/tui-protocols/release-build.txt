@@ -1,0 +1,10 @@
+   Compiling mechanic-config v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-config)
+   Compiling vte v0.15.0 (/Users/sarah.murphy/git/mechanic/vendor/vte)
+   Compiling objc2-app-kit v0.3.2
+   Compiling mechanic-renderer v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-renderer)
+   Compiling alacritty_terminal v0.26.0 (/Users/sarah.murphy/git/mechanic/vendor/alacritty_terminal)
+   Compiling mechanic-core v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-core)
+   Compiling arboard v3.6.1
+   Compiling mechanic-bench v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-bench)
+   Compiling mechanic-app v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-app)
+    Finished `release` profile [optimized] target(s) in 4.89s

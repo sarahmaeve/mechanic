@@ -1,0 +1,141 @@
+{
+  "schema": 1,
+  "workload_version": 1,
+  "mode": "core",
+  "build_profile": "release",
+  "label": "mechanic-core",
+  "cols": 120,
+  "rows": 40,
+  "requested_bytes": 4194304,
+  "warmups": 1,
+  "samples": 5,
+  "os": "macos",
+  "arch": "aarch64",
+  "unix_seconds": 1790977098,
+  "term": "xterm-256color",
+  "term_program": "iTerm.app",
+  "term_program_version": "3.6.11",
+  "notes": "",
+  "measurements": [
+    {
+      "case": "ascii",
+      "bytes": 4194366,
+      "operations": 1,
+      "seconds": [
+        0.0191565,
+        0.016121958,
+        0.014123209,
+        0.013635709,
+        0.014308375
+      ]
+    },
+    {
+      "case": "wrap",
+      "bytes": 4194642,
+      "operations": 1,
+      "seconds": [
+        0.015091709,
+        0.01385225,
+        0.0140605,
+        0.013962292,
+        0.014364542
+      ]
+    },
+    {
+      "case": "unicode",
+      "bytes": 4194320,
+      "operations": 1,
+      "seconds": [
+        0.013454375,
+        0.013220458,
+        0.013249833,
+        0.013556791,
+        0.013487666
+      ]
+    },
+    {
+      "case": "sgr",
+      "bytes": 4196463,
+      "operations": 1,
+      "seconds": [
+        0.0136445,
+        0.013469667,
+        0.013654833,
+        0.013275375,
+        0.013151833
+      ]
+    },
+    {
+      "case": "scrollback",
+      "bytes": 4194366,
+      "operations": 1,
+      "seconds": [
+        0.017905166,
+        0.017172792,
+        0.017243166,
+        0.01770225,
+        0.01773975
+      ]
+    },
+    {
+      "case": "scroll-region",
+      "bytes": 4194320,
+      "operations": 1,
+      "seconds": [
+        0.026925542,
+        0.027359041,
+        0.0265005,
+        0.026254542,
+        0.026851334
+      ]
+    },
+    {
+      "case": "repaint",
+      "bytes": 4194328,
+      "operations": 1,
+      "seconds": [
+        0.01410575,
+        0.014791042,
+        0.013697458,
+        0.0146065,
+        0.014753667
+      ]
+    },
+    {
+      "case": "sparse",
+      "bytes": 4195020,
+      "operations": 1,
+      "seconds": [
+        0.02783825,
+        0.028274708,
+        0.02821,
+        0.028067458,
+        0.028003417
+      ]
+    },
+    {
+      "case": "paste-filter",
+      "bytes": 3984604,
+      "operations": 1,
+      "seconds": [
+        0.003205375,
+        0.003456584,
+        0.00340925,
+        0.003688458,
+        0.003285042
+      ]
+    },
+    {
+      "case": "resize-reflow",
+      "bytes": 0,
+      "operations": 200,
+      "seconds": [
+        0.09873375,
+        0.097235583,
+        0.115559584,
+        0.098886625,
+        0.104161875
+      ]
+    }
+  ]
+}

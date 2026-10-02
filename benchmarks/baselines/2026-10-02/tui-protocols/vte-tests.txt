@@ -1,0 +1,63 @@
+   Compiling vte v0.15.0 (/Users/sarah.murphy/git/mechanic/vendor/vte)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+     Running unittests src/lib.rs (target/debug/deps/vte-35bfadb71502afa9)
+
+running 55 tests
+test ansi::tests::contrast ... ok
+test ansi::tests::parse_invalid_number ... ok
+test ansi::tests::parse_invalid_rgb_colors ... ok
+test ansi::tests::parse_designate_g1_as_line_drawing_and_invoke ... ok
+test ansi::tests::parse_control_attribute ... ok
+test ansi::tests::parse_osc104_reset_all_colors ... ok
+test ansi::tests::parse_osc104_reset_all_colors_no_semicolon ... ok
+test ansi::tests::parse_designate_g0_as_line_drawing ... ok
+test ansi::tests::parse_osc104_reset_color ... ok
+test ansi::tests::mixed_sync_escape ... ok
+test ansi::tests::parse_number_too_large ... ok
+test ansi::tests::parse_invalid_legacy_rgb_colors ... ok
+test ansi::tests::parse_osc4_set_color ... ok
+test ansi::tests::parse_terminal_identity_csi ... ok
+test ansi::tests::parse_terminal_identity_esc ... ok
+test ansi::tests::parse_truecolor_attr ... ok
+test ansi::tests::parse_valid_legacy_rgb_colors ... ok
+test ansi::tests::parse_valid_number ... ok
+test ansi::tests::parse_valid_rgb_colors ... ok
+test ansi::tests::parse_zsh_startup ... ok
+test ansi::tests::partial_sync_updates ... ok
+test ansi::tests::sync_bsu_with_esu ... ok
+test tests::c1s ... ok
+test tests::csi_reset ... ok
+test tests::csi_subparameters ... ok
+test tests::dcs_reset ... ok
+test tests::esc_reset ... ok
+test tests::esc_reset_intermediates ... ok
+test tests::exceed_max_buffer_size ... ok
+test tests::execute_anywhere ... ok
+test tests::intermediate_reset_on_dcs_exit ... ok
+test tests::invalid_utf8 ... ok
+test tests::osc_bell_terminated ... ok
+test tests::osc_c0_st_terminated ... ok
+test tests::osc_containing_string_terminator ... ok
+test tests::params_buffer_filled_with_subparam ... ok
+test tests::parse_csi_max_params ... ok
+test tests::parse_csi_params_ignore_long_params ... ok
+test tests::parse_csi_params_leading_semicolon ... ok
+test tests::parse_csi_params_trailing_semicolon ... ok
+test tests::parse_dcs ... ok
+test tests::parse_dcs_max_params ... ok
+test tests::parse_empty_osc ... ok
+test tests::parse_long_csi_param ... ok
+test tests::parse_osc ... ok
+test tests::parse_osc_max_params ... ok
+test tests::parse_osc_with_utf8_arguments ... ok
+test tests::partial_invalid_utf8 ... ok
+test tests::partial_invalid_utf8_split ... ok
+test tests::partial_utf8 ... ok
+test tests::partial_utf8_into_esc ... ok
+test tests::partial_utf8_separating_utf8 ... ok
+test tests::unicode ... ok
+test tests::shell_osc_storage_is_bounded_before_termination ... ok
+test ansi::tests::sync_bursts_buffer ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+

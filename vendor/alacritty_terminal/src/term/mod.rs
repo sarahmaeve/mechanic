@@ -110,6 +110,22 @@ impl From<KeyboardModes> for TermMode {
     }
 }
 
+impl From<TermMode> for KeyboardModes {
+    fn from(value: TermMode) -> Self {
+        let mut mode = Self::empty();
+        for (terminal_flag, keyboard_flag) in [
+            (TermMode::DISAMBIGUATE_ESC_CODES, Self::DISAMBIGUATE_ESC_CODES),
+            (TermMode::REPORT_EVENT_TYPES, Self::REPORT_EVENT_TYPES),
+            (TermMode::REPORT_ALTERNATE_KEYS, Self::REPORT_ALTERNATE_KEYS),
+            (TermMode::REPORT_ALL_KEYS_AS_ESC, Self::REPORT_ALL_KEYS_AS_ESC),
+            (TermMode::REPORT_ASSOCIATED_TEXT, Self::REPORT_ASSOCIATED_TEXT),
+        ] {
+            mode.set(keyboard_flag, value.contains(terminal_flag));
+        }
+        mode
+    }
+}
+
 impl Default for TermMode {
     fn default() -> TermMode {
         TermMode::SHOW_CURSOR
@@ -1321,8 +1337,7 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         trace!("Reporting active keyboard mode");
-        let current_mode =
-            self.keyboard_mode_stack.last().unwrap_or(&KeyboardModes::NO_MODE).bits();
+        let current_mode = KeyboardModes::from(self.mode).bits();
         let text = format!("\x1b[?{current_mode}u");
         self.event_proxy.send_event(Event::PtyWrite(text));
     }
@@ -1336,7 +1351,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Pushing `{mode:?}` keyboard mode into the stack");
 
         if self.keyboard_mode_stack.len() >= KEYBOARD_MODE_STACK_MAX_DEPTH {
-            let removed = self.title_stack.remove(0);
+            let removed = self.keyboard_mode_stack.remove(0);
             trace!(
                 "Removing '{removed:?}' from bottom of keyboard mode stack that exceeds its \
                  maximum depth"
@@ -1369,6 +1384,14 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         self.set_keyboard_mode(mode.into(), apply);
+        // A set changes the current stack entry. Preserve it across subsequent
+        // push/pop operations and alternate-screen transitions.
+        let active_mode = KeyboardModes::from(self.mode);
+        if let Some(current) = self.keyboard_mode_stack.last_mut() {
+            *current = active_mode;
+        } else {
+            self.keyboard_mode_stack.push(active_mode);
+        }
     }
 
     #[inline]
@@ -2588,6 +2611,60 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    #[test]
+    fn keyboard_stack_is_bounded_and_does_not_modify_title_stack() {
+        let size = TermSize::new(7, 17);
+        let config = Config { kitty_keyboard: true, ..Config::default() };
+        let mut term = Term::new(config.clone(), &size, VoidListener);
+        term.set_title(Some("saved-title".into()));
+        term.push_title();
+        for _ in 0..KEYBOARD_MODE_STACK_MAX_DEPTH + 1 {
+            term.push_keyboard_mode(KeyboardModes::DISAMBIGUATE_ESC_CODES);
+        }
+        assert_eq!(term.keyboard_mode_stack.len(), KEYBOARD_MODE_STACK_MAX_DEPTH);
+        assert_eq!(term.title_stack, [Some("saved-title".into())]);
+        // No title entries is the important hostile-input case: the old
+        // overflow path tried to remove a nonexistent title and panicked.
+        let mut term = Term::new(config, &size, VoidListener);
+        for _ in 0..KEYBOARD_MODE_STACK_MAX_DEPTH + 1 {
+            term.push_keyboard_mode(KeyboardModes::REPORT_ALL_KEYS_AS_ESC);
+        }
+        assert_eq!(term.keyboard_mode_stack.len(), KEYBOARD_MODE_STACK_MAX_DEPTH);
+        assert!(term.title_stack.is_empty());
+        term.pop_keyboard_modes(u16::MAX);
+        assert!(KeyboardModes::from(term.mode).is_empty());
+    }
+
+    #[test]
+    fn keyboard_set_updates_current_stack_entry_and_roundtrips_all_flags() {
+        let size = TermSize::new(7, 17);
+        let config = Config { kitty_keyboard: true, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        for bits in 0..=31 {
+            let flags = KeyboardModes::from_bits_truncate(bits);
+            assert_eq!(KeyboardModes::from(TermMode::from(flags)), flags);
+        }
+        Handler::set_keyboard_mode(
+            &mut term,
+            KeyboardModes::DISAMBIGUATE_ESC_CODES,
+            KeyboardModesApplyBehavior::Replace,
+        );
+        Handler::set_keyboard_mode(
+            &mut term,
+            KeyboardModes::REPORT_EVENT_TYPES,
+            KeyboardModesApplyBehavior::Union,
+        );
+        let expected = KeyboardModes::DISAMBIGUATE_ESC_CODES | KeyboardModes::REPORT_EVENT_TYPES;
+        assert_eq!(term.keyboard_mode_stack.last(), Some(&expected));
+        term.push_keyboard_mode(KeyboardModes::REPORT_ALL_KEYS_AS_ESC);
+        term.pop_keyboard_modes(1);
+        assert_eq!(KeyboardModes::from(term.mode), expected);
+        term.swap_alt();
+        assert!(KeyboardModes::from(term.mode).is_empty());
+        term.swap_alt();
+        assert_eq!(KeyboardModes::from(term.mode), expected);
+    }
 
     #[test]
     fn scroll_display_page_up() {

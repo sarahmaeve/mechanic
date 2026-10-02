@@ -18,8 +18,16 @@ Partial screen/line erases and insert/delete characters report modified cell
 ranges, so routine shell prompt redraws preserve the current prompt while
 previous command output overlapping edited cells becomes unavailable.
 
-The raw VTE patch limits shell OSC payload storage to 8192 bytes, rejects
-parameter overflow and CAN/SUB cancellation, and waits for the backslash in an
-ESC-backslash terminator before publishing metadata. Other OSC parsing keeps
-the upstream behavior. Pending shell OSCs reuse the parser's existing storage;
-the raw parser still supports allocator-free builds without std.
+The raw VTE patch limits shell OSC payload storage to 8192 bytes and OSC 52 to
+base64 for 1 MiB plus framing. These sequences reject parameter overflow and
+CAN/SUB cancellation, and wait for the backslash in an ESC-backslash terminator
+before dispatch. OSC 52 requires exactly three fields. Pending sequences reuse
+the parser's existing storage; allocator-free builds remain supported.
+
+Synchronized-update replay exposes callbacks at OSC query boundaries so replies
+use state from the query's position. Mechanic schedules the existing timeout in
+its event loop and flushes buffered output before reporting EOF.
+
+Keyboard-mode queries report active flags. Set operations update the current
+stack entry, and keyboard-stack overflow removes its oldest entry without
+touching the title stack.

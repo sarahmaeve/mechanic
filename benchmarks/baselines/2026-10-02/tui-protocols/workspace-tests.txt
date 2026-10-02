@@ -1,0 +1,42 @@
+     Running unittests src/main.rs (target/debug/deps/mechanic-d7c084a0fa88eb22)
+test result: ok. 361 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.94s
+     Running tests/cli_smoke.rs (target/debug/deps/cli_smoke-2133e7d9460d1e13)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+     Running unittests examples/link_native_smoke.rs (target/debug/examples/link_native_smoke-4e5ee007d9455828)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests examples/palette_native_smoke.rs (target/debug/examples/palette_native_smoke-d6cc20a6f23f5aa1)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests examples/pane_move_native_smoke.rs (target/debug/examples/pane_move_native_smoke-a2ce11c6f4f88aa4)
+test result: ok. 344 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.99s
+     Running unittests examples/panes_native_smoke.rs (target/debug/examples/panes_native_smoke-b9eceedc4b4afb5e)
+test result: ok. 344 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 1.03s
+     Running unittests examples/protocol_native_smoke.rs (target/debug/examples/protocol_native_smoke-9ff300aa834f6c22)
+test result: ok. 344 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.98s
+     Running unittests examples/search_native_smoke.rs (target/debug/examples/search_native_smoke-cc664af1a073a9d3)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests examples/services_bench.rs (target/debug/examples/services_bench-eac5ab19c9e9870d)
+test result: ok. 56 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.97s
+     Running unittests examples/session_control_native_smoke.rs (target/debug/examples/session_control_native_smoke-41270b4d253e9205)
+test result: ok. 344 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.98s
+     Running unittests examples/workspace_native_smoke.rs (target/debug/examples/workspace_native_smoke-59f8cf02f9abdcc4)
+test result: ok. 344 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.98s
+     Running unittests src/main.rs (target/debug/deps/mechanic_bench-ab317414436153be)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/terminal_driver.rs (target/debug/deps/terminal_driver-45a0bf3adb42b694)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
+     Running unittests examples/app_cpu.rs (target/debug/examples/app_cpu-c5863600a6f7010c)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests examples/paragraph_demo.rs (target/debug/examples/paragraph_demo-7ea781d06a19d7f8)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests examples/paragraph_ui.rs (target/debug/examples/paragraph_ui-bae77e9ada944734)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests examples/parse_responsiveness.rs (target/debug/examples/parse_responsiveness-61b79eeeea55dc68)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/mechanic_config-16c1197e688966d6)
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/mechanic_core-de5d3a1d987d584c)
+test result: ok. 159 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1.89s
+     Running unittests src/lib.rs (target/debug/deps/mechanic_renderer-e4da8130facb1d6d)
+test result: ok. 35 passed; 0 failed; 21 ignored; 0 measured; 0 filtered out; finished in 6.23s
+     Running unittests examples/surface_recovery.rs (target/debug/examples/surface_recovery-36ccaac3a8bc54ca)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -1,0 +1,17 @@
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running unittests src/lib.rs (target/release/deps/mechanic_core-ea348006cde96f49)
+
+running 1 test
+test terminal::tests::synchronized_parser_benchmark ... parser,ascii,mode=plain,bytes=7987200,elapsed_ns=35069750,MiB_per_second=217.20
+parser,ascii,mode=timeout,bytes=7987200,elapsed_ns=33055750,MiB_per_second=230.43
+parser,ascii,mode=end,bytes=7987200,elapsed_ns=34388083,MiB_per_second=221.51
+parser,title,mode=plain,bytes=7372800,elapsed_ns=42689625,MiB_per_second=164.71
+parser,title,mode=timeout,bytes=7372800,elapsed_ns=42937292,MiB_per_second=163.76
+parser,title,mode=end,bytes=7372800,elapsed_ns=45118709,MiB_per_second=155.84
+parser,queries,mode=plain,bytes=5068800,elapsed_ns=72527625,MiB_per_second=66.65
+parser,queries,mode=timeout,bytes=5068800,elapsed_ns=72674917,MiB_per_second=66.52
+parser,queries,mode=end,bytes=5068800,elapsed_ns=70999875,MiB_per_second=68.08
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 161 filtered out; finished in 0.51s
+

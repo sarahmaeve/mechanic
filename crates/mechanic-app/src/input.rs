@@ -2,6 +2,14 @@
 
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+
+use alacritty_terminal::vte::ansi::KeyboardModes;
+
+#[path = "input_kitty.rs"]
+mod kitty;
+
+pub(crate) use kitty::KeyInput;
 
 /// Translate key presses to PTY bytes; releases and unsupported keys return `None`.
 /// `cursor_app_mode` selects SS3 sequences for arrows and Home/End.
@@ -17,6 +25,62 @@ pub fn translate_key(
         modifiers,
         cursor_app_mode,
     )
+}
+
+/// Translate using the enhancements negotiated by the foreground terminal program.
+///
+/// With no enhancements this retains Mechanic's legacy input exactly. The caller
+/// must suppress releases for presses consumed by application shortcuts, and must
+/// supply the modifier state including the effect of a modifier key's event.
+pub fn translate_key_with_modes(
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+    cursor_app_mode: bool,
+    keyboard_modes: KeyboardModes,
+) -> Option<Vec<u8>> {
+    if !kitty::encodes_keys(keyboard_modes) {
+        return translate_key(event, modifiers, cursor_app_mode);
+    }
+    let unmodified_key = event.key_without_modifiers();
+    translate_input_with_modes(
+        KeyInput {
+            state: event.state,
+            logical_key: &event.logical_key,
+            unmodified_key: &unmodified_key,
+            physical_key: event.physical_key,
+            location: event.location,
+            text: event
+                .text_with_all_modifiers()
+                .or_else(|| (!modifiers.control_key()).then_some(event.text.as_deref()).flatten()),
+            repeat: event.repeat,
+        },
+        modifiers,
+        cursor_app_mode,
+        keyboard_modes,
+    )
+}
+
+pub(crate) fn translate_input_with_modes(
+    input: KeyInput<'_>,
+    modifiers: ModifiersState,
+    cursor_app_mode: bool,
+    keyboard_modes: KeyboardModes,
+) -> Option<Vec<u8>> {
+    if !kitty::encodes_keys(keyboard_modes) {
+        return translate_input(
+            input.state,
+            input.logical_key,
+            input.text,
+            modifiers,
+            cursor_app_mode,
+        );
+    }
+    kitty::translate(input, modifiers, keyboard_modes)
+}
+
+/// Encode an IME commit, which has text but no associated physical key.
+pub fn translate_text_with_modes(text: &str, keyboard_modes: KeyboardModes) -> Option<Vec<u8>> {
+    kitty::translate_text(text, keyboard_modes)
 }
 
 fn translate_input(

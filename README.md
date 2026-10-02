@@ -46,9 +46,30 @@ restore = true
 
 [control]
 enabled = true
+
+[clipboard]
+read = "ask" # ask, allow, deny
+write = "allow"
 ```
 
 Restart Mechanic after changing configuration.
+
+TUIs can negotiate Kitty keyboard reporting, including distinct modified keys,
+press/repeat/release events, alternate keys and associated text. Legacy input
+remains the default. IME commits and macOS Option-composed text are preserved;
+reported modifiers are Shift, Control, Option and Command.
+
+OSC 52 supports terminal-initiated clipboard access. Writes are allowed by
+default; reads require one-time approval in a native sheet. Each permission can
+be set independently to `ask`, `allow` or `deny`. Target `c` uses the system
+clipboard; `p`/`s` use the pane's local selection. Denied reads return an empty
+response. Requests are bounded to 16 pending operations and 1 MiB of decoded
+text; encoded payload storage is also bounded. Only one approval sheet is
+pending at a time; additional approval requests are denied.
+
+Synchronized updates (DEC 2026) expire after 150 ms without a renewed start
+marker, including in hidden panes. Final output is flushed when the shell exits.
+The event loop schedules outstanding deadlines without idle polling.
 
 Cmd+Shift+P opens the command palette. Type to filter, use Up/Down to select,
 Return to run, and Escape to close. It includes pane actions, titles/colors,

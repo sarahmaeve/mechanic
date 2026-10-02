@@ -1,0 +1,18 @@
+   Compiling serde_core v1.0.229
+   Compiling bitflags v2.13.2
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling rustix v1.1.5
+   Compiling vte v0.15.0 (/tmp/mechanic-vendor-check.yAK2tj/vte)
+   Compiling rustix-openpty v0.2.0
+   Compiling polling v3.11.0
+   Compiling alacritty_terminal v0.26.0 (/tmp/mechanic-vendor-check.yAK2tj/alacritty_terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.08s
+     Running unittests src/lib.rs (target/debug/deps/alacritty_terminal-32ede9ec145d3df0)
+
+running 2 tests
+test term::tests::keyboard_set_updates_current_stack_entry_and_roundtrips_all_flags ... ok
+test term::tests::keyboard_stack_is_bounded_and_does_not_modify_title_stack ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.00s
+

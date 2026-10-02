@@ -25,8 +25,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
+#[path = "app_clipboard.rs"]
+mod app_clipboard;
 #[path = "app_control.rs"]
 mod app_control;
+#[path = "app_keys.rs"]
+mod app_keys;
 #[path = "app_palette.rs"]
 mod app_palette;
 #[path = "app_pane_drag.rs"]
@@ -49,6 +53,7 @@ pub enum UserEvent {
     Control(crate::control::ControlEvent),
     Palette(WindowId, crate::palette_platform::PaletteAction),
     RendererLost(WindowId),
+    ClipboardDecision(u64, bool),
 }
 
 /// Independent terminal state retained when focus or pointer routing changes.
@@ -152,6 +157,7 @@ struct AppState {
     pointer_cursor: Option<CursorIcon>,
     hovered_preview: Option<String>,
     modifiers: ModifiersState,
+    keys: app_keys::KeyTracking,
     cancelled_ime_commit: bool,
     clipboard: Option<arboard::Clipboard>,
     /// Instant when this window was created (used to compute the `time` uniform).
@@ -193,6 +199,7 @@ impl AppState {
         if self.tree.active() == id {
             return;
         }
+        self.keys.clear_forwarded();
         self.load_pane(self.tree.active());
         self.cancel_preedit();
         self.pane.link_press.cancel();
@@ -460,6 +467,7 @@ pub struct App {
     next_session: u64,
     session_service: app_session::SessionService,
     control_service: app_control::ControlService,
+    clipboard_controller: app_clipboard::ClipboardController,
     pane_drag: Option<app_pane_drag::PaneDrag>,
     pane_header_buttons: Vec<MouseButton>,
     #[cfg(test)]
@@ -493,6 +501,7 @@ impl App {
             next_session: 1,
             session_service: app_session::SessionService::default(),
             control_service: app_control::ControlService::default(),
+            clipboard_controller: Default::default(),
             pane_drag: None,
             pane_header_buttons: Vec::new(),
             #[cfg(test)]
@@ -600,6 +609,17 @@ impl App {
             }
         }
 
+        self.drain_clipboard_requests(
+            id,
+            pane_id,
+            session,
+            outcome.child_exit.is_some() || outcome.io_error.is_some(),
+        );
+        let Some(state) = self.windows.get_mut(&id) else { return };
+        if !state.load_pane(pane_id) || state.pane.session != session {
+            return;
+        }
+
         // Fatal transport failures freeze the window even if a child exit was
         // delivered with the same final output batch.
         if let Some(error) = outcome.io_error {
@@ -646,6 +666,26 @@ impl App {
         state.load_pane(state.tree.active());
         if directory_changed {
             self.note_session_change();
+        }
+    }
+
+    /// Schedule only outstanding synchronized updates, including hidden panes.
+    fn schedule_sync_deadlines(&mut self, now: Instant, deadline: &mut Option<Instant>) {
+        for (window, state) in &self.windows {
+            for (pane_id, pane) in std::iter::once((state.loaded_pane, &state.pane))
+                .chain(state.other_panes.iter().map(|(id, pane)| (*id, pane)))
+            {
+                if pane.exit_status.is_some() {
+                    continue;
+                }
+                if let Some(due) = pane.terminal.sync_deadline() {
+                    if due <= now {
+                        self.pending_parsers.enqueue((*window, pane_id, pane.session));
+                    } else {
+                        merge_deadline(deadline, due);
+                    }
+                }
+            }
         }
     }
 
@@ -870,6 +910,7 @@ impl App {
             pointer_cursor: None,
             hovered_preview: None,
             modifiers: ModifiersState::empty(),
+            keys: Default::default(),
             cancelled_ime_commit: false,
             clipboard,
             start_time: now,
@@ -1099,6 +1140,7 @@ impl App {
             }
 
             WindowEvent::ModifiersChanged(mods) => {
+                state.keys.reconcile(mods.state());
                 if state.modifiers != mods.state() {
                     state.pane.scroll_accumulator.reset();
                     state.pane.last_mouse_report = None;
@@ -1112,6 +1154,7 @@ impl App {
                 state.focused = focused;
                 let active = state.tree.active();
                 if !focused {
+                    state.keys.clear();
                     state.load_pane(active);
                     state.cancel_preedit();
                 }
@@ -1297,17 +1340,38 @@ impl App {
                     }
                 }
 
-                if let Some(bytes) = crate::input::translate_key(
+                if key_event.repeat
+                    && !state.keys.repeat_allowed(
+                        key_event.physical_key,
+                        (state.loaded_pane, state.pane.session),
+                    )
+                {
+                    return;
+                }
+                if let Some(bytes) = crate::input::translate_key_with_modes(
                     &key_event,
                     state.modifiers,
                     state.pane.terminal.cursor_app_mode(),
+                    state.pane.terminal.keyboard_modes(),
                 ) {
                     // Escape must still reach programs such as vim when a selection exists.
-                    if state.pane.terminal.selection_range().is_some() {
+                    if key_event.state == ElementState::Pressed
+                        && state.pane.terminal.selection_range().is_some()
+                    {
                         state.pane.terminal.clear_selection();
                     }
-                    if let Err(e) = state.pane.terminal.write_to_pty(&bytes) {
+                    let write = if key_event.state == ElementState::Released {
+                        state.pane.terminal.write_protocol_reply(&bytes)
+                    } else {
+                        state.pane.terminal.write_to_pty(&bytes)
+                    };
+                    if let Err(e) = write {
                         log::warn!("PTY write failed: {e}");
+                    } else if key_event.state == ElementState::Pressed {
+                        state.keys.forwarded(
+                            key_event.physical_key,
+                            (state.loaded_pane, state.pane.session),
+                        );
                     }
                 }
                 state.mark_content_dirty();
@@ -1324,7 +1388,11 @@ impl App {
                             state.request_redraw();
                             return;
                         }
-                        if let Err(e) = state.pane.terminal.write_to_pty(text.as_bytes()) {
+                        if let Some(bytes) = crate::input::translate_text_with_modes(
+                            &text,
+                            state.pane.terminal.keyboard_modes(),
+                        ) && let Err(e) = state.pane.terminal.write_to_pty(&bytes)
+                        {
                             log::warn!("PTY IME commit failed: {e}");
                         }
                     }
@@ -1776,6 +1844,19 @@ impl App {
         id: WindowId,
         mut event: WindowEvent,
     ) {
+        if let WindowEvent::KeyboardInput { event: key, is_synthetic, .. } = &event {
+            let Some(state) = self.windows.get_mut(&id) else { return };
+            if *is_synthetic {
+                return;
+            }
+            state.modifiers =
+                state.keys.update_modifiers(key.physical_key, key.state, state.modifiers);
+            let active = state.tree.active();
+            let Some(session) = state.pane_state(active).map(|pane| pane.session) else { return };
+            if !state.keys.begin(key.physical_key, key.state, key.repeat, (active, session)) {
+                return;
+            }
+        }
         if self.route_pane_drag(event_loop, id, &event) {
             return;
         }
@@ -2017,10 +2098,12 @@ impl ApplicationHandler<UserEvent> for App {
         // Requeue continuations rather than self-posting user events: macOS
         // drains those events before it can dispatch native input events.
         self.pump_parser(event_loop);
+        self.service_clipboard_requests();
         let now = Instant::now();
         let mut earliest_deadline: Option<Instant> = None;
         self.service_session_deadline(now, &mut earliest_deadline);
         self.control_service.expire(now, &mut earliest_deadline);
+        self.schedule_sync_deadlines(now, &mut earliest_deadline);
 
         for state in self.windows.values_mut() {
             if state.renderer.needs_device_recovery() {
@@ -2086,6 +2169,9 @@ impl ApplicationHandler<UserEvent> for App {
                     state.content_dirty = true;
                     state.request_redraw();
                 }
+            }
+            UserEvent::ClipboardDecision(request, allow) => {
+                self.dispatch_clipboard_decision(request, allow)
             }
             UserEvent::Search(id, pane_id, session, action) => {
                 let Some(state) = self.windows.get_mut(&id) else {
@@ -2908,6 +2994,11 @@ mod pane_smoke;
 #[path = "app_workspace_smoke.rs"]
 #[allow(dead_code, reason = "used by the explicit native workspace smoke example")]
 mod workspace_smoke;
+
+#[cfg(test)]
+#[path = "app_protocol_smoke.rs"]
+#[allow(dead_code, reason = "used by the explicit native protocol smoke example")]
+pub(crate) mod protocol_smoke;
 
 #[cfg(test)]
 #[path = "app_pane_drag_smoke.rs"]

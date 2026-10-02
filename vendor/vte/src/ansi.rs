@@ -299,10 +299,26 @@ impl<T: Timeout> Processor<T> {
     where
         H: Handler,
     {
+        self.advance_with_sync_callback(handler, bytes, |_| {});
+    }
+
+    /// Process input and allow protocol events to be resolved while replaying a
+    /// synchronized update, before later OSC commands can change their state.
+    /// Ordinary input retains the same parser path as [`Self::advance`].
+    #[inline]
+    pub fn advance_with_sync_callback<H, F>(
+        &mut self,
+        handler: &mut H,
+        bytes: &[u8],
+        mut checkpoint: F,
+    ) where
+        H: Handler,
+        F: FnMut(&mut H),
+    {
         let mut processed = 0;
         while processed != bytes.len() {
             if self.state.sync_state.timeout.pending_timeout() {
-                processed += self.advance_sync(handler, &bytes[processed..]);
+                processed += self.advance_sync(handler, &bytes[processed..], &mut checkpoint);
             } else {
                 let mut performer = Performer::new(&mut self.state, handler);
                 processed +=
@@ -316,7 +332,16 @@ impl<T: Timeout> Processor<T> {
     where
         H: Handler,
     {
-        self.stop_sync_internal(handler, None);
+        self.stop_sync_with_callback(handler, |_| {});
+    }
+
+    /// End an update, resolving protocol events at OSC boundaries during replay.
+    pub fn stop_sync_with_callback<H, F>(&mut self, handler: &mut H, mut checkpoint: F)
+    where
+        H: Handler,
+        F: FnMut(&mut H),
+    {
+        self.stop_sync_internal(handler, None, &mut checkpoint);
     }
 
     /// End a synchronized update.
@@ -324,9 +349,14 @@ impl<T: Timeout> Processor<T> {
     /// The `bsu_offset` parameter should be passed if the sync buffer contains
     /// a new BSU escape that is not part of the current synchronized
     /// update.
-    fn stop_sync_internal<H>(&mut self, handler: &mut H, bsu_offset: Option<usize>)
-    where
+    fn stop_sync_internal<H, F>(
+        &mut self,
+        handler: &mut H,
+        bsu_offset: Option<usize>,
+        checkpoint: &mut F,
+    ) where
         H: Handler,
+        F: FnMut(&mut H),
     {
         // Process all synchronized bytes.
         //
@@ -334,8 +364,32 @@ impl<T: Timeout> Processor<T> {
         // processed automatically during the synchronized update.
         let buffer = mem::take(&mut self.state.sync_state.buffer);
         let offset = bsu_offset.unwrap_or(buffer.len());
-        let mut performer = Performer::new(&mut self.state, handler);
-        self.parser.advance(&mut performer, &buffer[..offset]);
+        let replay = &buffer[..offset];
+        // Queries contain '?'. Plain output, including dense OSC title updates,
+        // requires neither delimiter scanning nor intermediate event draining.
+        if memchr::memchr(b'?', replay).is_some() {
+            let mut start = 0;
+            let mut bells = memchr::memchr_iter(b'\x07', replay).peekable();
+            let mut sts = memchr::memmem::find_iter(replay, b"\x1b\\").peekable();
+            loop {
+                let end = match (bells.peek(), sts.peek()) {
+                    (Some(&bell), Some(&st)) if bell < st => bells.next().unwrap() + 1,
+                    (_, Some(_)) => sts.next().unwrap() + 2,
+                    (Some(_), None) => bells.next().unwrap() + 1,
+                    (None, None) => break,
+                };
+                let mut performer = Performer::new(&mut self.state, handler);
+                self.parser.advance(&mut performer, &replay[start..end]);
+                checkpoint(handler);
+                start = end;
+            }
+            let mut performer = Performer::new(&mut self.state, handler);
+            self.parser.advance(&mut performer, &replay[start..]);
+        } else {
+            let mut performer = Performer::new(&mut self.state, handler);
+            self.parser.advance(&mut performer, replay);
+        }
+        checkpoint(handler);
         self.state.sync_state.buffer = buffer;
 
         match bsu_offset {
@@ -347,13 +401,13 @@ impl<T: Timeout> Processor<T> {
                 let new_len = self.state.sync_state.buffer.len() - bsu_offset;
                 self.state.sync_state.buffer.copy_within(bsu_offset.., 0);
                 self.state.sync_state.buffer.truncate(new_len);
-            },
+            }
             // Report mode and clear state if no new BSU is present.
             None => {
                 handler.unset_private_mode(NamedPrivateMode::SyncUpdate.into());
                 self.state.sync_state.timeout.clear_timeout();
                 self.state.sync_state.buffer.clear();
-            },
+            }
         }
     }
 
@@ -367,29 +421,31 @@ impl<T: Timeout> Processor<T> {
     ///
     /// Returns the number of bytes processed.
     #[cold]
-    fn advance_sync<H>(&mut self, handler: &mut H, bytes: &[u8]) -> usize
+    fn advance_sync<H, F>(&mut self, handler: &mut H, bytes: &[u8], checkpoint: &mut F) -> usize
     where
         H: Handler,
+        F: FnMut(&mut H),
     {
         // Advance sync parser or stop sync if we'd exceed the maximum buffer size.
         if self.state.sync_state.buffer.len() + bytes.len() >= SYNC_BUFFER_SIZE - 1 {
             // Terminate the synchronized update.
-            self.stop_sync_internal(handler, None);
+            self.stop_sync_internal(handler, None, checkpoint);
 
             // Just parse the bytes normally.
             let mut performer = Performer::new(&mut self.state, handler);
             self.parser.advance_until_terminated(&mut performer, bytes)
         } else {
             self.state.sync_state.buffer.extend(bytes);
-            self.advance_sync_csi(handler, bytes.len());
+            self.advance_sync_csi(handler, bytes.len(), checkpoint);
             bytes.len()
         }
     }
 
     /// Handle BSU/ESU CSI sequences during synchronized update.
-    fn advance_sync_csi<H>(&mut self, handler: &mut H, new_bytes: usize)
+    fn advance_sync_csi<H, F>(&mut self, handler: &mut H, new_bytes: usize, checkpoint: &mut F)
     where
         H: Handler,
+        F: FnMut(&mut H),
     {
         // Get constraints within which a new escape character might be relevant.
         let buffer_len = self.state.sync_state.buffer.len();
@@ -411,7 +467,7 @@ impl<T: Timeout> Processor<T> {
                 self.state.sync_state.timeout.set_timeout(SYNC_UPDATE_TIMEOUT);
                 bsu_offset = Some(offset);
             } else if escape == ESU_CSI {
-                self.stop_sync_internal(handler, bsu_offset);
+                self.stop_sync_internal(handler, bsu_offset, checkpoint);
                 break;
             }
         }
@@ -1485,8 +1541,11 @@ where
 
             // Set clipboard.
             b"52" => {
-                if params.len() < 3 {
-                    return unhandled(params);
+                // OSC 52 has exactly command, selection, and base64 fields.
+                // Never decode a truncated prefix of a malformed payload.
+                if params.len() != 3 {
+                    // Clipboard payloads must also stay out of parser logs.
+                    return;
                 }
 
                 let clipboard = params[1].first().unwrap_or(&b'c');

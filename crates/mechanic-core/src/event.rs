@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener as AlacrittyEventListener};
 
+use crate::clipboard::{ClipboardRequest, MAX_CLIPBOARD_BYTES, MAX_CLIPBOARD_REQUESTS};
+
 /// A terminal event that the application layer may need to act on.
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
@@ -20,6 +22,10 @@ pub enum TerminalEvent {
     Exit(Option<std::process::ExitStatus>),
     /// Protocol response bytes to write back to the PTY.
     PtyWrite(Vec<u8>),
+    /// Terminal-initiated clipboard access, subject to application permissions.
+    Clipboard(ClipboardRequest),
+    /// Bounded empty protocol responses for clipboard reads rejected at ingress.
+    ClipboardDeniedReply(Vec<u8>),
     /// Color or viewport query, carrying the parser's protocol formatter.
     Query(AlacrittyEvent),
     /// Parsed shell protocol marker with its main-grid coordinates.
@@ -57,8 +63,37 @@ impl EventProxy {
 
     fn push(&self, event: TerminalEvent) {
         let mut guard = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        if let TerminalEvent::Clipboard(request) = &event {
+            let (count, bytes) = guard.iter().fold((0, 0usize), |(count, bytes), event| {
+                if let TerminalEvent::Clipboard(request) = event {
+                    (count + 1, bytes.saturating_add(request.payload_bytes()))
+                } else {
+                    (count, bytes)
+                }
+            });
+            if count >= MAX_CLIPBOARD_REQUESTS
+                || request.payload_bytes() > MAX_CLIPBOARD_BYTES.saturating_sub(bytes)
+            {
+                // Drop excess stores. Loads retain a bounded empty response;
+                // parser query boundaries normally drain before this cap.
+                if let ClipboardRequest::Load { formatter, .. } = request {
+                    let reply = formatter("").into_bytes();
+                    if let Some(TerminalEvent::ClipboardDeniedReply(previous)) = guard
+                        .iter_mut()
+                        .find(|event| matches!(event, TerminalEvent::ClipboardDeniedReply(_)))
+                    {
+                        if previous.len().saturating_add(reply.len()) <= MAX_CLIPBOARD_BYTES {
+                            previous.extend_from_slice(&reply);
+                        }
+                    } else if reply.len() <= MAX_CLIPBOARD_BYTES {
+                        guard.push(TerminalEvent::ClipboardDeniedReply(reply));
+                    }
+                }
+                return;
+            }
+        }
         guard.push(event);
-        if matches!(guard.last(), Some(TerminalEvent::Query(_))) {
+        if matches!(guard.last(), Some(TerminalEvent::Query(_) | TerminalEvent::Clipboard(_))) {
             self.query_pending.store(true, Ordering::Release);
         }
     }
@@ -85,6 +120,12 @@ impl AlacrittyEventListener for EventProxy {
             AlacrittyEvent::Exit => self.push(TerminalEvent::Exit(None)),
             AlacrittyEvent::ChildExit(status) => self.push(TerminalEvent::Exit(Some(status))),
             AlacrittyEvent::PtyWrite(text) => self.push(TerminalEvent::PtyWrite(text.into_bytes())),
+            AlacrittyEvent::ClipboardStore(target, text) => {
+                self.push(TerminalEvent::Clipboard(ClipboardRequest::Store { target, text }));
+            }
+            AlacrittyEvent::ClipboardLoad(target, formatter) => {
+                self.push(TerminalEvent::Clipboard(ClipboardRequest::Load { target, formatter }));
+            }
             event
             @ (AlacrittyEvent::ColorRequest(..) | AlacrittyEvent::TextAreaSizeRequest(..)) => {
                 self.push(TerminalEvent::Query(event))
@@ -139,6 +180,57 @@ mod tests {
         let events = proxy.drain();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], TerminalEvent::PtyWrite(b) if b == b"hi"));
+    }
+
+    #[test]
+    fn clipboard_events_preserve_order_and_formatter_without_logging_payloads() {
+        use crate::clipboard::ClipboardType;
+
+        let proxy = EventProxy::new();
+        proxy
+            .send_event(AlacrittyEvent::ClipboardStore(ClipboardType::Selection, "private".into()));
+        proxy.send_event(AlacrittyEvent::ClipboardLoad(
+            ClipboardType::Clipboard,
+            Arc::new(|text| format!("\x1b]52;c;{text}\x07")),
+        ));
+        assert!(proxy.has_pending_query());
+        let events = proxy.drain();
+        assert_eq!(events.len(), 2);
+        assert!(!format!("{events:?}").contains("private"));
+        assert!(
+            matches!(&events[0], TerminalEvent::Clipboard(ClipboardRequest::Store { target: ClipboardType::Selection, text }) if text == "private")
+        );
+        let TerminalEvent::Clipboard(ClipboardRequest::Load { formatter, .. }) = &events[1] else {
+            panic!("expected clipboard load");
+        };
+        assert_eq!(formatter("response"), "\x1b]52;c;response\x07");
+    }
+
+    #[test]
+    fn clipboard_event_count_payload_and_overflow_replies_are_bounded() {
+        use crate::clipboard::ClipboardType;
+
+        let proxy = EventProxy::new();
+        proxy.send_event(AlacrittyEvent::ClipboardStore(
+            ClipboardType::Clipboard,
+            "x".repeat(MAX_CLIPBOARD_BYTES + 1),
+        ));
+        assert!(proxy.drain().is_empty());
+        for _ in 0..MAX_CLIPBOARD_REQUESTS + 100 {
+            proxy.send_event(AlacrittyEvent::ClipboardLoad(
+                ClipboardType::Clipboard,
+                Arc::new(|_| "empty".into()),
+            ));
+        }
+        let events = proxy.drain();
+        assert_eq!(
+            events.iter().filter(|event| matches!(event, TerminalEvent::Clipboard(_))).count(),
+            MAX_CLIPBOARD_REQUESTS
+        );
+        assert_eq!(events.len(), MAX_CLIPBOARD_REQUESTS + 1);
+        assert!(
+            matches!(events.last(), Some(TerminalEvent::ClipboardDeniedReply(bytes)) if bytes == &b"empty".repeat(100))
+        );
     }
 
     #[test]

@@ -1,0 +1,13 @@
+case,unit,min,median,max,samples
+ascii/plain,MiB/s,140.33,217.2,238.6,5
+ascii/timeout,MiB/s,227.03,234.31,240.08,5
+ascii/end,MiB/s,221.51,239.38,247.22,5
+title/plain,MiB/s,157.95,178.22,189.75,5
+title/timeout,MiB/s,160.77,168.36,181.91,5
+title/end,MiB/s,155.84,166.01,175.5,5
+queries/plain,MiB/s,66.65,73.05,75.64,5
+queries/timeout,MiB/s,66.06,69.82,71.8,5
+queries/end,MiB/s,63.89,71.1,71.45,5
+keyboard/legacy,ns/event,10.6,12.5,28.3,5
+keyboard/kitty_disambiguated,ns/event,23.2,26.4,49,5
+keyboard/kitty_all,ns/event,29.3,31,43.5,5

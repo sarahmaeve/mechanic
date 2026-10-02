@@ -1,0 +1,4 @@
+    Checking mechanic-core v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-core)
+    Checking mechanic-app v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-app)
+    Checking mechanic-bench v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-bench)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.08s

@@ -12,11 +12,12 @@ use alacritty_terminal::index::{Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::cell::Cell;
-use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
+use alacritty_terminal::vte::ansi::{CursorShape, KeyboardModes, Processor, Rgb};
 use mechanic_config::{Config, Theme};
 
 use crate::PtyWaker;
 use crate::TerminalSize;
+use crate::clipboard::{ClipboardRequest, ClipboardRequests};
 use crate::error::TerminalError;
 use crate::event::{EventProxy, TerminalEvent};
 use crate::pty::PtyHandle;
@@ -93,6 +94,7 @@ pub struct Terminal {
     pending_error: Option<String>,
     output_finished: bool,
     shell_integration: ShellIntegration,
+    clipboard_requests: ClipboardRequests,
 }
 
 impl Terminal {
@@ -121,6 +123,10 @@ impl Terminal {
 
         let term_config = TermConfig {
             scrolling_history: config.terminal.scrollback_lines,
+            kitty_keyboard: true,
+            // Application policy handles permission and target support. The
+            // parser must still surface reads so denials receive a response.
+            osc52: alacritty_terminal::term::Osc52::CopyPaste,
             ..TermConfig::default()
         };
 
@@ -145,12 +151,37 @@ impl Terminal {
             pending_error: None,
             output_finished: false,
             shell_integration: ShellIntegration::default(),
+            clipboard_requests: ClipboardRequests::default(),
         })
     }
 
     /// Drain output, update the grid/title, and send terminal protocol replies.
     pub fn process_input(&mut self) -> ProcessOutcome {
         self.process_input_with_budget(Instant::now(), PARSE_TIME_BUDGET, PARSE_BYTE_BUDGET)
+    }
+
+    /// Expiration of the current synchronized update, if one is active.
+    /// The application schedules this deadline even when the pane is hidden.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// Replay an expired synchronized update without requiring another PTY wake.
+    /// Returns whether buffered terminal output was released.
+    pub fn expire_synchronized_update(&mut self, now: Instant) -> bool {
+        if self.sync_deadline().is_none_or(|deadline| deadline > now) {
+            return false;
+        }
+        self.stop_synchronized_update();
+        true
+    }
+
+    fn stop_synchronized_update(&mut self) {
+        self.with_parser(false, |parser, term, checkpoint| {
+            parser.stop_sync_with_callback(term, checkpoint);
+        });
+        self.drain_parser_events();
+        self.flush_replies();
     }
 
     // Check budgets between whole queue chunks so VTE state carries incomplete
@@ -163,6 +194,9 @@ impl Terminal {
     ) -> ProcessOutcome {
         self.pty.begin_input_turn();
         let mut outcome = ProcessOutcome::default();
+        if self.sync_deadline().is_some() {
+            outcome.grid_maybe_changed = self.expire_synchronized_update(Instant::now());
+        }
         // Observe completion BEFORE checking for an empty output queue. An
         // empty observation made earlier cannot prove final output was parsed.
         let output_done = self.pty.output_done();
@@ -215,6 +249,15 @@ impl Terminal {
             // Only an observed PTY exit or worker completion guarantees that
             // another producer cannot race this empty queue observation.
             if self.output_finished {
+                // An unterminated synchronized update must be visible before
+                // the application observes final output, exit, or transport failure.
+                if self.sync_deadline().is_some() {
+                    self.stop_synchronized_update();
+                    outcome.grid_maybe_changed = true;
+                }
+                if let Some(error) = self.pty.take_failure() {
+                    self.pending_error = Some(error);
+                }
                 outcome.child_exit = self.pending_exit.take();
                 self.exit_delivered |= outcome.child_exit.is_some();
                 outcome.io_error = self.pending_error.take();
@@ -229,7 +272,7 @@ impl Terminal {
         // prior input, chunks without '?' need no intermediate palette read.
         // This keeps dense title updates on the normal single-advance path.
         if !self.question_mark_since_terminator && memchr::memchr(b'?', chunk).is_none() {
-            self.parser.advance(&mut self.term, chunk);
+            self.advance_parser(chunk);
             self.drain_parser_events();
             if let Some(byte) = chunk.last() {
                 self.previous_byte_is_escape = *byte == b'\x1b';
@@ -243,7 +286,7 @@ impl Terminal {
         // in paths and JSON stay in the same parser slice as ordinary text.
         let mut start = 0;
         if self.previous_byte_is_escape && chunk.first() == Some(&b'\\') {
-            self.parser.advance(&mut self.term, &chunk[..1]);
+            self.advance_parser(&chunk[..1]);
             if self.event_proxy.has_pending_query() {
                 self.drain_parser_events();
             }
@@ -258,14 +301,14 @@ impl Terminal {
                 (Some(_), None) => bells.next().unwrap() + 1,
                 (None, None) => break,
             };
-            self.parser.advance(&mut self.term, &chunk[start..end]);
+            self.advance_parser(&chunk[start..end]);
             if self.event_proxy.has_pending_query() {
                 self.drain_parser_events();
             }
             start = end;
         }
         if start < chunk.len() {
-            self.parser.advance(&mut self.term, &chunk[start..]);
+            self.advance_parser(&chunk[start..]);
         }
         self.question_mark_since_terminator = (start == 0 && self.question_mark_since_terminator)
             || memchr::memchr(b'?', &chunk[start..]).is_some();
@@ -277,67 +320,45 @@ impl Terminal {
     }
 
     fn drain_parser_events(&mut self) {
-        for event in self.event_proxy.drain() {
-            match event {
-                TerminalEvent::ShellIntegration(AlacrittyEvent::ShellIntegration(
-                    params,
-                    point,
-                    scroll,
-                    generation,
-                )) => {
-                    self.shell_integration.marker(&params, point, scroll, generation);
-                }
-                TerminalEvent::ShellIntegration(AlacrittyEvent::ShellErase(
-                    point,
-                    mode,
-                    scroll,
-                    generation,
-                )) => {
-                    self.shell_integration.erase(point, mode, scroll, generation);
-                }
-                TerminalEvent::ShellIntegration(AlacrittyEvent::ShellCellsChanged(
-                    start,
-                    end,
-                    scroll,
-                    generation,
-                )) => {
-                    self.shell_integration.cells_changed(start, end, scroll, generation);
-                }
-                TerminalEvent::TitleChanged(t) => self.title = t,
-                TerminalEvent::TitleReset => self.title.clear(),
-                TerminalEvent::Exit(status) if !self.exit_delivered => {
-                    self.pending_exit.get_or_insert(status);
-                }
-                TerminalEvent::PtyWrite(bytes) => {
-                    self.write_reply(&bytes);
-                }
-                TerminalEvent::Query(AlacrittyEvent::ColorRequest(index, formatter)) => {
-                    if let Some(color) = self.query_color(index) {
-                        self.write_reply(formatter(color).as_bytes());
-                    }
-                }
-                TerminalEvent::Query(AlacrittyEvent::TextAreaSizeRequest(formatter)) => {
-                    // The library formatter multiplies u16 dimensions. Clamp
-                    // cell sizes so unusually large viewports cannot overflow.
-                    let mut size = self.size.to_window_size();
-                    size.cell_width = size.cell_width.min(u16::MAX / size.num_cols.max(1));
-                    size.cell_height = size.cell_height.min(u16::MAX / size.num_lines.max(1));
-                    self.write_reply(formatter(size).as_bytes());
-                }
-                _ => {}
-            }
-        }
-        let (scroll, generation) = self.term.shell_coordinates();
-        let oldest = scroll.min(i64::MAX as u64) as i64 + self.term.grid().topmost_line().0 as i64;
-        // The alternate grid has no history; its bounds cannot evict main-grid markers.
-        if !self.term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
-            self.shell_integration.synchronize(generation, oldest);
-        }
+        self.with_parser(true, |_, term, checkpoint| checkpoint(term));
     }
 
-    // Protocol replies must not move a scrolled viewport.
-    fn write_reply(&mut self, bytes: &[u8]) {
-        self.reply_buffer.extend_from_slice(bytes);
+    fn advance_parser(&mut self, bytes: &[u8]) {
+        self.with_parser(false, |parser, term, checkpoint| {
+            parser.advance_with_sync_callback(term, bytes, checkpoint);
+        });
+    }
+
+    // Keep parser/grid borrows separate from the event state so callbacks can
+    // resolve palette queries at OSC boundaries during synchronized replay.
+    fn with_parser(
+        &mut self,
+        drain_all_events: bool,
+        operation: impl FnOnce(
+            &mut Processor,
+            &mut Term<EventProxy>,
+            &mut dyn FnMut(&mut Term<EventProxy>),
+        ),
+    ) {
+        let mut events = ParserEvents {
+            proxy: &self.event_proxy,
+            shell: &mut self.shell_integration,
+            title: &mut self.title,
+            pending_exit: &mut self.pending_exit,
+            exit_delivered: self.exit_delivered,
+            replies: &mut self.reply_buffer,
+            size: self.size,
+            theme: &self.theme,
+            clipboard: &mut self.clipboard_requests,
+        };
+        operation(&mut self.parser, &mut self.term, &mut |term| {
+            // ESU itself contains '?', so replay may visit many OSC boundaries
+            // without producing a query. Keep title/shell event draining on
+            // the final chunk path unless a protocol query needs resolution.
+            if drain_all_events || events.proxy.has_pending_query() {
+                events.drain(term);
+            }
+        });
     }
 
     fn flush_replies(&mut self) {
@@ -358,16 +379,9 @@ impl Terminal {
         self.theme = theme.clone();
     }
 
-    fn query_color(&self, index: usize) -> Option<Rgb> {
-        if index >= alacritty_terminal::term::color::COUNT {
-            return None;
-        }
-        self.term.colors()[index].or_else(|| theme_color(&self.theme, index))
-    }
-
     /// Feed `data` directly to the VTE parser without writing to the PTY.
     pub fn inject_local(&mut self, data: &[u8]) {
-        self.parser.advance(&mut self.term, data);
+        self.advance_parser(data);
         self.question_mark_since_terminator |= memchr::memchr(b'?', data).is_some();
         if let Some(byte) = data.last() {
             self.previous_byte_is_escape = *byte == b'\x1b';
@@ -379,6 +393,21 @@ impl Terminal {
     pub fn write_to_pty(&mut self, data: &[u8]) -> Result<(), TerminalError> {
         self.term.scroll_display(Scroll::Bottom);
         self.pty.write(data)
+    }
+
+    /// Clipboard operations emitted by OSC 52, in parser source order.
+    pub fn drain_clipboard_requests(&mut self) -> Vec<ClipboardRequest> {
+        self.clipboard_requests.drain()
+    }
+
+    /// Send a clipboard protocol response without moving the scrollback viewport.
+    pub fn write_clipboard_reply(&mut self, bytes: &[u8]) -> Result<(), TerminalError> {
+        self.write_protocol_reply(bytes)
+    }
+
+    /// Send terminal protocol bytes without moving the scrollback viewport.
+    pub fn write_protocol_reply(&mut self, bytes: &[u8]) -> Result<(), TerminalError> {
+        self.pty.write(bytes)
     }
 
     /// Filter clipboard text and wrap it when DECSET 2004 is enabled.
@@ -553,6 +582,11 @@ impl Terminal {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// Kitty keyboard flags negotiated by the foreground application.
+    pub fn keyboard_modes(&self) -> KeyboardModes {
+        (*self.term.mode()).into()
+    }
+
     /// Mouse-reporting protocol currently negotiated with the shell.
     pub fn mouse_protocol(&self) -> MouseProtocol {
         use alacritty_terminal::term::TermMode;
@@ -629,6 +663,85 @@ impl Terminal {
         let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
         selection.update(end, Side::Right);
         self.term.selection = Some(selection);
+    }
+}
+
+/// Event state borrowed independently of the parser and terminal grid.
+struct ParserEvents<'a> {
+    proxy: &'a EventProxy,
+    shell: &'a mut ShellIntegration,
+    title: &'a mut String,
+    pending_exit: &'a mut Option<Option<std::process::ExitStatus>>,
+    exit_delivered: bool,
+    replies: &'a mut Vec<u8>,
+    size: TerminalSize,
+    theme: &'a Theme,
+    clipboard: &'a mut ClipboardRequests,
+}
+
+impl ParserEvents<'_> {
+    fn drain(&mut self, term: &mut Term<EventProxy>) {
+        for event in self.proxy.drain() {
+            match event {
+                TerminalEvent::ShellIntegration(AlacrittyEvent::ShellIntegration(
+                    params,
+                    point,
+                    scroll,
+                    generation,
+                )) => self.shell.marker(&params, point, scroll, generation),
+                TerminalEvent::ShellIntegration(AlacrittyEvent::ShellErase(
+                    point,
+                    mode,
+                    scroll,
+                    generation,
+                )) => self.shell.erase(point, mode, scroll, generation),
+                TerminalEvent::ShellIntegration(AlacrittyEvent::ShellCellsChanged(
+                    start,
+                    end,
+                    scroll,
+                    generation,
+                )) => self.shell.cells_changed(start, end, scroll, generation),
+                TerminalEvent::TitleChanged(title) => *self.title = title,
+                TerminalEvent::TitleReset => self.title.clear(),
+                TerminalEvent::Exit(status) if !self.exit_delivered => {
+                    self.pending_exit.get_or_insert(status);
+                }
+                TerminalEvent::PtyWrite(bytes) | TerminalEvent::ClipboardDeniedReply(bytes) => {
+                    self.replies.extend_from_slice(&bytes);
+                }
+                TerminalEvent::Query(AlacrittyEvent::ColorRequest(index, formatter)) => {
+                    if index < alacritty_terminal::term::color::COUNT
+                        && let Some(color) =
+                            term.colors()[index].or_else(|| theme_color(self.theme, index))
+                    {
+                        self.replies.extend_from_slice(formatter(color).as_bytes());
+                    }
+                }
+                TerminalEvent::Query(AlacrittyEvent::TextAreaSizeRequest(formatter)) => {
+                    // The library formatter multiplies u16 dimensions. Clamp
+                    // cell sizes so unusually large viewports cannot overflow.
+                    let mut size = self.size.to_window_size();
+                    size.cell_width = size.cell_width.min(u16::MAX / size.num_cols.max(1));
+                    size.cell_height = size.cell_height.min(u16::MAX / size.num_lines.max(1));
+                    self.replies.extend_from_slice(formatter(size).as_bytes());
+                }
+                TerminalEvent::Clipboard(request) => {
+                    if let Err(ClipboardRequest::Load { formatter, .. }) =
+                        self.clipboard.push(request)
+                    {
+                        // Bounded overflow denies the read with an empty response.
+                        self.replies.extend_from_slice(formatter("").as_bytes());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (scroll, generation) = term.shell_coordinates();
+        let oldest = scroll.min(i64::MAX as u64) as i64 + term.grid().topmost_line().0 as i64;
+        // The alternate grid has no history; its bounds cannot evict main-grid markers.
+        if !term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
+            self.shell.synchronize(generation, oldest);
+        }
     }
 }
 
@@ -741,7 +854,15 @@ mod tests {
         let size = TerminalSize::default();
         let dimensions = TermDimensions { columns: size.columns, screen_lines: size.rows };
         let event_proxy = EventProxy::new();
-        let term = Term::new(TermConfig::default(), &dimensions, event_proxy.clone());
+        let term = Term::new(
+            TermConfig {
+                kitty_keyboard: true,
+                osc52: alacritty_terminal::term::Osc52::CopyPaste,
+                ..TermConfig::default()
+            },
+            &dimensions,
+            event_proxy.clone(),
+        );
         (
             Terminal {
                 term,
@@ -759,6 +880,7 @@ mod tests {
                 pending_error: None,
                 output_finished: false,
                 shell_integration: ShellIntegration::default(),
+                clipboard_requests: ClipboardRequests::default(),
             },
             peer,
         )
@@ -766,6 +888,404 @@ mod tests {
 
     fn parse_one_chunk(terminal: &mut Terminal) -> ProcessOutcome {
         terminal.process_input_with_budget(Instant::now(), Duration::ZERO, PARSE_BYTE_BUDGET)
+    }
+
+    #[test]
+    fn synchronized_update_normal_end_and_all_chunk_splits() {
+        let payload = b"\x1b[?2026h\x1b]2;released\x07hello\x1b[?2026l";
+        for split in 0..=payload.len() {
+            let (mut terminal, _) = buffered_terminal();
+            terminal.parse_chunk(&payload[..split]);
+            terminal.parse_chunk(&payload[split..]);
+            assert_eq!(terminal.title(), "released", "split {split}");
+            assert!(terminal.sync_deadline().is_none(), "split {split}");
+            assert_eq!(terminal.grid()[GridLine(0)][GridColumn(0)].c, 'h');
+        }
+        let (mut terminal, _) = buffered_terminal();
+        terminal.parse_chunk(b"\x1b[?2026h\x1b]2;released\x07hello");
+        assert!(terminal.title().is_empty());
+        assert_eq!(terminal.grid()[GridLine(0)][GridColumn(0)].c, ' ');
+        assert!(terminal.sync_deadline().is_some());
+        terminal.parse_chunk(b"\x1b[?2026l");
+        assert_eq!(terminal.title(), "released");
+        assert!(terminal.sync_deadline().is_none());
+    }
+
+    #[test]
+    fn synchronized_update_expiry_releases_output_once_without_more_input() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(b"\x1b[?2026h\x1b]2;expired\x07\x1b[6nhello".to_vec());
+        terminal.process_input();
+        let deadline = terminal.sync_deadline().unwrap();
+        assert!(!terminal.expire_synchronized_update(deadline - Duration::from_nanos(1)));
+        assert!(terminal.title().is_empty());
+        assert!(terminal.expire_synchronized_update(deadline));
+        assert_eq!(terminal.title(), "expired");
+        assert_eq!(peer.reply(), b"\x1b[1;1R");
+        assert!(terminal.sync_deadline().is_none());
+        assert!(!terminal.expire_synchronized_update(deadline + Duration::from_secs(1)));
+        assert!(!terminal.process_input().grid_maybe_changed);
+    }
+
+    #[test]
+    fn synchronized_update_process_input_expires_without_a_pty_wake() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(b"\x1b[?2026h\x1b]2;expired\x07".to_vec());
+        terminal.process_input();
+        let deadline = terminal.sync_deadline().unwrap();
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        let expired = terminal.process_input();
+        assert!(expired.grid_maybe_changed);
+        assert!(!expired.more_output);
+        assert_eq!(terminal.title(), "expired");
+        assert!(terminal.sync_deadline().is_none());
+    }
+
+    #[test]
+    fn synchronized_update_extension_and_end_then_restart_reset_deadline() {
+        let (mut terminal, _) = buffered_terminal();
+        terminal.parse_chunk(b"\x1b[?2026h\x1b]2;first\x07");
+        let first = terminal.sync_deadline().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        terminal.parse_chunk(b"\x1b[?2026h");
+        let extended = terminal.sync_deadline().unwrap();
+        assert!(extended > first);
+        assert!(!terminal.expire_synchronized_update(first));
+        // Completing the old update and beginning a new one in the same chunk
+        // must release only the old output and retain the new deadline.
+        terminal.parse_chunk(b"\x1b[?2026l\x1b[?2026h\x1b]2;second\x07");
+        assert_eq!(terminal.title(), "first");
+        let second = terminal.sync_deadline().unwrap();
+        assert!(terminal.expire_synchronized_update(second));
+        assert_eq!(terminal.title(), "second");
+        assert!(terminal.sync_deadline().is_none());
+        // Shell restart constructs a fresh terminal rather than carrying the
+        // previous child's parser state or timeout into the new shell.
+        terminal.parse_chunk(b"\x1b[?2026h\x1b]2;old-child\x07");
+        let (restarted, _) = buffered_terminal();
+        assert!(restarted.sync_deadline().is_none());
+        assert!(restarted.title().is_empty());
+    }
+
+    #[test]
+    fn synchronized_update_flushes_before_exit_or_transport_failure() {
+        use std::os::unix::process::ExitStatusExt as _;
+        for failed in [false, true] {
+            let (mut terminal, peer) = buffered_terminal();
+            peer.send(b"\x1b[?2026h\x1b]2;final\x07hello\x1b[6n".to_vec());
+            let status = std::process::ExitStatus::from_raw(0);
+            if failed {
+                peer.fail();
+                peer.finish();
+            } else {
+                peer.exit(Some(status));
+            }
+            let budgeted = parse_one_chunk(&mut terminal);
+            assert!(budgeted.more_output);
+            assert!(budgeted.child_exit.is_none() && budgeted.io_error.is_none());
+            assert!(terminal.title().is_empty());
+            let done = terminal.process_input();
+            assert!(done.grid_maybe_changed);
+            assert_eq!(terminal.title(), "final");
+            assert!(terminal.sync_deadline().is_none());
+            if failed {
+                assert_eq!(done.io_error.as_deref(), Some("test transport failure"));
+            } else {
+                assert_eq!(peer.reply(), b"\x1b[1;6R");
+                assert_eq!(done.child_exit, Some(Some(status)));
+            }
+        }
+    }
+
+    #[test]
+    fn synchronized_update_expiry_preserves_incomplete_utf8_and_csi() {
+        let (mut terminal, _) = buffered_terminal();
+        terminal.parse_chunk(b"\x1b[?2026h\xe2");
+        assert!(terminal.expire_synchronized_update(terminal.sync_deadline().unwrap()));
+        terminal.parse_chunk(b"\x82\xac\x1b[");
+        terminal.parse_chunk(b"31mX");
+        assert_eq!(terminal.grid()[GridLine(0)][GridColumn(0)].c, '€');
+        let x = &terminal.grid()[GridLine(0)][GridColumn(1)];
+        assert_eq!(x.c, 'X');
+        assert_eq!(
+            x.fg,
+            alacritty_terminal::vte::ansi::Color::Named(
+                alacritty_terminal::vte::ansi::NamedColor::Red
+            )
+        );
+    }
+
+    #[test]
+    fn synchronized_update_color_queries_observe_palette_at_each_osc() {
+        let body = b"\x1b]10;?\x1b\\\x1b]10;#112233\x07\x1b]10;?\x07\x1b]110\x07\x1b]10;?\x1b\\";
+        let expected = b"\x1b]10;rgb:5252/e8e8/ffff\x1b\\\x1b]10;rgb:1111/2222/3333\x07\x1b]10;rgb:5252/e8e8/ffff\x1b\\";
+        for expire in [false, true] {
+            for split in 0..=body.len() {
+                let (mut terminal, peer) = buffered_terminal();
+                terminal.parse_chunk(b"\x1b[?2026h");
+                terminal.parse_chunk(&body[..split]);
+                terminal.parse_chunk(&body[split..]);
+                if expire {
+                    assert!(terminal.expire_synchronized_update(terminal.sync_deadline().unwrap()));
+                } else {
+                    terminal.parse_chunk(b"\x1b[?2026l");
+                }
+                assert_eq!(peer.reply(), expected, "expire {expire}, split {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn synchronized_update_shell_and_clipboard_events_preserve_source_order() {
+        let (mut terminal, peer) = buffered_terminal();
+        terminal.parse_chunk(b"\x1b[?2026h\x1b]133;A\x07\x1b]133;C\x07output\r\n\x1b]133;D;7\x07\x1b]52;c;b25l\x07\x1b]52;c;?\x1b\\\x1b]52;c;dHdv\x07\x1b]52;c;?\x07\x1b]10;?\x07\x1b]10;#112233\x07");
+        assert!(terminal.drain_command_completions().next().is_none());
+        assert!(terminal.drain_clipboard_requests().is_empty());
+        assert!(terminal.expire_synchronized_update(terminal.sync_deadline().unwrap()));
+        let completions = terminal.drain_command_completions().collect::<Vec<_>>();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].exit_status, Some(7));
+        assert_eq!(terminal.last_command_output().as_deref(), Some("output"));
+        let requests = terminal.drain_clipboard_requests();
+        assert_eq!(requests.len(), 4);
+        assert!(matches!(&requests[0], ClipboardRequest::Store { text, .. } if text == "one"));
+        assert!(matches!(&requests[1], ClipboardRequest::Load { .. }));
+        assert!(matches!(&requests[2], ClipboardRequest::Store { text, .. } if text == "two"));
+        assert!(matches!(&requests[3], ClipboardRequest::Load { .. }));
+        assert_eq!(peer.reply(), b"\x1b]10;rgb:5252/e8e8/ffff\x07");
+        assert!(terminal.drain_clipboard_requests().is_empty());
+    }
+
+    #[test]
+    fn clipboard_protocol_reply_preserves_viewport_and_overflow_denies_reads() {
+        let (mut terminal, peer) = buffered_terminal();
+        terminal.inject_local(&b"line\r\n".repeat(50));
+        terminal.term.scroll_display(Scroll::Delta(5));
+        let offset = terminal.grid().display_offset();
+        terminal.write_clipboard_reply(b"raw-reply").unwrap();
+        assert_eq!(peer.reply(), b"raw-reply");
+        assert_eq!(terminal.grid().display_offset(), offset);
+        terminal.parse_chunk(&b"\x1b]52;c;?\x07".repeat(17));
+        assert_eq!(terminal.drain_clipboard_requests().len(), 16);
+        assert_eq!(peer.reply(), b"\x1b]52;c;\x07");
+        assert_eq!(terminal.grid().display_offset(), offset);
+    }
+
+    fn clipboard_x_payload(decoded_bytes: usize, terminator: &[u8]) -> Vec<u8> {
+        // The fixture encodes ASCII 'x' without adding a test-only dependency.
+        let mut payload = b"\x1b]52;c;".to_vec();
+        payload.extend_from_slice(&b"eHh4".repeat(decoded_bytes / 3));
+        payload.extend_from_slice(match decoded_bytes % 3 {
+            1 => b"eA==",
+            2 => b"eHg=",
+            _ => b"",
+        });
+        payload.extend_from_slice(terminator);
+        payload
+    }
+
+    #[test]
+    fn clipboard_osc52_decoded_boundary_accepts_complete_bel_and_st() {
+        use crate::clipboard::MAX_CLIPBOARD_BYTES;
+        for terminator in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            for decoded_bytes in
+                [MAX_CLIPBOARD_BYTES - 1, MAX_CLIPBOARD_BYTES, MAX_CLIPBOARD_BYTES + 1]
+            {
+                let (mut terminal, _) = buffered_terminal();
+                let payload = clipboard_x_payload(decoded_bytes, terminator);
+                // Feed through the normal PTY-sized parser slices, with ST's
+                // ESC/backslash deliberately split on the final two calls.
+                let prefix = payload.len() - terminator.len();
+                for chunk in payload[..prefix].chunks(64 * 1024) {
+                    terminal.parse_chunk(chunk);
+                    assert!(terminal.drain_clipboard_requests().is_empty());
+                }
+                for (index, byte) in terminator.iter().enumerate() {
+                    terminal.parse_chunk(&[*byte]);
+                    if index + 1 != terminator.len() {
+                        assert!(terminal.drain_clipboard_requests().is_empty());
+                    }
+                }
+                let requests = terminal.drain_clipboard_requests();
+                if decoded_bytes <= MAX_CLIPBOARD_BYTES {
+                    assert_eq!(requests.len(), 1);
+                    assert!(matches!(&requests[0], ClipboardRequest::Store { text, .. }
+                        if text.len() == decoded_bytes && text.bytes().all(|byte| byte == b'x')));
+                } else {
+                    assert!(requests.is_empty());
+                }
+                terminal.parse_chunk(b"\x1b]52;c;b25l\x07");
+                assert!(matches!(&terminal.drain_clipboard_requests()[0],
+                    ClipboardRequest::Store { text, .. } if text == "one"));
+            }
+        }
+    }
+
+    #[test]
+    fn clipboard_osc52_oversized_unterminated_payload_is_discarded_and_recovers() {
+        use crate::clipboard::MAX_CLIPBOARD_BYTES;
+        for ending in [
+            b"\x07".as_slice(),
+            b"\x1b\\".as_slice(),
+            b"\x18".as_slice(),
+            b"\x1a".as_slice(),
+            b"".as_slice(),
+        ] {
+            let (mut terminal, _) = buffered_terminal();
+            let payload = clipboard_x_payload(MAX_CLIPBOARD_BYTES + 1024, b"");
+            for chunk in payload.chunks(64 * 1024) {
+                terminal.parse_chunk(chunk);
+                assert!(terminal.drain_clipboard_requests().is_empty());
+            }
+            terminal.parse_chunk(ending);
+            assert!(terminal.drain_clipboard_requests().is_empty());
+            // Starting another OSC must discard the oversized unfinished one
+            // as well as recovering from ordinary termination or cancellation.
+            terminal.parse_chunk(b"\x1b]52;c;dHdv\x1b");
+            assert!(terminal.drain_clipboard_requests().is_empty());
+            terminal.parse_chunk(b"\\");
+            let requests = terminal.drain_clipboard_requests();
+            assert_eq!(requests.len(), 1);
+            assert!(matches!(&requests[0], ClipboardRequest::Store { text, .. } if text == "two"));
+        }
+    }
+
+    #[test]
+    fn clipboard_osc52_cancelled_or_malformed_sequences_never_publish_partial_requests() {
+        let rejected = [
+            b"\x1b]52;c;b25l\x18".as_slice(),
+            b"\x1b]52;c;b25l\x1a".as_slice(),
+            b"\x1b]52;c;b25l\x1bX".as_slice(),
+            b"\x1b]52;c;b25l\x1b\x18".as_slice(),
+            b"\x1b]52;c;b25l\x1b\x1a".as_slice(),
+            b"\x1b]52;c;b25l;garbage\x07".as_slice(),
+            b"\x1b]52;c;b25l;;;;;;;;;;;;;;;;;;\x07".as_slice(),
+            b"\x1b]52;c;?\x18".as_slice(),
+            b"\x1b]52;c;?\x1a".as_slice(),
+            b"\x1b]52;c;?\x1bX".as_slice(),
+            b"\x1b]52;c;invalid-base64\x07".as_slice(),
+            // Valid base64 containing a byte that is not valid UTF-8.
+            b"\x1b]52;c;/w==\x07".as_slice(),
+        ];
+        for (case, payload) in rejected.into_iter().enumerate() {
+            for split in 0..=payload.len() {
+                let (mut terminal, _) = buffered_terminal();
+                terminal.parse_chunk(&payload[..split]);
+                assert!(terminal.drain_clipboard_requests().is_empty());
+                terminal.parse_chunk(&payload[split..]);
+                assert!(
+                    terminal.drain_clipboard_requests().is_empty(),
+                    "case {case}, split {split}"
+                );
+                terminal.parse_chunk(b"\x1b]52;c;b25l\x07");
+                let requests = terminal.drain_clipboard_requests();
+                assert_eq!(requests.len(), 1, "recovery case {case}, split {split}");
+                assert!(
+                    matches!(&requests[0], ClipboardRequest::Store { text, .. } if text == "one")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kitty_keyboard_negotiation_queries_active_flags_and_restores_stack() {
+        let (mut terminal, peer) = buffered_terminal();
+        assert!(terminal.keyboard_modes().is_empty());
+        for (sequence, bits) in [
+            (b"\x1b[>1u".as_slice(), 1),
+            (b"\x1b[=2;2u".as_slice(), 3),
+            (b"\x1b[>31u".as_slice(), 31),
+            (b"\x1b[<u".as_slice(), 3),
+            (b"\x1b[=1;3u".as_slice(), 2),
+            (b"\x1b[=0u".as_slice(), 0),
+            (b"\x1b[<4097u".as_slice(), 0),
+        ] {
+            terminal.parse_chunk(sequence);
+            assert_eq!(terminal.keyboard_modes().bits(), bits);
+            terminal.parse_chunk(b"\x1b[?u");
+            assert_eq!(peer.reply(), format!("\x1b[?{bits}u").as_bytes());
+        }
+    }
+
+    #[test]
+    fn kitty_keyboard_modes_follow_alternate_screen_and_reset() {
+        let (mut terminal, peer) = buffered_terminal();
+        for (sequence, bits) in [
+            (b"\x1b[=3u".as_slice(), 3),
+            (b"\x1b[?1049h".as_slice(), 0),
+            (b"\x1b[>8u\x1b[=16;2u".as_slice(), 24),
+            (b"\x1b[?1049l".as_slice(), 3),
+            (b"\x1b[?1049h".as_slice(), 24),
+            (b"\x1b[?1049l\x1bc".as_slice(), 0),
+        ] {
+            terminal.parse_chunk(sequence);
+            assert_eq!(terminal.keyboard_modes().bits(), bits);
+            terminal.parse_chunk(b"\x1b[?u");
+            assert_eq!(peer.reply(), format!("\x1b[?{bits}u").as_bytes());
+        }
+    }
+
+    #[test]
+    fn kitty_keyboard_hostile_pushes_are_bounded_and_preserve_saved_title() {
+        for title in [false, true] {
+            let (mut terminal, _) = buffered_terminal();
+            if title {
+                terminal.parse_chunk(b"\x1b]2;saved-title\x07\x1b[22t\x1b]2;new-title\x07");
+            }
+            terminal.parse_chunk(&b"\x1b[>31u".repeat(4097));
+            assert_eq!(terminal.keyboard_modes().bits(), 31);
+            terminal.parse_chunk(b"\x1b[<4095u");
+            assert_eq!(terminal.keyboard_modes().bits(), 31);
+            terminal.parse_chunk(b"\x1b[<u");
+            assert!(terminal.keyboard_modes().is_empty());
+            if title {
+                terminal.parse_chunk(b"\x1b[23t");
+                assert_eq!(terminal.title(), "saved-title");
+            } else {
+                assert!(terminal.title().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "parser throughput benchmark; run alone with --ignored --nocapture"]
+    fn synchronized_parser_benchmark() {
+        let ascii = b"plain terminal output without queries\r\n".repeat(1600);
+        let title = b"\x1b]2;dense-title\x07".repeat(3600);
+        let queries = b"\x1b]10;?\x07\x1b]10;#112233\x07\x1b]10;?\x07\x1b]110\x07".repeat(1200);
+        for (name, payload) in [("ascii", ascii), ("title", title), ("queries", queries)] {
+            for mode in ["plain", "timeout", "end"] {
+                let (mut terminal, peer) = buffered_terminal();
+                let rounds = 128;
+                let warmups = 16;
+                let mut started = Instant::now();
+                for iteration in 0..warmups + rounds {
+                    if iteration == warmups {
+                        started = Instant::now();
+                    }
+                    if mode != "plain" {
+                        terminal.parse_chunk(b"\x1b[?2026h");
+                    }
+                    terminal.parse_chunk(&payload);
+                    if mode == "timeout" {
+                        terminal.expire_synchronized_update(terminal.sync_deadline().unwrap());
+                    } else if mode == "end" {
+                        terminal.parse_chunk(b"\x1b[?2026l");
+                    }
+                    if name == "queries" {
+                        let _ = peer.reply();
+                    }
+                }
+                let elapsed = started.elapsed();
+                assert!(terminal.sync_deadline().is_none());
+                eprintln!(
+                    "parser,{name},mode={mode},bytes={},elapsed_ns={},MiB_per_second={:.2}",
+                    payload.len() * rounds,
+                    elapsed.as_nanos(),
+                    (payload.len() * rounds) as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+                );
+            }
+        }
     }
 
     #[test]

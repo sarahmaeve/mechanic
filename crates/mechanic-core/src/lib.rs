@@ -1,5 +1,6 @@
 //! `mechanic-core` — terminal emulation and PTY management.
 
+pub mod clipboard;
 pub mod error;
 pub mod event;
 pub mod paste;

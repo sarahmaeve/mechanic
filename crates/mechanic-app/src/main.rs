@@ -1,6 +1,7 @@
 //! Mechanic terminal emulator — application entry point.
 
 mod app;
+mod clipboard_platform;
 mod control;
 mod control_cli;
 mod convert;
