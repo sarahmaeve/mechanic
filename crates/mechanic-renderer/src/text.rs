@@ -516,9 +516,8 @@ impl TextRenderer {
         row
     }
 
-    /// Soft-wrapped rows share paragraph bidi resolution. Glyph joining is
-    /// deliberately broken at a physical row boundary, so a lam-alef ligature
-    /// cannot occupy cells from two separately presented terminal rows.
+    /// Soft-wrapped rows share bidi context and Arabic joining forms while
+    /// ligatures remain within separately presented terminal rows.
     pub fn shape_grid(
         &mut self,
         grid: &crate::grid::RenderGrid,
@@ -869,6 +868,57 @@ struct GlyphCluster {
     glyphs: Vec<LayoutGlyph>,
 }
 
+fn joining_type(character: char) -> swash::text::JoiningType {
+    use swash::text::Codepoint as _;
+    character.joining_type()
+}
+
+fn joins_across(
+    left: Option<swash::text::JoiningType>,
+    right: Option<swash::text::JoiningType>,
+) -> bool {
+    use swash::text::JoiningType::{D, L, R};
+    matches!(left, Some(D | L)) && matches!(right, Some(D | R))
+}
+
+fn first_joining_type(text: &str) -> Option<swash::text::JoiningType> {
+    text.chars().map(joining_type).find(|kind| *kind != swash::text::JoiningType::T)
+}
+
+fn cell_first_joining_type(cell: &RenderCell) -> Option<swash::text::JoiningType> {
+    if cell.flags.intersects(
+        CellFlags::HIDDEN | CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER,
+    ) {
+        return Some(swash::text::JoiningType::U);
+    }
+    std::iter::once(cell.character)
+        .chain(cell.zerowidth.chars())
+        .map(joining_type)
+        .find(|kind| *kind != swash::text::JoiningType::T)
+}
+
+fn shaping_boundary<'a>(
+    text: &mut String,
+    spans: &mut Vec<(std::ops::Range<usize>, Attrs<'a>)>,
+    left: &Attrs<'a>,
+    right: &Attrs<'a>,
+    joined: bool,
+) {
+    let start = text.len();
+    if joined {
+        // ZWJs retain contextual forms; ZWNJ blocks cross-row ligatures.
+        // ZWSP starts a grapheme so the right ZWJ receives its own font style.
+        text.push_str("\u{200d}\u{200c}\u{200b}");
+        spans.push((start..text.len(), left.clone()));
+        let start = text.len();
+        text.push('\u{200d}');
+        spans.push((start..text.len(), right.clone()));
+    } else {
+        text.push('\u{200c}');
+        spans.push((start..text.len(), left.clone()));
+    }
+}
+
 fn shape_contextual_row(
     font_system: &mut FontSystem,
     buffer: &mut Buffer,
@@ -902,10 +952,13 @@ fn shape_contextual_paragraph(
     let mut row_bytes = Vec::new();
     let mut occupied_ranges = Vec::new();
     let mut row_cell_indices = Vec::new();
+    let default_attrs = Attrs::new().family(cosmic_text::Family::Name(&config.family));
+    let mut previous_attrs = default_attrs.clone();
+    let mut previous_joining =
+        prefix.chars().rev().map(joining_type).find(|kind| *kind != swash::text::JoiningType::T);
     if !prefix.is_empty() {
         text.push_str(prefix);
-        text.push('\u{200c}');
-        spans.push((0..text.len(), Attrs::new().family(cosmic_text::Family::Name(&config.family))));
+        spans.push((0..text.len(), default_attrs.clone()));
     }
     let occupied = |cell: &RenderCell| {
         !cell.flags.intersects(
@@ -913,6 +966,19 @@ fn shape_contextual_paragraph(
         ) && (cell.character != ' ' || !cell.zerowidth.is_empty())
     };
     for (row, cells) in rows.iter().enumerate() {
+        if row > 0 || !prefix.is_empty() {
+            let right = cells.iter().find_map(cell_first_joining_type);
+            let right_attrs = cells
+                .first()
+                .map_or_else(|| default_attrs.clone(), |cell| cell_attrs(cell, config));
+            shaping_boundary(
+                &mut text,
+                &mut spans,
+                &previous_attrs,
+                &right_attrs,
+                joins_across(previous_joining, right),
+            );
+        }
         let first = cells.iter().position(occupied);
         let last = cells.iter().rposition(occupied);
         let occupied_range = match (first, last) {
@@ -936,6 +1002,13 @@ fn shape_contextual_paragraph(
         let mut col = 0;
         while col < cells.len() {
             let cell = &cells[col];
+            let attrs = cell_attrs(cell, config);
+            if col > 0
+                && !previous_attrs.compatible(&attrs)
+                && joins_across(previous_joining, cell_first_joining_type(cell))
+            {
+                shaping_boundary(&mut text, &mut spans, &previous_attrs, &attrs, true);
+            }
             let start = text.len();
             let hidden = cell.flags.intersects(
                 CellFlags::HIDDEN
@@ -947,6 +1020,12 @@ fn shape_contextual_paragraph(
                 text.push_str(&cell.zerowidth);
             }
             let end = text.len();
+            for character in text[start..end].chars() {
+                let kind = joining_type(character);
+                if kind != swash::text::JoiningType::T {
+                    previous_joining = Some(kind);
+                }
+            }
             let span = if cell.flags.contains(CellFlags::WIDE_CHAR)
                 && cells
                     .get(col + 1)
@@ -960,25 +1039,22 @@ fn shape_contextual_paragraph(
                 *index = ranges.len();
             }
             ranges.push(CellRange { start, end, col, span, row });
-            spans.push((start..end, cell_attrs(cell, config)));
+            spans.push((start..end, attrs.clone()));
+            previous_attrs = attrs;
             col += span;
         }
         row_bytes.push(row_start..text.len());
         row_cell_indices.push(cell_indices);
-        if row + 1 < rows.len() {
-            // ZWNJ is not a paragraph break. Bidi context is retained, while
-            // Arabic joins/ligatures do not straddle two physical row bitmaps.
-            let start = text.len();
-            text.push('\u{200c}');
-            spans.push((
-                start..text.len(),
-                Attrs::new().family(cosmic_text::Family::Name(&config.family)),
-            ));
-        }
     }
     if !suffix.is_empty() {
+        shaping_boundary(
+            &mut text,
+            &mut spans,
+            &previous_attrs,
+            &default_attrs,
+            joins_across(previous_joining, first_joining_type(suffix)),
+        );
         let start = text.len();
-        text.push('\u{200c}');
         text.push_str(suffix);
         spans.push((
             start..text.len(),
@@ -1019,8 +1095,9 @@ fn shape_contextual_paragraph(
             }
             let source = &ranges[first_index];
             let tail = &ranges[end_index - 1];
-            // Row boundary controls prevent cross-row ligatures. Keep any
+            // The joining bridge prevents cross-row ligatures. Keep any
             // invisible boundary-only glyph out of the terminal-cell mapping.
+            debug_assert_eq!(source.row, tail.row, "glyph crossed a protected row boundary");
             if source.row != tail.row {
                 continue;
             }
@@ -1164,12 +1241,11 @@ fn shape_contextual_paragraph(
                     .get(index)
                     .filter(|range| range.row == row && range.start <= glyph.start)
                     .map_or(cluster.first, |range| range.col);
-                let physical = glyph.physical((0.0, metrics.ascent), 1.0);
+                let physical = glyph.physical((-natural_start, metrics.ascent), 1.0);
                 shaped[row].glyphs.push(ShapedGlyph {
                     cache_key: GlyphKey::new(physical.cache_key, scale_x),
                     source_col,
-                    x: group_start as f32 * metrics.cell_width
-                        + (physical.x as f32 - natural_start) * scale_x,
+                    x: group_start as f32 * metrics.cell_width + physical.x as f32 * scale_x,
                     y: physical.y as f32,
                     scale_x,
                     cluster_start: group_start,
@@ -1273,6 +1349,102 @@ mod tests {
             && glyph.y.is_finite()));
     }
 
+    fn ink_ids(fonts: &mut FontSystem, row: &ShapedRow) -> Vec<u16> {
+        row.glyphs
+            .iter()
+            .filter_map(|glyph| {
+                let font =
+                    fonts.get_font(glyph.cache_key.font_id, glyph.cache_key.font_weight).unwrap();
+                (glyph.cache_key.glyph_id != font.as_swash().charmap().map(' '))
+                    .then_some(glyph.cache_key.glyph_id)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn joining_boundaries_follow_unicode_controls_and_direction() {
+        let boundary = |left: &str, right: &str| {
+            joins_across(
+                left.chars()
+                    .rev()
+                    .map(joining_type)
+                    .find(|kind| *kind != swash::text::JoiningType::T),
+                first_joining_type(right),
+            )
+        };
+        assert!(boundary("ب\u{64e}", "ب"));
+        assert!(boundary("ل", "ا"));
+        assert!(boundary("ب", "ـ"));
+        assert!(boundary("ـ", "ب"));
+        assert!(boundary("ب\u{200d}", "ب"));
+        assert!(!boundary("ا", "ب"));
+        assert!(!boundary("ب\u{200c}", "ب"));
+        assert!(!boundary("ب", "\u{200c}ب"));
+        assert!(!boundary("ب ", "ب"));
+    }
+
+    #[test]
+    #[ignore = "manual CPU shaping benchmark"]
+    fn wrapped_shaping_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        let mut csv = String::from(
+            "workload,sample,ms_per_shape,glyphs,columns,rows,warmup_iterations,iterations\n",
+        );
+        for (name, phrase, prefix, suffix) in [
+            ("arabic", "سلام عليكم المسؤول الله لا سلام ", "", ""),
+            ("mixed", "قال المسؤول: «سنبدأ عام 2026». Latin / Русский ", "", ""),
+            ("viewport", "سلام عليكم المسؤول الله لا سلام ", "المسؤول سلا", "م عليكم"),
+            ("contextual_ascii", "ordinary terminal text with digits 12345 and words ", "", ""),
+        ] {
+            let input: Vec<_> = phrase.chars().cycle().take(80 * 24).collect();
+            let mut rows: Vec<_> =
+                input.chunks(80).map(|chars| cells(&chars.iter().collect::<String>())).collect();
+            let mut samples = Vec::new();
+            let mut glyphs = 0;
+            for iteration in 0..20 {
+                rows[12][20].character = char::from(b'0' + iteration % 10);
+                let slices: Vec<_> = rows.iter().map(Vec::as_slice).collect();
+                black_box(shape_contextual_paragraph(
+                    &mut fonts,
+                    &mut buffer,
+                    &slices,
+                    &config,
+                    metrics,
+                    prefix,
+                    suffix,
+                ));
+            }
+            for sample in 0..7 {
+                let started = Instant::now();
+                for iteration in 0..20 {
+                    rows[12][20].character = char::from(b'0' + iteration % 10);
+                    let slices: Vec<_> = rows.iter().map(Vec::as_slice).collect();
+                    let output = shape_contextual_paragraph(
+                        &mut fonts,
+                        &mut buffer,
+                        &slices,
+                        &config,
+                        metrics,
+                        prefix,
+                        suffix,
+                    );
+                    glyphs = output.iter().map(|row| row.glyphs.len()).sum::<usize>();
+                    black_box(output);
+                }
+                let millis = started.elapsed().as_secs_f64() * 1000. / 20.;
+                csv.push_str(&format!("{name},{sample},{millis:.6},{glyphs},80,24,20,20\n"));
+                samples.push(millis);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!("{name}: {:.3} ms/shape, {glyphs} glyphs, 24x80 cells", samples[3]);
+        }
+        if let Ok(path) = std::env::var("MECHANIC_SHAPING_CSV") {
+            std::fs::write(path, csv).unwrap();
+        }
+    }
+
     #[test]
     fn language_rows_preserve_glyphs_marks_and_terminal_spans() {
         let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
@@ -1359,6 +1531,199 @@ mod tests {
     }
 
     #[test]
+    fn soft_wrapped_arabic_uses_joined_forms_and_keeps_row_local_ligatures() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        for word in ["بب", "بلا", "العربية", "الله"] {
+            let input = cells(word);
+            let slices: Vec<_> = input.iter().map(std::slice::from_ref).collect();
+            let rows = shape_contextual_paragraph(
+                &mut fonts,
+                &mut buffer,
+                &slices,
+                &config,
+                metrics,
+                "",
+                "",
+            );
+            for row in &rows {
+                assert_permutation(row);
+                assert!(!ink_ids(&mut fonts, row).is_empty());
+                assert!(row.glyphs.iter().all(|glyph| glyph.source_col == 0
+                    && glyph.cluster_start == 0
+                    && glyph.cluster_end == 1));
+            }
+        }
+        let beh = cells("ب");
+        let joined = shape_contextual_paragraph(
+            &mut fonts,
+            &mut buffer,
+            &[&beh, &beh],
+            &config,
+            metrics,
+            "",
+            "",
+        );
+        let isolated = shape_contextual_row(&mut fonts, &mut buffer, &beh, &config, metrics);
+        let isolated_ids = ink_ids(&mut fonts, &isolated);
+        assert_ne!(ink_ids(&mut fonts, &joined[0]), isolated_ids);
+        assert_ne!(ink_ids(&mut fonts, &joined[1]), isolated_ids);
+        let mut blocked = beh.clone();
+        blocked[0].zerowidth.push('\u{200c}');
+        let rows = shape_contextual_paragraph(
+            &mut fonts,
+            &mut buffer,
+            &[&blocked, &beh],
+            &config,
+            metrics,
+            "",
+            "",
+        );
+        assert_eq!(ink_ids(&mut fonts, &rows[0]), isolated_ids);
+        assert_eq!(ink_ids(&mut fonts, &rows[1]), isolated_ids);
+        let nonjoining = cells("ا");
+        let rows = shape_contextual_paragraph(
+            &mut fonts,
+            &mut buffer,
+            &[&nonjoining, &beh],
+            &config,
+            metrics,
+            "",
+            "",
+        );
+        assert_eq!(ink_ids(&mut fonts, &rows[1]), isolated_ids);
+    }
+
+    #[test]
+    fn wrapped_marks_styles_and_viewport_context_keep_glyph_geometry() {
+        let (_, _, _, metrics) = cpu_shaper();
+        for family in ["Menlo", "Geeza Pro", "Noto Sans Arabic"] {
+            let config = FontConfig { family: family.into(), ..FontConfig::default() };
+            let mut fonts = configured_font_system(&config);
+            if !fonts.db().faces().any(|face| face.families.iter().any(|(name, _)| name == family))
+            {
+                continue;
+            }
+            let mut buffer = Buffer::new(&mut fonts, Metrics::new(16.0, 24.0));
+            for word in ["بلا", "العربية", "الله"] {
+                let mut input = cells(word);
+                input[0].zerowidth = "\u{64e}\u{651}".into();
+                input[1].flags = CellFlags::BOLD;
+                let slices: Vec<_> = input.iter().map(std::slice::from_ref).collect();
+                let complete = shape_contextual_paragraph(
+                    &mut fonts,
+                    &mut buffer,
+                    &slices,
+                    &config,
+                    metrics,
+                    "",
+                    "",
+                );
+                for row in 0..input.len() {
+                    let text = |cells: &[RenderCell]| {
+                        cells
+                            .iter()
+                            .map(|cell| format!("{}{}", cell.character, cell.zerowidth))
+                            .collect::<String>()
+                    };
+                    let viewport = shape_contextual_paragraph(
+                        &mut fonts,
+                        &mut buffer,
+                        &[slices[row]],
+                        &config,
+                        metrics,
+                        &text(&input[..row]),
+                        &text(&input[row + 1..]),
+                    );
+                    assert_permutation(&viewport[0]);
+                    assert_eq!(viewport[0].visual_cols, complete[row].visual_cols);
+                    assert_eq!(viewport[0].rtl, complete[row].rtl);
+                    assert!(!ink_ids(&mut fonts, &viewport[0]).is_empty());
+                    let signature = |shaped: &ShapedRow| {
+                        shaped
+                            .glyphs
+                            .iter()
+                            .map(|glyph| {
+                                (
+                                    glyph.cache_key,
+                                    glyph.x.to_bits(),
+                                    glyph.y.to_bits(),
+                                    glyph.scale_x.to_bits(),
+                                    glyph.source_col,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        signature(&viewport[0]),
+                        signature(&complete[row]),
+                        "viewport changed {family} glyph geometry for {word} row {row}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multicell_arabic_wraps_preserve_forms_and_viewport_geometry() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        for parts in [["سل", "ام"], ["السلا", "م عليكم"], ["المس", "ؤول 2026"]]
+        {
+            let input: Vec<_> = parts.iter().map(|text| cells(text)).collect();
+            let slices: Vec<_> = input.iter().map(Vec::as_slice).collect();
+            let complete = shape_contextual_paragraph(
+                &mut fonts,
+                &mut buffer,
+                &slices,
+                &config,
+                metrics,
+                "",
+                "",
+            );
+            for index in 0..2 {
+                assert_permutation(&complete[index]);
+                assert!(
+                    complete[index]
+                        .glyphs
+                        .iter()
+                        .all(|glyph| glyph.cluster_end <= input[index].len())
+                );
+                let viewport = shape_contextual_paragraph(
+                    &mut fonts,
+                    &mut buffer,
+                    &[slices[index]],
+                    &config,
+                    metrics,
+                    if index == 1 { parts[0] } else { "" },
+                    if index == 0 { parts[1] } else { "" },
+                );
+                let signature = |row: &ShapedRow| {
+                    row.glyphs
+                        .iter()
+                        .map(|glyph| {
+                            (
+                                glyph.cache_key,
+                                glyph.x.to_bits(),
+                                glyph.y.to_bits(),
+                                glyph.scale_x.to_bits(),
+                                glyph.source_col,
+                                glyph.cluster_start,
+                                glyph.cluster_end,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    signature(&complete[index]),
+                    signature(&viewport[0]),
+                    "viewport changed geometry for {parts:?} row {index}"
+                );
+                assert_eq!(complete[index].visual_cols, viewport[0].visual_cols);
+                assert_eq!(complete[index].rtl, viewport[0].rtl);
+            }
+        }
+    }
+
+    #[test]
     fn proportional_arabic_advances_scale_to_contiguous_terminal_clusters() {
         let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
         for word in ["سلام", "الله", "المسؤول"] {
@@ -1383,11 +1748,11 @@ mod tests {
                     .iter()
                     .find(|source| {
                         word[..source.start].chars().count() == glyph.source_col
-                            && source.physical((0.0, metrics.ascent), 1.0).cache_key
+                            && source.physical((-min_x, metrics.ascent), 1.0).cache_key
                                 == glyph.cache_key.base
                     })
                     .unwrap();
-                origins.push((glyph.x, source.physical((0.0, metrics.ascent), 1.0).x as f32));
+                origins.push((glyph.x, source.physical((-min_x, metrics.ascent), 1.0).x as f32));
             }
             for pair in origins.windows(2) {
                 let transformed = pair[1].0 - pair[0].0;

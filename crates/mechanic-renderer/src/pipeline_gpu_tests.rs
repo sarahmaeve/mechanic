@@ -287,6 +287,82 @@ fn multilingual_pixel_fixture() {
 
 #[test]
 #[ignore = "requires a Metal device; run explicitly on macOS"]
+fn wrapped_arabic_pixels_survive_viewport_clipping() {
+    use mechanic_config::font::FontConfig;
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::METAL,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let config = FontConfig { family: "Menlo".into(), size: 18.0, ..Default::default() };
+    let mut text = TextRenderer::new(&device, &queue, &config, 2.0);
+    let metrics = text.cell_metrics();
+    let cell_size = (metrics.cell_width.ceil(), metrics.cell_height.ceil());
+    let mut render = |grid: &RenderGrid, row: usize| {
+        let shaped = text.shape_grid(grid, &config);
+        text.prepare_frame(&shaped, &device, &queue).unwrap();
+        let (instances, backgrounds) = build_instances(grid, &shaped, &text, cell_size, true);
+        // Isolate the row so neighboring glyph overhangs cannot affect comparison.
+        let mut selected_backgrounds = 0;
+        let instances: Vec<_> = instances
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, mut instance)| {
+                if instance.cell_pos[1] != row as u32 {
+                    return None;
+                }
+                selected_backgrounds += u32::from(index < backgrounds as usize);
+                instance.cell_pos[1] = 0;
+                Some(instance)
+            })
+            .collect();
+        render_fixture_pixels(
+            &device,
+            &queue,
+            &text.atlas_view,
+            None,
+            fixture_globals((cell_size.0 as u32, cell_size.1 as u32), cell_size),
+            &instances,
+            selected_backgrounds,
+        )
+    };
+    // Every character crosses a physical row; lam-alef must remain visible.
+    for word in ["بلا", "العربية"] {
+        let chars: Vec<_> = word.chars().collect();
+        let mut grid = RenderGrid::new(1, chars.len());
+        grid.cursor_visible = false;
+        for (row, ch) in chars.iter().copied().enumerate() {
+            grid.cells[row] = crate::RenderCell {
+                character: ch,
+                fg: Rgb::new(255, 255, 255),
+                bg: Rgb::new(0, 0, 0),
+                ..Default::default()
+            };
+            grid.wrapped[row] = row + 1 < chars.len();
+        }
+        for row in 0..chars.len() {
+            let expected = render(&grid, row);
+            assert!(
+                expected.as_chunks::<4>().0.iter().any(|pixel| pixel[0] > 80),
+                "missing ink in {word}, row {row}"
+            );
+            let mut viewport = RenderGrid::new(1, 1);
+            viewport.cursor_visible = false;
+            viewport.cells[0] = grid.cells[row].clone();
+            viewport.bidi_prefix = chars[..row].iter().collect();
+            viewport.bidi_suffix = chars[row + 1..].iter().collect();
+            let actual = render(&viewport, 0);
+            let max_delta =
+                actual.iter().zip(&expected).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            assert!(max_delta <= 1, "viewport changed {word}, row {row}: max delta {max_delta}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal device; run explicitly on macOS"]
 fn triangle_logo_is_static_by_default_and_pulses_when_enabled() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::METAL,

@@ -47,7 +47,7 @@ failed shell exit, Cmd+R restarts the shell.
 `mechanic-core` owns terminal state and PTY I/O; `mechanic-app` routes events
 and converts the grid; `mechanic-renderer` shapes glyphs and draws cells;
 `mechanic-config` loads TOML. Text shaping supports combining marks, Japanese
-wide cells and Arabic paragraph direction. Configured font fallbacks precede
+wide cells, Arabic paragraph direction and joining across soft wraps. Configured font fallbacks precede
 platform fallback; macOS supplies Hiragino Sans and Geeza Pro. See
 [review findings](design/REVIEW.md) for remaining rendering limits.
 
@@ -56,6 +56,9 @@ changes affect both display and color-query replies. IME composition appears
 underlined with a selection and caret, clipped to the current visible row.
 Mouse reporting distinguishes hover and held buttons; trackpad scrolling retains
 fractional movement within each gesture.
+
+OSC 8 hyperlink targets are retained in terminal cells. Opening links, hover
+address previews, and link context menus are not implemented.
 
 PTY writes are queued without waiting for the child. Pending input is limited
 to 8 MiB (including paste markers) and 1,024 queued messages; a full queue
@@ -80,6 +83,8 @@ The event loop waits when parsing and animations are idle.
 
 Content frames reuse unchanged row geometry and upload changed buffer ranges.
 Snapshots and surface presentation still cover the whole visible grid.
+Lost window surfaces are recreated while retaining the atlas and cached frames.
+GPU device loss is detected but is not yet recoverable.
 
 See [benchmarks](benchmarks/README.md) for Rust microbenchmarks and identical
 workloads for Mechanic, iTerm2, and Ghostty.

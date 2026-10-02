@@ -85,7 +85,7 @@ impl Renderer {
         self.state.render(grid, &mut self.text, &self.font_config, uniforms)
     }
 
-    /// Draw cached instances with new uniforms; false if no full frame is cached.
+    /// Draw cached instances with new uniforms; true only after presentation.
     pub fn render_animation(&mut self, uniforms: FrameUniforms) -> bool {
         self.state.render_animation(uniforms)
     }

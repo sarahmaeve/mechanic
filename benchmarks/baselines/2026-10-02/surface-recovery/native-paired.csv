@@ -1,0 +1,13 @@
+pair,baseline_render_ns,recreate_ns,recovered_render_ns,baseline_presented,recreated,recovered_presented,same_atlas_generation
+0,258459,674500,356125,true,true,true,true
+1,419458,835708,299709,true,true,true,true
+2,454167,776500,266000,true,true,true,true
+3,879042,798667,460042,true,true,true,true
+4,1637584,980500,676417,true,true,true,true
+5,1331833,919708,749375,true,true,true,true
+6,1832375,947791,756000,true,true,true,true
+7,1232292,987250,773292,true,true,true,true
+8,1921000,925875,815667,true,true,true,true
+9,975916,895750,733917,true,true,true,true
+10,1258583,913375,678250,true,true,true,true
+11,1149209,842375,487042,true,true,true,true

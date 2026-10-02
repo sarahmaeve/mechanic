@@ -165,6 +165,34 @@ mod tests {
     }
 
     #[test]
+    fn failed_presentations_retry_at_content_cadence_without_animations() {
+        let mut attempted_at = Instant::now();
+        let mut pacer = FramePacer::new(attempted_at);
+        pacer.request_redraw();
+        // Failed full or cached fallback renders leave content dirty. Each
+        // delivered RedrawRequested clears its pending request and paces retries.
+        for _ in 0..3 {
+            pacer.rendered(attempted_at);
+            let retry = attempted_at + CONTENT_INTERVAL;
+            assert_eq!(pacer.schedule(attempted_at, true, None), FrameSchedule::WaitUntil(retry));
+            assert_eq!(
+                pacer.schedule(retry - Duration::from_millis(1), true, None),
+                FrameSchedule::WaitUntil(retry)
+            );
+            assert_eq!(pacer.schedule(retry, true, None), FrameSchedule::Redraw);
+            assert_eq!(pacer.schedule(retry, true, None), FrameSchedule::Idle);
+            attempted_at = retry;
+        }
+        // Recovery clears dirty content; an otherwise idle window sleeps again.
+        pacer.rendered(attempted_at);
+        assert_eq!(pacer.schedule(attempted_at, false, None), FrameSchedule::Idle);
+        assert_eq!(
+            pacer.schedule(attempted_at + Duration::from_secs(1), false, None),
+            FrameSchedule::Idle
+        );
+    }
+
+    #[test]
     fn occluded_windows_keep_parsing_without_presentation_deadlines() {
         let now = Instant::now();
         let mut pacer = FramePacer::new(now);

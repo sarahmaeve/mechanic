@@ -146,6 +146,7 @@ impl Terminal {
         time_budget: Duration,
         byte_budget: usize,
     ) -> ProcessOutcome {
+        self.pty.begin_input_turn();
         let mut outcome = ProcessOutcome::default();
         // Observe completion BEFORE checking for an empty output queue. An
         // empty observation made earlier cannot prove final output was parsed.
@@ -577,7 +578,11 @@ mod tests {
     use super::*;
 
     fn buffered_terminal() -> (Terminal, crate::pty::TestPtyPeer) {
-        let (pty, peer) = PtyHandle::test_pair(noop_waker());
+        buffered_terminal_with_waker(noop_waker())
+    }
+
+    fn buffered_terminal_with_waker(waker: crate::PtyWaker) -> (Terminal, crate::pty::TestPtyPeer) {
+        let (pty, peer) = PtyHandle::test_pair(waker);
         let size = TerminalSize::default();
         let dimensions = TermDimensions { columns: size.columns, screen_lines: size.rows };
         let event_proxy = EventProxy::new();
@@ -605,6 +610,113 @@ mod tests {
 
     fn parse_one_chunk(terminal: &mut Terminal) -> ProcessOutcome {
         terminal.process_input_with_budget(Instant::now(), Duration::ZERO, PARSE_BYTE_BUDGET)
+    }
+
+    #[test]
+    fn output_bursts_share_one_wake_until_the_parser_turn_starts() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&wakes);
+        let (mut terminal, peer) = buffered_terminal_with_waker(Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }));
+        for _ in 0..1024 {
+            peer.send(b"x".to_vec());
+        }
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(terminal.process_input().grid_maybe_changed);
+        peer.send(b"\x1b]2;next-burst\x07".to_vec());
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        terminal.process_input();
+        assert_eq!(terminal.title(), "next-burst");
+        peer.exit(None);
+        assert_eq!(wakes.load(Ordering::Relaxed), 3, "exit and completion share a wake");
+        assert_eq!(terminal.process_input().child_exit, Some(None));
+    }
+
+    #[test]
+    fn budget_continuations_drain_without_new_producer_wakes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&wakes);
+        let (mut terminal, peer) = buffered_terminal_with_waker(Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }));
+        peer.send(vec![b' '; 192 * 1024]);
+        peer.send(b"\x1b]2;drained\x07".to_vec());
+        peer.exit(None);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        for _ in 0..4 {
+            let result = parse_one_chunk(&mut terminal);
+            assert!(result.more_output);
+            assert!(result.child_exit.is_none());
+        }
+        assert_eq!(terminal.title(), "drained");
+        assert_eq!(terminal.process_input().child_exit, Some(None));
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn worker_completion_rearms_after_an_early_failure_wake() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&wakes);
+        let (mut terminal, peer) = buffered_terminal_with_waker(Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }));
+        peer.fail();
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(terminal.process_input().io_error.is_none());
+        peer.send(b"\x1b]2;last-output\x07".to_vec());
+        peer.finish();
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        let result = terminal.process_input();
+        assert_eq!(terminal.title(), "last-output");
+        assert_eq!(result.io_error.as_deref(), Some("test transport failure"));
+    }
+
+    #[test]
+    fn concurrent_publication_and_parser_acknowledgement_do_not_lose_wakes() {
+        use std::{sync::Arc, thread};
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (mut terminal, peer) = buffered_terminal_with_waker(Arc::new(move || {
+            tx.send(()).unwrap();
+        }));
+        let producer = thread::spawn(move || {
+            for index in 0..2000 {
+                peer.send(format!("\x1b]2;sequence-{index}\x07").into_bytes());
+                if index % 7 == 0 {
+                    thread::yield_now();
+                }
+            }
+            peer.exit(None);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        'events: loop {
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("lost PTY wake");
+            loop {
+                let result = parse_one_chunk(&mut terminal);
+                if result.child_exit.is_some() {
+                    break 'events;
+                }
+                if !result.more_output {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "parser continuation stalled");
+            }
+        }
+        producer.join().unwrap();
+        assert_eq!(terminal.title(), "sequence-1999");
     }
 
     #[test]
@@ -696,6 +808,30 @@ mod tests {
         terminal.process_input();
         assert_eq!(peer.reply(), b"\x1b]10;rgb:1212/3434/5656\x07");
         assert!(!terminal.question_mark_since_terminator);
+    }
+
+    #[test]
+    fn osc8_links_preserve_targets_across_chunks_and_close_after_label() {
+        use alacritty_terminal::index::{Column, Line};
+
+        for terminator in ["\x07", "\x1b\\"] {
+            let (mut terminal, peer) = buffered_terminal();
+            let target = "https://example.com/report?language=ar&year=2026";
+            let payload =
+                format!("\x1b]8;id=article;{target}{terminator}Read\x1b]8;;{terminator} plain");
+            for byte in payload.bytes() {
+                peer.send(vec![byte]);
+                terminal.process_input();
+            }
+            for col in 0..4 {
+                let link = terminal.grid()[Line(0)][Column(col)].hyperlink().unwrap();
+                assert_eq!(link.uri(), target);
+                assert_eq!(link.id(), "article");
+            }
+            for col in 4..10 {
+                assert!(terminal.grid()[Line(0)][Column(col)].hyperlink().is_none());
+            }
+        }
     }
 
     #[test]
@@ -844,6 +980,51 @@ mod tests {
         assert!(outcome.grid_maybe_changed && outcome.more_output);
         assert!(terminal.pty.rx.try_recv().is_err());
         assert!(!terminal.process_input().more_output);
+    }
+
+    #[test]
+    fn native_pty_delivers_output_and_exit_using_only_wakes() {
+        use std::{io::Write, os::unix::fs::PermissionsExt, sync::Arc};
+
+        let mut script = tempfile::NamedTempFile::new().unwrap();
+        script.write_all(b"#!/bin/sh\nstty raw -echo\nprintf '\\033]2;ready\\007'\ndd bs=1 count=1 >/dev/null 2>&1\nprintf '\\033]2;final\\007'\nexit 7\n").unwrap();
+        script.as_file().set_permissions(std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = script.into_temp_path();
+        let mut config = Config::default();
+        config.shell.program = path.to_str().unwrap().into();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut terminal = Terminal::new(
+            &config,
+            TerminalSize::default(),
+            Arc::new(move || {
+                let _ = tx.send(());
+            }),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut released = false;
+        loop {
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("native PTY wake stalled");
+            loop {
+                let result = terminal.process_input();
+                assert!(result.io_error.is_none(), "{:?}", result.io_error);
+                if !released && terminal.title() == "ready" {
+                    terminal.write_to_pty(b"x").unwrap();
+                    released = true;
+                }
+                if let Some(status) = result.child_exit {
+                    assert!(released);
+                    assert_eq!(terminal.title(), "final");
+                    assert_eq!(status.unwrap().code(), Some(7));
+                    return;
+                }
+                if !result.more_output {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "native parser continuation stalled");
+            }
+        }
     }
 
     #[test]

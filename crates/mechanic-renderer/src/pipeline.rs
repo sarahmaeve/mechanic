@@ -1,5 +1,9 @@
 use std::mem;
-use std::time::Instant;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -164,13 +168,40 @@ pub struct SurfaceInit {
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
     pub surface_config: wgpu::SurfaceConfiguration,
+    surface_factory: SurfaceFactory,
+    adapter: wgpu::Adapter,
+    device_lost: Arc<AtomicBool>,
+}
+
+type SurfaceFactory =
+    Box<dyn Fn() -> Result<wgpu::Surface<'static>, wgpu::CreateSurfaceError> + Send + Sync>;
+
+const SURFACE_RECOVERY_BACKOFF: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct SurfaceRecovery {
+    retry_at: Option<Instant>,
+}
+
+impl SurfaceRecovery {
+    fn ready(&self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|retry_at| now >= retry_at)
+    }
+
+    fn failed(&mut self, now: Instant) {
+        self.retry_at = Some(now + SURFACE_RECOVERY_BACKOFF);
+    }
 }
 
 /// Holds all wgpu objects needed to render terminal frames.
 pub struct RenderState {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
+    surface: Option<wgpu::Surface<'static>>,
+    surface_factory: SurfaceFactory,
+    adapter: wgpu::Adapter,
+    device_lost: Arc<AtomicBool>,
+    surface_recovery: SurfaceRecovery,
     surface_config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     foreground_pipeline: wgpu::RenderPipeline,
@@ -210,7 +241,12 @@ where
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
-    let surface = instance.create_surface(window)?;
+    let window = Arc::new(window);
+    let surface_factory: SurfaceFactory = Box::new({
+        let instance = instance.clone();
+        move || instance.create_surface(Arc::clone(&window))
+    });
+    let surface = surface_factory()?;
 
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -232,6 +268,17 @@ where
             experimental_features: wgpu::ExperimentalFeatures::default(),
         })
         .await?;
+
+    let device_lost = Arc::new(AtomicBool::new(false));
+    device.set_device_lost_callback({
+        let device_lost = Arc::clone(&device_lost);
+        move |reason, message| {
+            device_lost.store(true, Ordering::Release);
+            log::error!(
+                "GPU device lost ({reason:?}): {message}; device recreation is unsupported"
+            );
+        }
+    });
 
     let caps = surface.get_capabilities(&adapter);
     let surface_format =
@@ -261,7 +308,15 @@ where
     };
     surface.configure(&device, &surface_config);
 
-    Ok(SurfaceInit { device, queue, surface, surface_config })
+    Ok(SurfaceInit {
+        device,
+        queue,
+        surface,
+        surface_config,
+        surface_factory,
+        adapter,
+        device_lost,
+    })
 }
 
 impl RenderState {
@@ -290,7 +345,15 @@ impl RenderState {
     }
     /// Build the pipeline and bind the text renderer's atlas.
     pub fn new_with_atlas(
-        SurfaceInit { device, queue, surface, surface_config }: SurfaceInit,
+        SurfaceInit {
+            device,
+            queue,
+            surface,
+            surface_config,
+            surface_factory,
+            adapter,
+            device_lost,
+        }: SurfaceInit,
         atlas_view: &wgpu::TextureView,
         atlas_generation: u64,
         cell_metrics: CellMetrics,
@@ -371,7 +434,11 @@ impl RenderState {
         Ok(Self {
             device,
             queue,
-            surface,
+            surface: Some(surface),
+            surface_factory,
+            adapter,
+            device_lost,
+            surface_recovery: SurfaceRecovery::default(),
             surface_config,
             pipeline,
             foreground_pipeline,
@@ -447,7 +514,12 @@ impl RenderState {
         self.size = new_size;
         self.surface_config.width = new_size.0;
         self.surface_config.height = new_size.1;
-        self.surface.configure(&self.device, &self.surface_config);
+        if let Some(surface) = &self.surface
+            && !self.configure_surface(surface)
+        {
+            self.surface = None;
+            self.surface_recovery.failed(Instant::now());
+        }
 
         let globals = Globals {
             viewport_size: [new_size.0 as f32, new_size.1 as f32],
@@ -468,6 +540,86 @@ impl RenderState {
         self.instance_cache.invalidate();
     }
 
+    fn configure_surface(&self, surface: &wgpu::Surface<'static>) -> bool {
+        if self.device_lost.load(Ordering::Acquire) {
+            return false;
+        }
+        let caps = surface.get_capabilities(&self.adapter);
+        if !surface_config_supported(&self.surface_config, &caps)
+            || self.surface_config.width > self.device.limits().max_texture_dimension_2d
+            || self.surface_config.height > self.device.limits().max_texture_dimension_2d
+        {
+            log::error!("replacement surface does not support the existing GPU configuration");
+            return false;
+        }
+        // Device loss or a driver error during configure must not become an
+        // uncaptured validation panic. GPU resource/device recreation is separate.
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        surface.configure(&self.device, &self.surface_config);
+        let errors = [
+            pollster::block_on(memory.pop()),
+            pollster::block_on(internal.pop()),
+            pollster::block_on(validation.pop()),
+        ];
+        for error in errors.iter().flatten() {
+            log::error!("surface configuration failed: {error}");
+        }
+        errors.iter().all(Option::is_none) && !self.device_lost.load(Ordering::Acquire)
+    }
+
+    /// Replace a lost native surface, preserving the device, atlas, and cached frame.
+    /// Failed attempts back off; this does not recover a lost GPU device.
+    /// Call on the window event-loop thread, as Metal surface creation requires.
+    pub fn recreate_surface(&mut self) -> bool {
+        let now = Instant::now();
+        if self.device_lost.load(Ordering::Acquire) || !self.surface_recovery.ready(now) {
+            return false;
+        }
+        // Release the old swapchain before creating another for the same window.
+        self.surface = None;
+        match (self.surface_factory)() {
+            Ok(surface) if self.configure_surface(&surface) => {
+                self.surface = Some(surface);
+                self.surface_recovery.retry_at = None;
+                true
+            }
+            Ok(_) => {
+                self.surface_recovery.failed(now);
+                false
+            }
+            Err(error) => {
+                log::error!("surface recreation failed: {error}");
+                self.surface_recovery.failed(now);
+                false
+            }
+        }
+    }
+
+    fn acquire_surface_texture(&mut self) -> Option<wgpu::SurfaceTexture> {
+        if self.device_lost.load(Ordering::Acquire) {
+            return None;
+        }
+        if self.surface.is_none() && !self.recreate_surface() {
+            return None;
+        }
+        let acquisition = self.surface.as_ref()?.get_current_texture();
+        surface_texture_for_render(acquisition, |action| match action {
+            SurfaceRecoveryAction::Recreate => {
+                self.recreate_surface();
+            }
+            SurfaceRecoveryAction::Reconfigure => {
+                let configured =
+                    self.surface.as_ref().is_some_and(|surface| self.configure_surface(surface));
+                if !configured {
+                    self.surface = None;
+                    self.surface_recovery.failed(Instant::now());
+                }
+            }
+        })
+    }
+
     /// Update the cell size used by the pipeline's globals uniform.
     pub fn set_cell_size(&mut self, cell_size: (f32, f32)) {
         self.cell_size = cell_size;
@@ -476,7 +628,7 @@ impl RenderState {
         self.instance_cache.invalidate();
     }
 
-    /// Render a single frame.
+    /// Render a single frame; true only after submitting and presenting it.
     pub fn render(
         &mut self,
         grid: &RenderGrid,
@@ -484,6 +636,9 @@ impl RenderState {
         font_config: &mechanic_config::font::FontConfig,
         uniforms: FrameUniforms,
     ) -> bool {
+        if self.device_lost.load(Ordering::Acquire) {
+            return false;
+        }
         // Full rendering replaces the cached buffer before surface acquisition.
         self.last_instance_count = 0;
         let profiling = log::log_enabled!(target: "mechanic_render_profile", log::Level::Trace);
@@ -595,26 +750,15 @@ impl RenderState {
         }
 
         let surface_started = profiling.then(Instant::now);
-        let surface_texture = self.surface.get_current_texture();
+        let surface_texture = self.acquire_surface_texture();
         if let (Some(profile), Some(started)) = (&mut profile, surface_started) {
             profile.surface_ns = started.elapsed().as_nanos();
         }
-        let surface_texture = match surface_texture {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.surface_config);
-                if let Some(profile) = profile {
-                    profile.log(false);
-                }
-                return false;
+        let Some(surface_texture) = surface_texture else {
+            if let Some(profile) = profile {
+                profile.log(false);
             }
-            _ => {
-                if let Some(profile) = profile {
-                    profile.log(false);
-                }
-                return false;
-            }
+            return false;
         };
 
         let submit_present_started = profiling.then(Instant::now);
@@ -669,9 +813,9 @@ impl RenderState {
         true
     }
 
-    /// Draw cached instances with new uniforms; false if no full frame is cached.
+    /// Draw cached instances with new uniforms; true only after presentation.
     pub fn render_animation(&mut self, uniforms: FrameUniforms) -> bool {
-        if self.last_instance_count == 0 {
+        if self.last_instance_count == 0 || self.device_lost.load(Ordering::Acquire) {
             return false;
         }
 
@@ -689,14 +833,8 @@ impl RenderState {
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
-        let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.surface_config);
-                return true;
-            }
-            _ => return true,
+        let Some(surface_texture) = self.acquire_surface_texture() else {
+            return false;
         };
 
         let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -743,6 +881,47 @@ impl RenderState {
         true
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceRecoveryAction {
+    Reconfigure,
+    Recreate,
+}
+
+fn surface_config_supported(
+    config: &wgpu::SurfaceConfiguration,
+    caps: &wgpu::SurfaceCapabilities,
+) -> bool {
+    config.width > 0
+        && config.height > 0
+        && caps.formats.contains(&config.format)
+        && caps.present_modes.contains(&config.present_mode)
+        && caps.alpha_modes.contains(&config.alpha_mode)
+        && caps.usages.contains(config.usage)
+        && config.color_space == wgpu::SurfaceColorSpace::Auto
+}
+
+fn surface_texture_for_render(
+    acquisition: wgpu::CurrentSurfaceTexture,
+    recover: impl FnOnce(SurfaceRecoveryAction),
+) -> Option<wgpu::SurfaceTexture> {
+    match acquisition {
+        wgpu::CurrentSurfaceTexture::Success(texture)
+        | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
+        wgpu::CurrentSurfaceTexture::Outdated => {
+            recover(SurfaceRecoveryAction::Reconfigure);
+            None
+        }
+        wgpu::CurrentSurfaceTexture::Lost => {
+            recover(SurfaceRecoveryAction::Recreate);
+            None
+        }
+        wgpu::CurrentSurfaceTexture::Timeout
+        | wgpu::CurrentSurfaceTexture::Occluded
+        | wgpu::CurrentSurfaceTexture::Validation => None,
+    }
+}
+
 fn create_cell_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
@@ -802,6 +981,95 @@ fn create_cell_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipped_surface_acquisitions_never_supply_a_presentable_frame() {
+        for acquisition in [
+            wgpu::CurrentSurfaceTexture::Timeout,
+            wgpu::CurrentSurfaceTexture::Occluded,
+            wgpu::CurrentSurfaceTexture::Validation,
+        ] {
+            assert!(
+                surface_texture_for_render(acquisition, |_| {
+                    panic!("only an outdated surface can be recovered by reconfiguration")
+                })
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn outdated_surface_reconfigures_but_still_requires_another_acquisition() {
+        let mut reconfigurations = 0;
+        let frame = surface_texture_for_render(wgpu::CurrentSurfaceTexture::Outdated, |action| {
+            assert_eq!(action, SurfaceRecoveryAction::Reconfigure);
+            reconfigurations += 1;
+        });
+        assert!(frame.is_none());
+        assert_eq!(reconfigurations, 1);
+    }
+
+    #[test]
+    fn lost_surface_recreates_once_and_does_not_claim_presentation() {
+        let mut recreations = 0;
+        let frame = surface_texture_for_render(wgpu::CurrentSurfaceTexture::Lost, |action| {
+            assert_eq!(action, SurfaceRecoveryAction::Recreate);
+            recreations += 1;
+        });
+        assert!(frame.is_none());
+        assert_eq!(recreations, 1);
+    }
+
+    #[test]
+    fn failed_surface_recovery_defers_repeated_native_creation() {
+        let now = Instant::now();
+        let mut recovery = SurfaceRecovery::default();
+        assert!(recovery.ready(now));
+        recovery.failed(now);
+        assert!(!recovery.ready(now));
+        assert!(!recovery.ready(now + SURFACE_RECOVERY_BACKOFF - Duration::from_millis(1)));
+        assert!(recovery.ready(now + SURFACE_RECOVERY_BACKOFF));
+        recovery.retry_at = None;
+        assert!(recovery.ready(now));
+    }
+
+    #[test]
+    fn replacement_surface_must_keep_existing_pipeline_configuration() {
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            width: 320,
+            height: 200,
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::PostMultiplied,
+            view_formats: vec![],
+            color_space: wgpu::SurfaceColorSpace::Auto,
+        };
+        let mut caps = wgpu::SurfaceCapabilities {
+            formats: vec![config.format],
+            present_modes: vec![config.present_mode],
+            alpha_modes: vec![config.alpha_mode],
+            usages: config.usage,
+            ..Default::default()
+        };
+        assert!(surface_config_supported(&config, &caps));
+        caps.formats = vec![wgpu::TextureFormat::Rgba8Unorm];
+        assert!(!surface_config_supported(&config, &caps));
+        caps.formats = vec![config.format];
+        caps.alpha_modes.clear();
+        assert!(!surface_config_supported(&config, &caps));
+        caps.alpha_modes = vec![config.alpha_mode];
+        caps.present_modes.clear();
+        assert!(!surface_config_supported(&config, &caps));
+        caps.present_modes = vec![config.present_mode];
+        caps.usages = wgpu::TextureUsages::COPY_SRC;
+        assert!(!surface_config_supported(&config, &caps));
+        caps.usages = config.usage;
+        let mut minimized = config.clone();
+        minimized.width = 0;
+        assert!(!surface_config_supported(&minimized, &caps));
+    }
 
     #[test]
     fn ligature_clips_uvs_at_selection_boundary() {

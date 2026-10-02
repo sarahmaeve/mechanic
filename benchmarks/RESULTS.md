@@ -1,9 +1,64 @@
-# Measurements — 2026-10-01
+# Measurements
 
 The queued PTY transport removes the large-paste stall and completes a duplex
 transfer that previously deadlocked. Output batching also improves most tested
 GUI workloads. These are initial observations from one machine, not stable
 cross-terminal rankings.
+
+## Surface recovery — 2026-10-02
+
+All 12 native surface replacements resumed cached presentation and retained the
+atlas generation. Median host-call times: ordinary cached render 0.968 ms,
+surface recreation/configuration 0.873 ms, recovered cached render 0.591 ms.
+These are paired observations in the same build, not a before/after speedup.
+Driver waits affect both render timings; GPU completion is not measured.
+
+Release build, Rust 1.99.0, wgpu 30.0.1/Metal, macOS 26.6.2 arm64. Temporary
+320×160 window, Menlo 16 pt at scale 1, 16×4 ASCII grid, animations and logo
+disabled; three full-frame warmups and 33 ms between pairs. The benchmark
+explicitly replaces healthy surfaces using the production recovery method;
+unit tests check that a `Lost` result dispatches that method. Device loss is
+not covered. [Raw CSV](baselines/2026-10-02/surface-recovery/redraw-paired.csv).
+
+## Arabic wrap repair — 2026-10-02
+
+Median milliseconds per uncached 80×24 paragraph shape, before/after joining
+and glyph-origin repairs:
+
+| Workload | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Arabic | 1.660 | 1.713 | +3.2% |
+| Arabic / Latin / Cyrillic | 1.280 | 1.335 | +4.3% |
+| Arabic with offscreen context | 1.754 | 1.720 | −2.0% |
+| ASCII through contextual shaper | 0.552 | 0.560 | +1.4% |
+
+The first two cases cost about 53–55 µs more per full paragraph shape. This
+benchmark bypasses the row/paragraph caches and normal ASCII fast path; it
+does not measure application CPU, rasterization or presentation. These are
+single sequential before/after batches, so small differences can include drift.
+
+Same machine/toolchain as the recovery check. Menlo 16 px with configured
+fallback, 24 px line height; fixed terminal metrics 10×24 px and 18 px ascent.
+Each workload has 20 warmup shapes, then seven samples of 20 changing shapes.
+Raw CSV glyph counts include invisible controls and are not correctness proof.
+[Before](baselines/2026-10-02/wrapped-shaping/before.csv) /
+[after](baselines/2026-10-02/wrapped-shaping/after.csv).
+
+Correctness checks cover split lam–alef, joining/nonjoining controls, combining
+marks, style boundaries and multi-cell wraps. Full and clipped viewport glyph
+geometry match; the offscreen Metal check compares isolated rendered rows.
+Logical copy order remains unchanged.
+
+The release row-cache benchmark also passed all 800 geometry comparisons after
+these repairs. Median sparse geometry time was 9.5–9.9 µs cached versus 193 µs
+for full construction, with 21,296 versus 894,432 planned upload bytes. Dense
+updates retained about 10% cache overhead (200–204 µs versus 181–185 µs).
+This checks existing cache behavior, not a before/after shaping comparison.
+[Raw geometry CSV](baselines/2026-10-02/row-cache/geometry.csv).
+
+Validation: 384 workspace tests, nine explicit serial Metal checks, strict
+Clippy, formatting and the release app build passed. The native recovery
+example and CPU shaping benchmark were run separately.
 
 ## Paste responsiveness
 

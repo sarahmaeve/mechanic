@@ -1273,6 +1273,7 @@ dependencies = [
  "unicode-script",
  "unicode-width",
  "wgpu",
+ "winit",
 ]
 
 [[package]]

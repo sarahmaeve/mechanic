@@ -37,6 +37,7 @@ static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 struct State {
+    wake_pending: AtomicBool,
     cancelled: AtomicBool,
     closed: AtomicBool,
     /// The worker cannot enqueue any more output, even if child cleanup continues.
@@ -47,6 +48,12 @@ struct State {
 }
 
 impl State {
+    fn wake_app(&self, waker: &PtyWaker) {
+        if !self.wake_pending.swap(true, Ordering::AcqRel) {
+            waker();
+        }
+    }
+
     fn fail(&self, error: io::Error, waker: &PtyWaker) {
         let mut failure = self.failure.lock().unwrap_or_else(|e| e.into_inner());
         if failure.is_some() {
@@ -57,7 +64,7 @@ impl State {
         drop(failure);
         self.closed.store(true, Ordering::Release);
         self.failure_pending.store(true, Ordering::Release);
-        waker();
+        self.wake_app(waker);
     }
 
     fn error(&self) -> io::Error {
@@ -246,6 +253,11 @@ impl PtyHandle {
         self.notify();
     }
 
+    /// Rearm before checking output/status so concurrent publications cannot lose a wake.
+    pub(crate) fn begin_input_turn(&self) {
+        self.state.wake_pending.swap(false, Ordering::AcqRel);
+    }
+
     fn notify(&self) {
         if let Err(error) = self.poller.notify() {
             // Already accepted bytes must not be reported as an enqueue rejection.
@@ -347,7 +359,7 @@ fn worker(
     // notify failure can arrive before this point, so wake again once its
     // preceding output can safely be considered complete.
     state.output_done.store(true, Ordering::Release);
-    waker();
+    state.wake_app(&waker);
     let _ = pty.deregister(&poller);
     drop(io.pending_write.take());
     drop(incoming);
@@ -367,6 +379,7 @@ pub(crate) struct TestPtyPeer {
 impl TestPtyPeer {
     pub(crate) fn send(&self, bytes: Vec<u8>) {
         self.output.try_send(bytes).unwrap();
+        self.state.wake_app(&self.waker);
     }
 
     pub(crate) fn exit(&self, status: Option<ExitStatus>) {
@@ -376,6 +389,7 @@ impl TestPtyPeer {
 
     pub(crate) fn publish_exit(&self, status: Option<ExitStatus>) {
         self.exit.try_send(status).unwrap();
+        self.state.wake_app(&self.waker);
     }
 
     pub(crate) fn fail(&self) {
@@ -384,7 +398,7 @@ impl TestPtyPeer {
 
     pub(crate) fn finish(&self) {
         self.state.output_done.store(true, Ordering::Release);
-        (self.waker)();
+        self.state.wake_app(&self.waker);
     }
 
     pub(crate) fn reply(&self) -> Vec<u8> {
@@ -478,7 +492,7 @@ impl IoLoop {
             }
 
             if produced_output {
-                waker();
+                state.wake_app(waker);
             }
             if self.eof {
                 self.input_closed = true;
@@ -490,7 +504,7 @@ impl IoLoop {
                 && let Some(status) = self.child_status
             {
                 let _ = exit.try_send(status);
-                waker();
+                state.wake_app(waker);
                 return Ok(());
             }
 

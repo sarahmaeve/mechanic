@@ -16,12 +16,13 @@ mechanic-config.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
 bitflags = "2"
 raw-window-handle = "0.6"
+pollster.workspace = true
 
 # The logo needs only SVG shapes.
 resvg = { version = "0.48", default-features = false }
 
 [dev-dependencies]
-pollster.workspace = true
+winit.workspace = true
 unicode-width = "0.2"
 # Shader validation.
 naga = { version = "30", features = ["wgsl-in"] }

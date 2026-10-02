@@ -222,3 +222,35 @@ CSV records host geometry time and planned upload byte counts; shaping, actual
 GPU uploads, presentation and whole-app CPU are outside timing. An absolute
 output path is required; the selected CSV is replaced. Every iteration also
 checks that cached geometry exactly matches a full rebuild.
+
+## Native surface recovery
+
+```sh
+cargo run --release -p mechanic-renderer --example surface_recovery -- /tmp/surface-recovery.csv
+```
+
+This opens a temporary 320×160 window with Menlo and animations off. After
+three warmup frames it measures 12 pairs: cached presentation, explicit surface
+replacement, and cached presentation on the replacement. Every pair must present
+successfully and preserve the atlas generation. The event-loop deadline is eight
+seconds, with a ten-second startup watchdog. Existing CSV files are not replaced.
+
+These are host-call timings in the same build, including driver waits. They
+measure recovery cost, not completed GPU execution or a before/after speedup.
+Replacement uses the production recovery method; the driver is not forced to
+emit a spontaneous surface-loss error. GPU device loss is a separate failure.
+
+## Wrapped paragraph shaping
+
+```sh
+MECHANIC_SHAPING_CSV=/tmp/wrapped-shaping.csv \
+  cargo test --release -p mechanic-renderer wrapped_shaping_benchmark -- --ignored --nocapture
+```
+
+This CPU benchmark reshapes changing 80×24 paragraphs: Arabic, mixed scripts,
+Arabic with offscreen context, and ASCII through the contextual shaper. It uses
+20 warmup iterations followed by seven samples of 20 iterations. CSV records
+each sample's mean milliseconds per shape and glyph count. It excludes the
+paragraph cache, atlas rasterization, uploads and presentation. The ASCII case
+does not use the application's faster ASCII path. Compare identical harnesses
+before and after shaping changes; glyph counts may differ when shaping is fixed.

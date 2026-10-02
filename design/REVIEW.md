@@ -1,10 +1,14 @@
-# Code review — 2026-10-01
+# Code review — 2026-10-02
 
 Two Sol 6.1/medium agents reviewed correctness and performance. Findings were
 checked against source; measurements are in [results](../benchmarks/RESULTS.md).
 
 Fixed: ordered nonblocking PTY transport, bounded parser turns, parsing independent
 of presentation, fixed frame deadlines, and hidden-window presentation suspension.
+PTY notifications now coalesce until the next parser turn. Failed cached
+presentations return failure, allowing the existing paced redraw retry.
+Lost native surfaces are recreated with the existing device and render resources;
+failed recreation attempts back off for 250 ms.
 
 Text rendering now preserves combining marks, wide-cell backgrounds and concealed
 text. Arabic uses contextual shaping and paragraph bidi across soft-wrapped rows,
@@ -12,6 +16,9 @@ with shared maps for backgrounds, cursor, selection and mouse coordinates. Copyi
 retains logical source order. Atlas uploads are preflighted before instance
 construction, bounded by device limits, and include sampling gutters. Cursor
 visibility and bar/underline/wide-outline geometry are tested.
+Soft wraps preserve Arabic joining forms without cross-row ligatures. Font-style
+boundaries retain joining, and glyph origins are relative to their geometry group
+so offscreen context does not change subpixel placement.
 
 Content rendering caches row geometry and uploads changed ranges. Cache keys
 include shaping identity, colors, decorations and resolved cursor geometry;
@@ -28,10 +35,11 @@ Remaining issues:
 
 | Priority | Finding | Location |
 | --- | --- | --- |
-| P2 | PTY output posts wake events even when one is pending. | `core/pty.rs` |
+| P2 | GPU device loss is detected but requires device/resource recreation. | `renderer/pipeline.rs` |
+| P2 | OSC 8 targets are stored, but link activation, hover previews and context menus are absent. | `app/app.rs` |
 
-Text limits: terminal wrapping is by cells, not words. Shaping breaks joining at
-physical row boundaries. Offscreen bidi context is bounded to 64 KiB per side;
+Text limits: terminal wrapping is by cells, not words. Ligatures stay within
+physical rows. Offscreen bidi context is bounded to 64 KiB per side;
 truncated or discarded scrollback cannot supply full paragraph context. Color
 bitmaps use their alpha as monochrome coverage; emoji typography is not validated.
 IME candidate positioning is mapped; joined emoji composition uses conservative
