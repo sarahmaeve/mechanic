@@ -149,7 +149,21 @@ cargo build --release -p mechanic-bench --example app_cpu
 ./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cpu-animated.json --animate
 ./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cpu-logo.json --animation logo --logo atom
 ./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cpu-background.json --animation background --logo atom
+./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cpu-services.json --services
 ```
+
+`app_cpu` disables session restoration and local control by default. `--services`
+enables both with temporary configuration, state, and socket directories.
+Compare enabled/disabled runs with the same workload to measure idle overhead.
+The storage/transport benchmark uses temporary directories without opening windows:
+
+```sh
+cargo run --release -p mechanic-app --example services_bench --locked
+```
+
+It reports 16-pane JSON encoding, durable atomic save/flush, and authenticated
+Unix socket round trips. The transport callback returns an empty pane list;
+these timings exclude GUI dispatch and terminal text extraction.
 
 `--animation off|logo|background|both` selects effects independently; the benchmark
 defaults to `off` and writes both settings explicitly to isolate the run. `--animate`
@@ -362,6 +376,35 @@ cargo rustc -p mechanic-app --example search_native_smoke --locked -- --cfg test
 It checks AppKit edits, Match case toggles without losing query/focus, navigation
 actions, keyboard equivalents, close and callback teardown. It does not capture
 the screen or send text to a shell.
+
+## Panes and completion notifications
+
+```sh
+cargo test --release --locked -p mechanic-app panes::tests::layout_hit_test_benchmark -- --ignored --exact --nocapture --test-threads=1
+MECHANIC_PANE_BENCH_CSV=/tmp/mechanic-panes.csv cargo test --release --locked -p mechanic-renderer multi_pane_update_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+The layout test measures 16 panes and 16 hit tests over five batches of 20,000
+iterations. The Metal preparation test holds 4,800 cells constant across one,
+two and four panes, changing one cell in one or every pane. It checks idle-pane
+cache reuse and records preparation time and vertex upload bytes. Discard the
+first 20 of 120 iterations per case as warmup. GPU synchronization and window
+presentation are outside these preparation timings. Run without other builds
+or benchmarks; the GPU test has a 60-second total bound.
+
+The hidden native app smoke opens isolated local shell sessions:
+
+```sh
+cargo rustc -p mechanic-app --example panes_native_smoke --locked -- --cfg test
+./target/debug/examples/panes_native_smoke
+```
+
+It exercises inherited directories, splits, hover scrolling, selection/search
+isolation, divider dragging, font resizing, IME cancellation/reactivation,
+restart sessions, stale callbacks and closing panes. It also checks native
+notification content/delegate construction without requesting permission or
+delivering alerts. It does not capture the screen. The shell fixture uses
+`/bin/sh` with integration disabled and never loads user zsh startup files.
 
 ## Hyperlinks
 

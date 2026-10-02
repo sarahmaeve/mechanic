@@ -1,0 +1,1 @@
+native session/control smoke passed: workspace save/restore, fresh PTYs, split ratios/active pane/font/cwd, discovery, list/read, paste and explicit Enter, raw input, pending and retained completion waits, timeout, stale handles, background focus

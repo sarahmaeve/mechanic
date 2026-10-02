@@ -1,0 +1,40 @@
+Date: 2026-10-02
+Host: macOS 26.6.2 arm64, Apple M5 Pro, Rust 1.99.0
+Before GUI build: commit 7745f09, preserved before pane implementation.
+After GUI build: working tree based on 7745f09, panes/cwd/notifications changes.
+Before app SHA256: 446a9f9eb3d7360203332ba05c2339bc09af594a62df080a1c7a12ee5600d57b
+After app SHA256: 8b7ca7f2e5371f46229c9ac53ea3cbbc46a2d24c06bfabc06c27b7c8359bed52
+Pane benchmark executable SHA256: 2668e8f13421a507f0c6f9aba5b06b95ff4cf6bae2781a9c3c534cc8d45ecd33
+
+Preparation: release renderer test multi_pane_update_benchmark, --ignored
+--nocapture --test-threads=1. MECHANIC_PANE_BENCH_CSV=preparation.csv.
+One serial run, 1/2/4 panes, busy_one then all_active, 4,800 cells in each case.
+120 raw samples per case; preparation-medians.csv discards iterations 0..19,
+then averages ordered observations 50 and 51. CPU preparation and queued vertex
+uploads measured; GPU synchronization/presentation excluded. Correctness checks
+ensure unchanged pane rows are retained and require no vertex uploads.
+
+Layout: release app test panes::tests::layout_hit_test_benchmark, --ignored
+--exact --nocapture --test-threads=1. Five 20,000-iteration batches; each iteration
+lays out 16 panes at varied sizes and hit-tests all 16 centers. layout.txt.
+App shortcut/session edits after this layout binary was built did not change
+the layout implementation or benchmark.
+
+GUI: target/release/examples/app_cpu APP OUTPUT --animation off --settle-secs 2
+--sample-secs 3 --workload idle|cell --label before-panes|after-panes.
+Cell cases also use --render-profile. Order idle before, idle after, cell before,
+cell after. No concurrent builds or benchmarks. All reports status=ok, focused
+throughout; cell cases 121x42, 60 complete profiled frames each. Idle has no
+profiling. CPU is one core percent, excluding PTY peer/WindowServer/GPU.
+
+Completion events: release core terminal::tests::shell_protocol_benchmark
+--ignored --exact --nocapture --test-threads=1, serial final run. Ten batches
+of 2,000 commands each, plain then markers; upper medians. Parsing/tracking only.
+
+Validation: full workspace suite plus final affected app suite total 484 passing
+tests; 12 Metal functional checks passed across renderer validation runs;
+strict workspace Clippy, formatting, release build. native-smoke.txt records
+the final hidden app run with independent PTYs, cwd inheritance, split/close,
+selection/search/pointer routing, font resize, IME cancellation and reactivation,
+restart and stale callbacks. Native notification objects/delegate verified
+without notification-center authorization or delivery. No screen capture.

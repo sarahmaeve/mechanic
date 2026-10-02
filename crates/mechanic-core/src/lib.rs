@@ -11,7 +11,7 @@ pub mod terminal;
 
 pub use error::TerminalError;
 pub use event::{EventProxy, TerminalEvent};
-pub use shell_state::{ShellCommand, ShellIntegration, ShellPosition};
+pub use shell_state::{CommandCompletion, ShellCommand, ShellIntegration, ShellPosition};
 pub use terminal::{GridColumn, GridLine, GridPoint, GridSide, MouseProtocol, Terminal};
 
 /// Wake the main loop after PTY output, exit, or transport failure.

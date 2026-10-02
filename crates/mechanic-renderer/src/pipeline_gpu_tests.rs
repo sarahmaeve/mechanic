@@ -52,6 +52,8 @@ fn cursor_geometry_and_overlapping_glyph_coverage() {
         bloom_peak_multiplier: 1.0,
         logo_size: 270.0,
         logo_style: 0,
+        pane_origin: [0.0; 2],
+        _padding: [0.0; 2],
     };
     let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
@@ -846,6 +848,8 @@ fn fixture_globals(size: (u32, u32), cell_size: (f32, f32)) -> Globals {
         bloom_peak_multiplier: 1.0,
         logo_size: 270.0,
         logo_style: 0,
+        pane_origin: [0.0; 2],
+        _padding: [0.0; 2],
     }
 }
 

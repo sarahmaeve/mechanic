@@ -21,6 +21,10 @@ use mechanic_config::theme::Rgb;
 mod instance_cache;
 use instance_cache::InstanceCache;
 
+#[path = "panes.rs"]
+mod panes;
+pub use panes::{PaneRect, RenderPane};
+
 /// Instanced vertex data. Field offsets must match the shader attributes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -160,6 +164,9 @@ struct Globals {
     bloom_peak_multiplier: f32,
     logo_size: f32,
     logo_style: u32,
+    /// Physical origin of this pane in the window's shared viewport.
+    pane_origin: [f32; 2],
+    _padding: [f32; 2],
 }
 
 /// Intermediate result of `init_surface`: device/queue/surface ready, but no pipeline or atlas yet.
@@ -226,6 +233,10 @@ pub struct RenderState {
     last_background_count: u32,
     shaped_rows: Vec<std::sync::Arc<crate::text::ShapedRow>>,
     instance_cache: InstanceCache,
+    panes: std::collections::HashMap<u64, panes::PaneState>,
+    pane_order: Vec<u64>,
+    pane_frame_cached: bool,
+    pane_colors: (Rgb, Rgb),
 }
 
 /// Initialise the wgpu instance, adapter, device, queue, and configured surface — without building any pipelines or textures.
@@ -393,6 +404,8 @@ impl RenderState {
             bloom_peak_multiplier: 1.0,
             logo_size: f32::from(mechanic_config::theme::DEFAULT_LOGO_SIZE),
             logo_style: logo_style as u32,
+            pane_origin: [0.0; 2],
+            _padding: [0.0; 2],
         };
 
         let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -457,6 +470,10 @@ impl RenderState {
             last_background_count: 0,
             shaped_rows: Vec::new(),
             instance_cache: InstanceCache::default(),
+            panes: std::collections::HashMap::new(),
+            pane_order: Vec::new(),
+            pane_frame_cached: false,
+            pane_colors: (Rgb::new(173, 255, 255), Rgb::new(26, 58, 64)),
         })
     }
 
@@ -499,6 +516,15 @@ impl RenderState {
             &self.sampler,
             &self.logo.view,
         );
+        for pane in self.panes.values_mut() {
+            pane.update_bind_group(
+                &self.device,
+                &self.bind_group_layout,
+                atlas_view,
+                &self.sampler,
+                &self.logo.view,
+            );
+        }
     }
 
     /// Sync the stored atlas generation to `gen`.
@@ -532,12 +558,15 @@ impl RenderState {
             bloom_peak_multiplier: 1.0,
             logo_size: f32::from(mechanic_config::theme::DEFAULT_LOGO_SIZE),
             logo_style: self.logo.style as u32,
+            pane_origin: [0.0; 2],
+            _padding: [0.0; 2],
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         self.last_instance_count = 0;
         self.shaped_rows.clear();
         self.instance_cache.invalidate();
+        self.pane_frame_cached = false;
     }
 
     fn configure_surface(&self, surface: &wgpu::Surface<'static>) -> bool {
@@ -626,6 +655,10 @@ impl RenderState {
         self.last_instance_count = 0;
         self.shaped_rows.clear();
         self.instance_cache.invalidate();
+        self.pane_frame_cached = false;
+        for pane in self.panes.values_mut() {
+            pane.invalidate_layout();
+        }
     }
 
     /// Render a single frame; true only after submitting and presenting it.
@@ -636,6 +669,7 @@ impl RenderState {
         font_config: &mechanic_config::font::FontConfig,
         uniforms: FrameUniforms,
     ) -> bool {
+        self.pane_frame_cached = false;
         if self.device_lost.load(Ordering::Acquire) {
             return false;
         }
@@ -654,6 +688,8 @@ impl RenderState {
             bloom_peak_multiplier: uniforms.bloom_peak_multiplier,
             logo_size: f32::from(uniforms.logo_size),
             logo_style: self.logo.style as u32,
+            pane_origin: [0.0; 2],
+            _padding: [0.0; 2],
         };
         let uniform_upload_started = profiling.then(Instant::now);
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
@@ -815,6 +851,9 @@ impl RenderState {
 
     /// Draw cached instances with new uniforms; true only after presentation.
     pub fn render_animation(&mut self, uniforms: FrameUniforms) -> bool {
+        if self.pane_frame_cached {
+            return self.render_pane_animation(uniforms);
+        }
         if self.last_instance_count == 0 || self.device_lost.load(Ordering::Acquire) {
             return false;
         }
@@ -830,6 +869,8 @@ impl RenderState {
             bloom_peak_multiplier: uniforms.bloom_peak_multiplier,
             logo_size: f32::from(uniforms.logo_size),
             logo_style: self.logo.style as u32,
+            pane_origin: [0.0; 2],
+            _padding: [0.0; 2],
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 

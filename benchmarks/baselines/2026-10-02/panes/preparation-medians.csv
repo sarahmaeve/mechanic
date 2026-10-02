@@ -1,0 +1,7 @@
+panes,workload,median_prepare_us
+1,all_active,83.333
+1,busy_one,81.7085
+2,all_active,84.458
+2,busy_one,57.583
+4,all_active,92.542
+4,busy_one,46.7295

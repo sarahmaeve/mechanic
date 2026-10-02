@@ -5,6 +5,97 @@ transfer that previously deadlocked. Output batching also improves most tested
 GUI workloads. These are initial observations from one machine, not stable
 cross-terminal rankings.
 
+## Session restoration and local control — 2026-10-02
+
+Restoration writes layout/directory snapshots through a coalescing worker.
+The control listener blocks on a private Unix socket; completion waits use
+shell events and event-loop deadlines. Neither service polls while idle.
+
+Serial GUI checks sampled eight seconds after three seconds of settling,
+with animations and render profiling off. Both services were enabled in
+temporary directories and verified initialized. All samples remained focused.
+
+| CPU, percent of one core | Before services | Final build, services enabled |
+| --- | ---: | ---: |
+| Idle | 0.013% | 0.010% |
+| Single-cell updates at 20 Hz | 4.335% | 4.103% |
+
+An earlier enabled run measured 0.012% idle and 4.377% updating; the new build
+with services disabled measured 0.012% idle. These short samples show no large
+regression; they do not establish a speedup. CPU excludes the PTY peer,
+WindowServer, and GPU work.
+
+| Service operation | Median | p95 |
+| --- | ---: | ---: |
+| Encode a 16-pane snapshot | 3.67 µs | 5.96 µs |
+| Atomic durable save + worker flush | 8.00 ms | 8.14 ms |
+| Authenticated socket round trip | 77.96 µs | 113.04 µs |
+
+The transport benchmark returns an empty list immediately; it excludes GUI
+dispatch, output extraction, and shell execution. Save timings include disk
+synchronization; ordinary UI changes queue saves asynchronously.
+
+Native checks restore two windows/four fresh PTYs and verify split ratios,
+font sizes, active panes, directories, control input/output, pending and retained
+completion waits, stale identifiers, focus preservation, and silent-input
+viewport redraw. Storage/transport tests cover malformed state, private files,
+writer locks, bounded reads/writes, Unicode output, and saturated input queues.
+All 531 workspace tests passed, along with both hidden native smoke checks,
+strict workspace Clippy, formatting, and the release build.
+
+[Raw measurements, build hashes, and reproduction commands](baselines/2026-10-02/sessions-control/README.md).
+
+## Split panes, directory inheritance and completion notifications — 2026-10-02
+
+Panes share one surface, device and glyph atlas per window. Each retains its
+own shaped rows, geometry and converted grid. The same parser queue schedules
+one bounded batch globally per turn; idle panes add no polling or animation
+timers. Native completion notifications default off and run on shell events.
+
+The offscreen Metal preparation benchmark holds 4,800 cells constant and
+changes one cell per active pane. Medians use 100 observations after 20 warmups
+per case, in one serial run. Preparation includes shaping/atlas work, geometry
+and queued uploads; it excludes GPU synchronization and presentation.
+
+| Panes | One pane changing | Every pane changing | Vertex bytes, one pane changing |
+| --- | ---: | ---: | ---: |
+| 1 | 81.71 µs | 83.33 µs | 21,120 |
+| 2 | 57.58 µs | 84.46 µs | 10,560 |
+| 4 | 46.73 µs | 92.54 µs | 5,280 |
+
+Unchanged panes retained their row identities and required no vertex uploads.
+With smaller panes, a single changed row costs less to rebuild. These timings
+do not measure simultaneous shell throughput or input latency. A separate
+16-pane layout plus 16 hit tests measured 721 ns median per iteration across
+five batches of 20,000 (batch range 552–1,205 ns).
+
+Mechanic-only GUI CPU checks compare `7745f09` with this change, one three-second
+sample after two seconds of settling. Animations were off; all samples stayed
+focused. The single-cell workload updates at 20 Hz in a 121×42 grid, with
+render profiling enabled in both builds and 60 complete frames each.
+
+| CPU, percent of one core | Before | After |
+| --- | ---: | ---: |
+| Idle | 0.007% | 0.008% |
+| Single-cell updates | 4.56% | 4.77% |
+
+These short samples are sanity checks, not precise regression thresholds.
+CPU excludes the controlled PTY peer, WindowServer and GPU work. A serial
+2,000-command marker benchmark including completion-event tracking measured
+0.657 ms plain and 1.511 ms with markers, about 427 ns additional per lifecycle;
+shell execution and native notification delivery are excluded.
+
+Validation: workspace tests and final affected-package tests total 484 passed;
+12 Metal functional checks, the hidden app smoke, strict workspace Clippy,
+formatting and release build passed. Checks include directory fallback and
+independent PTYs, tiny/nested layouts, clipping, atlas growth, idle cache reuse,
+bidi mapping, mouse capture across focus changes, logical shortcuts on non-US
+layouts, IME cancellation, and callback rejection after close/restart or reused
+window IDs. Native notification content/delegate checks sent no alerts and
+requested no authorization; actual OS banner delivery was not tested.
+
+[Raw samples, commands and build fingerprints](baselines/2026-10-02/panes/metadata.txt).
+
 ## Shell integration and scrollback search — 2026-10-02
 
 Shell integration adds bounded OSC 7/133 metadata to the existing parser.

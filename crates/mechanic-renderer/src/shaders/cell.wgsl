@@ -1,4 +1,4 @@
-// Layout must match pipeline.rs::Globals (48 bytes).
+// Layout must match pipeline.rs::Globals (64 bytes).
 struct Globals {
     viewport_size: vec2<f32>,
     cell_size: vec2<f32>,
@@ -10,6 +10,8 @@ struct Globals {
     bloom_peak_multiplier: f32,
     logo_size: f32,
     logo_style: u32,
+    pane_origin: vec2<f32>,
+    padding: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -73,7 +75,7 @@ fn vs_main(
         quad_size = globals.cell_size;
     }
 
-    let px = quad_origin + lv * quad_size;
+    let px = globals.pane_origin + quad_origin + lv * quad_size;
 
     let ndc = vec2<f32>(
          2.0 * px.x / globals.viewport_size.x - 1.0,

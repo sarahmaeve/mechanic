@@ -1,0 +1,17 @@
+#[allow(dead_code, unused_imports, reason = "explicit native smoke shares application internals")]
+#[path = "../src/app.rs"] mod app;
+#[allow(dead_code, unused_imports)] #[path = "../src/control.rs"] mod control;
+#[allow(dead_code, unused_imports)] #[path = "../src/session.rs"] mod session;
+#[allow(dead_code, unused_imports)] #[path = "../src/convert.rs"] mod convert;
+#[allow(dead_code, unused_imports)] #[path = "../src/hyperlinks.rs"] mod hyperlinks;
+#[allow(dead_code, unused_imports)] #[path = "../src/input.rs"] mod input;
+#[allow(dead_code, unused_imports)] #[path = "../src/link_input.rs"] mod link_input;
+#[allow(dead_code, unused_imports)] #[path = "../src/link_platform.rs"] mod link_platform;
+#[allow(dead_code, unused_imports)] #[path = "../src/mouse.rs"] mod mouse;
+#[allow(dead_code, unused_imports)] #[path = "../src/notifications.rs"] mod notifications;
+#[allow(dead_code, unused_imports)] #[path = "../src/notifications_platform.rs"] mod notifications_platform;
+#[allow(dead_code, unused_imports)] #[path = "../src/panes.rs"] mod panes;
+#[allow(dead_code, unused_imports)] #[path = "../src/preedit.rs"] mod preedit;
+#[allow(dead_code, unused_imports)] #[path = "../src/scheduling.rs"] mod scheduling;
+#[allow(dead_code, unused_imports)] #[path = "../src/search.rs"] mod search;
+#[allow(dead_code, unused_imports)] #[path = "../src/search_platform.rs"] mod search_platform;

@@ -1,23 +1,53 @@
 //! Mechanic terminal emulator — application entry point.
 
 mod app;
+mod control;
+mod control_cli;
 mod convert;
 mod hyperlinks;
 mod input;
 mod link_input;
 mod link_platform;
 mod mouse;
+mod notifications;
+mod notifications_platform;
+mod panes;
 mod preedit;
 mod scheduling;
 mod search;
 mod search_platform;
+mod session;
 
 use app::UserEvent;
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let cli = parse_args(std::env::args().skip(1));
+    let cli = match parse_args(std::env::args().skip(1)) {
+        Ok(Invocation::App(cli)) => cli,
+        Ok(Invocation::Control(cli)) => std::process::exit(control_cli::run(cli)),
+        Ok(Invocation::Help) => {
+            print_help();
+            return;
+        }
+        Ok(Invocation::ControlHelp) => {
+            control_cli::print_help();
+            return;
+        }
+        Ok(Invocation::Version) => {
+            println!("mechanic {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Err(error) => {
+            if error.control {
+                control_cli::print_error("invalid_arguments", &error.message);
+            } else {
+                eprintln!("mechanic: {}", error.message);
+                eprintln!("try 'mechanic --help' for usage");
+            }
+            std::process::exit(2);
+        }
+    };
 
     let config = match config_path(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME")) {
         Some(path) => mechanic_config::Config::load(&path),
@@ -34,6 +64,17 @@ fn main() {
 
     let animations = cli.animations(config.theme.animation);
     let mut app = app::App::new(config, proxy, animations, cli.mouse_tracking);
+    let state_directory = session::state_directory()
+        .map_err(|err| {
+            log::warn!("cannot resolve session storage: {err}");
+        })
+        .ok();
+    let control_directory = control::runtime_directory()
+        .map_err(|err| {
+            log::warn!("cannot resolve local control directory: {err}");
+        })
+        .ok();
+    app.configure_services(!cli.no_restore, state_directory, control_directory);
     event_loop.run_app(&mut app).expect("event loop exited with error");
 }
 
@@ -46,11 +87,19 @@ struct Cli {
     animate_logo: Option<bool>,
     /// Forward mouse events when requested by the terminal program.
     mouse_tracking: bool,
+    /// Skip loading persisted windows and panes at startup.
+    no_restore: bool,
 }
 
 impl Default for Cli {
     fn default() -> Self {
-        Self { hot_cpu: false, animate_background: None, animate_logo: None, mouse_tracking: true }
+        Self {
+            hot_cpu: false,
+            animate_background: None,
+            animate_logo: None,
+            mouse_tracking: true,
+            no_restore: false,
+        }
     }
 }
 
@@ -67,12 +116,31 @@ impl Cli {
 }
 
 /// Parse `mechanic`'s command-line arguments.
-fn parse_args<I>(args: I) -> Cli
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Invocation {
+    App(Cli),
+    Control(control_cli::Cli),
+    Help,
+    ControlHelp,
+    Version,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliError {
+    message: String,
+    control: bool,
+}
+
+fn parse_args<I>(args: I) -> Result<Invocation, CliError>
 where
     I: IntoIterator<Item = String>,
 {
+    let args: Vec<_> = args.into_iter().collect();
+    let control = args.iter().any(|arg| arg == "ctl");
+    let mut args = args.into_iter();
     let mut cli = Cli::default();
-    for arg in args {
+    let mut socket = None;
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--animate" | "--hot-cpu" => {
                 cli.hot_cpu = true;
@@ -84,22 +152,41 @@ where
             "--no-animate-background" => cli.animate_background = Some(false),
             "--no-animate-logo" => cli.animate_logo = Some(false),
             "--no-mouse-tracking" => cli.mouse_tracking = false,
+            "--no-restore" => cli.no_restore = true,
+            "--socket" => {
+                if socket.is_some() {
+                    return Err(CliError {
+                        message: "--socket may only be supplied once".into(),
+                        control,
+                    });
+                }
+                let value = args.next().ok_or_else(|| CliError {
+                    message: "--socket requires a path".into(),
+                    control,
+                })?;
+                socket = Some(std::path::PathBuf::from(value));
+            }
+            "ctl" => {
+                return control_cli::parse(args.collect(), socket)
+                    .map(|parsed| match parsed {
+                        control_cli::Parsed::Command(cli) => Invocation::Control(cli),
+                        control_cli::Parsed::Help => Invocation::ControlHelp,
+                    })
+                    .map_err(|message| CliError { message, control: true });
+            }
             "-h" | "--help" => {
-                print_help();
-                std::process::exit(0);
+                return Ok(if control { Invocation::ControlHelp } else { Invocation::Help });
             }
-            "-V" | "--version" => {
-                println!("mechanic {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
+            "-V" | "--version" => return Ok(Invocation::Version),
             other => {
-                eprintln!("mechanic: unknown argument '{other}'");
-                eprintln!("try 'mechanic --help' for usage");
-                std::process::exit(2);
+                return Err(CliError { message: format!("unknown argument '{other}'"), control });
             }
         }
     }
-    cli
+    if socket.is_some() {
+        return Err(CliError { message: "--socket requires a ctl command".into(), control: false });
+    }
+    Ok(Invocation::App(cli))
 }
 
 fn print_help() {
@@ -107,6 +194,7 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("    mechanic [OPTIONS]");
+    println!("    mechanic [--socket PATH] ctl COMMAND [OPTIONS]");
     println!();
     println!("OPTIONS:");
     println!("    --animate              Animate the gradient and logo while focused");
@@ -117,9 +205,14 @@ fn print_help() {
     println!("    --no-animate-background Disable background animation");
     println!("    --no-animate-logo      Disable logo animation and focus glow");
     println!("    --no-mouse-tracking    Keep selection and middle-click paste local");
+    println!("    --no-restore           Start fresh without loading saved windows and panes");
+    println!("    ctl                    Control a running instance; see 'mechanic ctl --help'");
     println!("    -h, --help             Show this help and exit");
     println!("    -V, --version          Show version and exit");
     println!("\n    Cmd+Shift+A toggles all animations on/off for this session.");
+    println!("    Cmd+D splits side by side; Cmd+Shift+D splits top and bottom.");
+    println!("    Cmd+[ / Cmd+] cycles panes; Cmd+W closes a pane; Cmd+Shift+W closes a window.");
+    println!("    Cmd+Option+arrow focuses the pane in that direction.");
 }
 
 /// Resolve the user's `mechanic.toml` config path using XDG then HOME.
@@ -138,8 +231,48 @@ fn config_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, config_path, parse_args};
+    use super::{Cli, Invocation, config_path};
     use std::ffi::OsString;
+
+    fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
+        let Invocation::App(cli) = super::parse_args(args).unwrap() else {
+            panic!("expected GUI options")
+        };
+        cli
+    }
+
+    #[test]
+    fn non_gui_modes_are_returned_without_process_exit() {
+        assert_eq!(super::parse_args(["--help".into()]).unwrap(), Invocation::Help);
+        assert_eq!(
+            super::parse_args(["ctl".into(), "--help".into()]).unwrap(),
+            Invocation::ControlHelp
+        );
+        assert_eq!(super::parse_args(["--version".into()]).unwrap(), Invocation::Version);
+        assert!(matches!(
+            super::parse_args(["ctl".into(), "list".into()]).unwrap(),
+            Invocation::Control(_)
+        ));
+        let error = super::parse_args(["ctl".into(), "read".into()]).unwrap_err();
+        assert!(error.control);
+        assert!(error.message.contains("--pane"));
+    }
+
+    #[test]
+    fn no_restore_flag_and_global_socket_are_parsed() {
+        assert!(parse_args(["--no-restore".into()]).no_restore);
+        let Invocation::Control(cli) = super::parse_args([
+            "--socket".into(),
+            "/tmp/control.sock".into(),
+            "ctl".into(),
+            "list".into(),
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(cli.socket, Some("/tmp/control.sock".into()));
+        assert!(super::parse_args(["--socket".into(), "/tmp/control.sock".into()]).is_err());
+    }
 
     #[test]
     fn animation_overrides_are_independent_and_last_flag_wins() {

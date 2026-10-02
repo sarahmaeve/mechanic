@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::path::Path;
 use std::process::ExitStatus;
 #[cfg(test)]
 use std::sync::Condvar;
@@ -176,8 +177,25 @@ impl PtyHandle {
         size: TerminalSize,
         waker: PtyWaker,
     ) -> Result<Self, TerminalError> {
+        Self::spawn_in_directory(config, size, waker, None)
+    }
+
+    /// Start only the PTY child in `directory`, leaving the application's cwd alone.
+    /// The Unix PTY launcher ignores a failed child chdir, including a directory
+    /// removed between this validation and spawning.
+    pub fn spawn_in_directory(
+        config: &Config,
+        size: TerminalSize,
+        waker: PtyWaker,
+        directory: Option<&Path>,
+    ) -> Result<Self, TerminalError> {
         let poller = Arc::new(Poller::new().map_err(TerminalError::Io)?);
-        let mut options = Options::default();
+        let mut options = Options {
+            working_directory: directory
+                .filter(|path| path.is_absolute() && path.is_dir())
+                .map(Path::to_path_buf),
+            ..Options::default()
+        };
         if !config.shell.program.is_empty() {
             options.shell = Some(Shell::new(config.shell.program.clone(), vec![]));
         }
@@ -829,14 +847,97 @@ mod tests {
     }
 
     fn spawn_script(body: &str) -> (tempfile::TempPath, PtyHandle) {
+        spawn_script_in_directory(body, None)
+    }
+
+    fn spawn_script_in_directory(
+        body: &str,
+        directory: Option<&Path>,
+    ) -> (tempfile::TempPath, PtyHandle) {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(file, "#!/bin/sh\n{body}").unwrap();
         file.as_file().set_permissions(std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = file.into_temp_path();
         let mut config = Config::default();
         config.shell.program = path.to_str().unwrap().into();
-        let pty = PtyHandle::spawn(&config, TerminalSize::default(), Arc::new(|| {})).unwrap();
+        let pty = PtyHandle::spawn_in_directory(
+            &config,
+            TerminalSize::default(),
+            Arc::new(|| {}),
+            directory,
+        )
+        .unwrap();
         (path, pty)
+    }
+
+    #[test]
+    fn inherited_directories_are_independent_and_do_not_change_application_cwd() {
+        let original = std::env::current_dir().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("a space 雪");
+        let second = temporary.path().join("another directory");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let (_first_script, first_pty) =
+            spawn_script_in_directory("stty raw -echo; /bin/pwd -P; exec /bin/cat", Some(&first));
+        let (_second_script, second_pty) =
+            spawn_script_in_directory("stty raw -echo; /bin/pwd -P; exec /bin/cat", Some(&second));
+        let first_expected = format!("{}\n", first.canonicalize().unwrap().display());
+        let second_expected = format!("{}\n", second.canonicalize().unwrap().display());
+        assert_eq!(receive(&first_pty, first_expected.len()), first_expected.as_bytes());
+        assert_eq!(receive(&second_pty, second_expected.len()), second_expected.as_bytes());
+        assert_eq!(std::env::current_dir().unwrap(), original);
+    }
+
+    #[test]
+    fn missing_and_remote_metadata_use_the_default_child_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("missing");
+        let expected =
+            format!("{}\n", std::env::current_dir().unwrap().canonicalize().unwrap().display());
+        let mut integration = crate::shell_state::ShellIntegration::default();
+        let remote = format!("file://remote.invalid{}", temporary.path().display());
+        integration.marker(
+            &[b"7".to_vec(), remote.into_bytes()],
+            alacritty_terminal::index::Point::default(),
+            0,
+            0,
+        );
+        assert!(integration.local_working_directory().is_none());
+        for candidate in [Some(missing.as_path()), integration.local_working_directory()] {
+            let (_script, pty) =
+                spawn_script_in_directory("stty raw -echo; /bin/pwd -P; exec /bin/cat", candidate);
+            assert_eq!(receive(&pty, expected.len()), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn inaccessible_inherited_directory_falls_back_without_hiding_launch_errors() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // A privileged child can enter a mode-000 directory.
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let blocked = temporary.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let expected =
+            format!("{}\n", std::env::current_dir().unwrap().canonicalize().unwrap().display());
+        let (_script, pty) =
+            spawn_script_in_directory("stty raw -echo; /bin/pwd -P; exec /bin/cat", Some(&blocked));
+        let actual = receive(&pty, expected.len());
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(actual, expected.as_bytes());
+        let mut config = Config::default();
+        config.shell.program = "/missing-mechanic-shell".into();
+        assert!(matches!(
+            PtyHandle::spawn_in_directory(
+                &config,
+                TerminalSize::default(),
+                Arc::new(|| {}),
+                Some(&blocked)
+            ),
+            Err(TerminalError::PtySpawn(_))
+        ));
     }
 
     fn receive(pty: &PtyHandle, length: usize) -> Vec<u8> {

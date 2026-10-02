@@ -1,10 +1,16 @@
 //! TOML configuration with defaults for missing fields and ignored unknown keys.
 
+pub mod control;
 pub mod font;
+pub mod notifications;
+pub mod session;
 pub mod terminal;
 pub mod theme;
 
+pub use control::ControlConfig;
 pub use font::FontConfig;
+pub use notifications::NotificationsConfig;
+pub use session::SessionConfig;
 pub use terminal::{CloseOnExitPolicy, TerminalConfig};
 pub use theme::{AnsiColors, OpacityConfig, Rgb, SelectionColors, Theme};
 
@@ -40,6 +46,12 @@ pub struct Config {
     pub shell: ShellConfig,
     /// Scrollback and shell-exit settings.
     pub terminal: TerminalConfig,
+    /// Optional command-completion alerts for unfocused windows.
+    pub notifications: NotificationsConfig,
+    /// Restore the last workspace's layout and pane directories.
+    pub session: SessionConfig,
+    /// Enable the local control endpoint.
+    pub control: ControlConfig,
 }
 
 impl Config {
@@ -90,12 +102,25 @@ mod tests {
         assert_eq!(cfg.font.family, "Berkeley Mono");
         assert!(!cfg.shell.program.is_empty());
         assert!(cfg.shell.integration);
+        assert!(cfg.session.restore);
+        assert!(cfg.control.enabled);
     }
 
     #[test]
     fn shell_config_falls_back_to_zsh_when_env_absent() {
         let sc = ShellConfig::default();
         assert!(!sc.program.is_empty());
+    }
+
+    #[test]
+    fn session_and_control_can_be_disabled_independently() {
+        let cfg: Config =
+            toml::from_str("[session]\nrestore = false\n[control]\nenabled = false\n").unwrap();
+        assert!(!cfg.session.restore);
+        assert!(!cfg.control.enabled);
+        let partial: Config = toml::from_str("[session]\n[control]\n").unwrap();
+        assert!(partial.session.restore);
+        assert!(partial.control.enabled);
     }
 
     #[test]

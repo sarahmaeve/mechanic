@@ -1,7 +1,7 @@
 # Mechanic
 
 macOS terminal emulator using alacritty_terminal, winit, wgpu/Metal, and
-cosmic-text. Each window has its own shell, terminal state, and renderer.
+cosmic-text. Each pane has its own shell and terminal state; panes share a window renderer.
 
 ```sh
 cargo run --release -p mechanic-app
@@ -36,6 +36,16 @@ size = 14.0
 [terminal]
 scrollback_lines = 10000
 close_on_exit = "success" # always, success, never
+
+[notifications]
+enabled = false
+min_command_seconds = 10.0
+
+[session]
+restore = true
+
+[control]
+enabled = true
 ```
 
 Restart Mechanic after changing configuration.
@@ -51,6 +61,17 @@ the current grid text, not an immutable command transcript. It can include zsh's
 end-of-line marker (`%`) when command output has no final newline. Automatic
 hooks apply to the configured zsh session; nested shells need their own hooks.
 
+New windows and panes inherit the active pane's reported local directory.
+Missing, inaccessible or remote paths fall back to Mechanic's startup directory.
+This requires OSC 7 directory reports, supplied automatically by the zsh hooks.
+
+Optional completion notifications use shell command boundaries. When enabled,
+commands lasting at least `min_command_seconds` notify only while their window
+is unfocused. macOS app bundles request alert permission on the first eligible
+completion; unbundled Cargo/CLI builds request Dock attention instead. Dock
+attention has no effect while Mechanic is the active application. Notifications
+contain completion status and duration, without command text or output.
+
 Cmd+F opens a native scrollback Find panel. Return / Shift+Return and
 Cmd+G / Cmd+Shift+G move between matches; Escape closes it. Search highlights
 logical text across soft wraps, including combining marks and wide characters.
@@ -63,7 +84,48 @@ original spelling. Searches are bounded to two million cells and 10,000 matches;
 the panel reports partial results. New output invalidates highlights; press
 Return to refresh. Search does not continually rescan streaming output.
 
-Cmd+N/W opens/closes windows, Cmd+C/V copies/pastes, Cmd+K clears history,
+Cmd+N opens a window. Cmd+D splits side by side; Cmd+Shift+D stacks panes.
+Click a pane to focus it, use Cmd+[/] to cycle, or Cmd+Option+arrow to move focus
+by direction. Drag a divider to resize. Cmd+W closes the active pane (or its
+window when it is the last pane); Cmd+Shift+W closes the window. Up to 16 panes
+share one renderer per window, with independent shells, scrollback, selections
+and Find queries. Scrolling targets the hovered pane; keyboard input targets
+the focused pane. Font-size changes apply to all panes in the window.
+
+Mechanic saves window sizes/positions, pane layouts, active panes, font sizes,
+and reported local directories. Relaunching starts fresh configured shells;
+commands and terminal output are not restored. `--no-restore` starts a fresh
+workspace and saves it normally. `[session] restore = false` disables both
+loading and saving. State lives in `$XDG_STATE_HOME/mechanic/session.json`, or
+`~/.local/state/mechanic/session.json`. Only one app instance owns the saved
+workspace at a time. Cmd+Q saves the whole workspace; closing the last window
+retains its layout. Missing directories fall back to the startup directory.
+
+Local automation uses a private Unix socket restricted to the current user.
+`mechanic ctl instances` discovers running instances; `--socket PATH` chooses
+one explicitly. `mechanic ctl list` returns panes and their instance/session
+identifiers as JSON. Use the combined `INSTANCE:SESSION` handle to target a
+pane; handles expire when its shell restarts or the app exits.
+
+```sh
+mechanic ctl list
+mechanic ctl read --pane INSTANCE:SESSION --lines 100
+mechanic ctl send --pane INSTANCE:SESSION --text 'cargo test' --enter
+mechanic ctl wait --pane INSTANCE:SESSION --after 0 --timeout 30
+```
+
+`send` uses terminal paste handling; `--enter` appends Enter and `--raw` sends
+unfiltered input. Embedded newlines follow the shell's normal paste behavior.
+`--stdin` reads input from a pipe. `read` returns bounded
+recent grid text in logical order, retaining multilingual characters and joining
+soft wraps. `wait` needs OSC 133 command boundaries and returns a completion
+whose ID is greater than `--after`; capture `latest_command_id` from `list`
+before sending a new command. Recent completions remain available if the command
+finishes before `wait` arrives. Control requests and replies are JSON; errors
+and timeouts return a nonzero CLI status. `[control] enabled = false` disables
+the socket. No network listener is opened.
+
+Cmd+C/V copies/pastes, Cmd+K clears history,
 Cmd+A selects the buffer, and Cmd++/−/0 changes/resets font size. After a
 failed shell exit, Cmd+R restarts the shell.
 Cmd+Shift+A toggles logo and background animations together across all windows.

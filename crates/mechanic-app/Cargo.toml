@@ -22,11 +22,16 @@ mechanic-config.workspace = true
 arboard.workspace = true
 unicode-width = "0.2"
 url = "2"
+serde.workspace = true
+serde_json = "1"
+tempfile = "3"
+libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSButton", "NSCell", "NSControl", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSMenu", "NSMenuItem", "NSPanel", "NSResponder", "NSSearchField", "NSText", "NSTextField", "NSTextView", "NSView", "NSWindow", "NSWorkspace"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSNotification", "NSObject", "NSString", "NSURL"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSGeometry", "NSNotification", "NSObject", "NSString", "NSURL"] }
 
 [dev-dependencies]
 wgpu.workspace = true

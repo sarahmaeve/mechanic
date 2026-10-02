@@ -8,7 +8,11 @@ use mechanic_config::Config;
 use mechanic_core::{
     GridColumn, GridLine, GridPoint, GridSide, MouseProtocol, PtyWaker, Terminal, TerminalSize,
 };
-use mechanic_renderer::{CellMetrics, FrameUniforms, Renderer};
+use mechanic_renderer::{CellMetrics, FrameUniforms, RenderGrid, RenderPane, Renderer};
+
+use crate::notifications::{CompletionNotification, CompletionScope, NotificationPolicy};
+use crate::notifications_platform::NativeNotifications;
+use crate::panes::{Axis, Direction, Hit, Layout, PaneId, PaneTree, Rect, Size};
 
 use crate::mouse as mouse_enc;
 use crate::scheduling::{FramePacer, FrameSchedule, ParseQueue};
@@ -19,6 +23,11 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
+#[path = "app_control.rs"]
+mod app_control;
+#[path = "app_session.rs"]
+mod app_session;
+
 /// Target interval between animation frames (~30 FPS).
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
@@ -26,28 +35,28 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 #[derive(Debug, Clone)]
 pub enum UserEvent {
     /// Wake this window to drain queued PTY output.
-    PtyOutput(WindowId),
-    Search(WindowId, crate::search_platform::SearchAction),
+    PtyOutput(WindowId, PaneId, u64),
+    Search(WindowId, PaneId, u64, crate::search_platform::SearchAction),
+    NotificationReady(CompletionNotification),
+    Control(crate::control::ControlEvent),
 }
 
-/// State for one terminal window.
-struct AppState {
+/// Independent terminal state retained when focus or pointer routing changes.
+struct PaneState {
     search_panel: Option<crate::search_platform::SearchPanel>,
     search: crate::search::Search,
-    /// The OS window, shared with the wgpu surface via `Arc`.
-    window: Arc<Window>,
-    window_title: String,
     terminal: Terminal,
-    renderer: Renderer,
-    /// Real cell metrics from the renderer (used for resize calculations).
-    cell_metrics: CellMetrics,
+    session: u64,
+    directory: Option<std::path::PathBuf>,
+    directory_metadata: (Option<String>, Option<String>),
+    completions: std::collections::VecDeque<mechanic_core::CommandCompletion>,
+    cached_grid: Option<RenderGrid>,
     /// Current physical mouse cursor position in pixels.
     mouse_position: (f64, f64),
     pointer_inside: bool,
     hovered_link: Option<crate::hyperlinks::LinkTarget>,
     link_press: crate::link_input::LinkPress,
     link_menu_release: bool,
-    pointer_cursor: Option<CursorIcon>,
     mouse_pressed: bool,
     held_buttons: mouse_enc::HeldButtons,
     scroll_accumulator: mouse_enc::ScrollAccumulator,
@@ -55,9 +64,63 @@ struct AppState {
     mouse_press_origin: Option<(f64, f64)>,
     /// Last drag selection, pasted by middle-click independently of the clipboard.
     primary_selection: Option<String>,
-    /// Current keyboard modifier state (updated via `ModifiersChanged`).
-    modifiers: ModifiersState,
     preedit: Option<crate::preedit::Preedit>,
+    exit_status: Option<Option<std::process::ExitStatus>>,
+    /// Last reported mouse cell, used to deduplicate motion events.
+    last_mouse_report: Option<(u32, u32, mouse_enc::MouseButton)>,
+    content_dirty: bool,
+    layout_dirty: bool,
+}
+
+impl PaneState {
+    fn new(terminal: Terminal, session: u64) -> Self {
+        Self {
+            terminal,
+            session,
+            directory: None,
+            directory_metadata: (None, None),
+            completions: std::collections::VecDeque::new(),
+            cached_grid: None,
+            search_panel: None,
+            search: crate::search::Search::default(),
+            mouse_position: (0.0, 0.0),
+            pointer_inside: false,
+            hovered_link: None,
+            link_press: crate::link_input::LinkPress::default(),
+            link_menu_release: false,
+            mouse_pressed: false,
+            held_buttons: mouse_enc::HeldButtons::default(),
+            scroll_accumulator: mouse_enc::ScrollAccumulator::default(),
+            mouse_press_origin: None,
+            primary_selection: None,
+            preedit: None,
+            exit_status: None,
+            last_mouse_report: None,
+            content_dirty: true,
+            layout_dirty: true,
+        }
+    }
+}
+
+/// One native window, renderer, and pane tree. The loaded pane is swapped as a
+/// whole for event dispatch; the tree's active ID remains keyboard focus.
+struct AppState {
+    window: Arc<Window>,
+    window_title: String,
+    renderer: Renderer,
+    cell_metrics: CellMetrics,
+    pane: PaneState,
+    loaded_pane: PaneId,
+    other_panes: HashMap<PaneId, PaneState>,
+    tree: PaneTree,
+    layout: Layout,
+    divider_drag: Option<u64>,
+    captured_pane: Option<PaneId>,
+    pointer_position: (f64, f64),
+    pointer_cursor: Option<CursorIcon>,
+    hovered_preview: Option<String>,
+    modifiers: ModifiersState,
+    cancelled_ime_commit: bool,
     clipboard: Option<arboard::Clipboard>,
     /// Instant when this window was created (used to compute the `time` uniform).
     start_time: std::time::Instant,
@@ -65,13 +128,8 @@ struct AppState {
     focused: bool,
     /// Live font size in points for incremental zoom shortcuts.
     current_font_size: f32,
-    /// `None` while running; `Some(None)` means exited without a known status.
-    exit_status: Option<Option<std::process::ExitStatus>>,
-    /// Last reported mouse cell, used to deduplicate motion events.
-    last_mouse_report: Option<(u32, u32, mouse_enc::MouseButton)>,
     /// Rebuild cell instances when true; otherwise reuse the cached frame.
     content_dirty: bool,
-    layout_dirty: bool,
     /// Forced frames after focus changes, to accommodate AppKit redraw coalescing.
     focus_redraw_frames: u8,
     /// Pending focus-gain time; cleared on focus loss or bloom commitment.
@@ -82,53 +140,137 @@ struct AppState {
 }
 
 impl AppState {
+    fn pane_state(&self, id: PaneId) -> Option<&PaneState> {
+        if self.loaded_pane == id { Some(&self.pane) } else { self.other_panes.get(&id) }
+    }
+
+    fn load_pane(&mut self, id: PaneId) -> bool {
+        if self.loaded_pane == id {
+            return true;
+        }
+        let Some(mut pane) = self.other_panes.remove(&id) else {
+            return false;
+        };
+        std::mem::swap(&mut pane, &mut self.pane);
+        self.other_panes.insert(self.loaded_pane, pane);
+        self.loaded_pane = id;
+        true
+    }
+
+    fn focus_pane(&mut self, id: PaneId) {
+        if self.tree.active() == id {
+            return;
+        }
+        self.load_pane(self.tree.active());
+        self.cancel_preedit();
+        self.pane.link_press.cancel();
+        if let Some(panel) = &self.pane.search_panel {
+            panel.close();
+        }
+        self.mark_content_dirty();
+        if self.tree.focus(id) {
+            self.load_pane(id);
+            self.mark_content_dirty();
+            self.request_redraw();
+        }
+    }
+
+    fn cancel_preedit(&mut self) {
+        if self.pane.preedit.take().is_some() {
+            // End native marked text before changing the input destination. A
+            // queued commit from that cancelled composition is discarded until
+            // the native Disabled/Enabled boundary or a new preedit arrives.
+            self.cancelled_ime_commit = true;
+            self.window.set_ime_allowed(false);
+            self.window.set_ime_allowed(true);
+        }
+    }
+
+    fn has_live_pane(&self) -> bool {
+        self.pane.exit_status.is_none()
+            || self.other_panes.values().any(|p| p.exit_status.is_none())
+    }
+
+    fn minimum_pane_size(&self) -> Size {
+        Size {
+            width: (self.cell_metrics.cell_width * 8.0).ceil().max(1.0) as u32,
+            height: (self.cell_metrics.cell_height * 3.0).ceil().max(1.0) as u32,
+        }
+    }
+
+    fn resize_panes(&mut self) {
+        let size = self.window.inner_size();
+        self.layout = self.tree.layout(
+            Rect { x: 0, y: 0, width: size.width, height: size.height },
+            self.minimum_pane_size(),
+            4,
+        );
+        let active = self.tree.active();
+        for item in self.layout.panes.clone() {
+            self.load_pane(item.id);
+            self.pane.link_press.cancel();
+            self.pane.scroll_accumulator.reset();
+            self.pane.last_mouse_report = None;
+            self.pane.terminal.resize(App::terminal_size_from_metrics(
+                item.rect.width,
+                item.rect.height,
+                &self.cell_metrics,
+            ));
+            self.invalidate_search();
+            self.mark_content_dirty();
+        }
+        self.load_pane(active);
+    }
+
     fn invalidate_search(&mut self) {
-        if self.search.invalidate() {
+        if self.pane.search.invalidate() {
             self.update_search_status();
         }
     }
 
     fn update_search_status(&self) {
-        if self.search.active
-            && let Some(panel) = &self.search_panel
+        if self.pane.search.active
+            && let Some(panel) = &self.pane.search_panel
         {
-            panel.set_status(&self.search.status());
+            panel.set_status(&self.pane.search.status());
         }
     }
 
     fn show_search(&mut self, proxy: &EventLoopProxy<UserEvent>, id: WindowId) {
-        if self.search_panel.is_none() {
+        if self.pane.search_panel.is_none() {
             let proxy = proxy.clone();
+            let pane_id = self.loaded_pane;
+            let session = self.pane.session;
             match crate::search_platform::SearchPanel::new(&self.window, move |action| {
-                let _ = proxy.send_event(UserEvent::Search(id, action));
+                let _ = proxy.send_event(UserEvent::Search(id, pane_id, session, action));
             }) {
-                Ok(panel) => self.search_panel = Some(panel),
+                Ok(panel) => self.pane.search_panel = Some(panel),
                 Err(error) => {
                     log::warn!("could not open search: {error}");
                     return;
                 }
             }
         }
-        self.preedit = None;
-        self.link_press.cancel();
-        self.search.active = true;
+        self.cancel_preedit();
+        self.pane.link_press.cancel();
+        self.pane.search.active = true;
         self.update_search_status();
-        self.search_panel.as_ref().unwrap().show();
+        self.pane.search_panel.as_ref().unwrap().show();
         self.mark_content_dirty();
         self.request_redraw();
     }
 
     fn reveal_search_match(&mut self) {
-        if let Some(hit) = self.search.current() {
-            let offset = self.terminal.grid().display_offset();
+        if let Some(hit) = self.pane.search.current() {
+            let offset = self.pane.terminal.grid().display_offset();
             let top = -(offset as i32);
-            let bottom = top + self.terminal.screen_lines() as i32 - 1;
+            let bottom = top + self.pane.terminal.screen_lines() as i32 - 1;
             if hit.start.line.0 < top || hit.end.line.0 > bottom {
                 let desired = (-hit.start.line.0).max(0) as usize;
                 if desired > offset {
-                    self.terminal.scroll_up(desired - offset);
+                    self.pane.terminal.scroll_up(desired - offset);
                 } else {
-                    self.terminal.scroll_down(offset - desired);
+                    self.pane.terminal.scroll_down(offset - desired);
                 }
             }
         }
@@ -139,42 +281,44 @@ impl AppState {
 
     fn mark_content_dirty(&mut self) {
         self.content_dirty = true;
-        self.layout_dirty = true;
+        self.pane.content_dirty = true;
+        self.pane.layout_dirty = true;
     }
 
     fn link_under_pointer(&self) -> Option<alacritty_terminal::term::cell::Hyperlink> {
-        if !self.pointer_inside || !self.focused || self.preedit.is_some() {
+        if !self.pane.pointer_inside || !self.focused || self.pane.preedit.is_some() {
             return None;
         }
         let (col, row) = link_cell(
-            self.mouse_position,
+            self.pane.mouse_position,
             &self.cell_metrics,
-            self.terminal.columns(),
-            self.terminal.screen_lines(),
+            self.pane.terminal.columns(),
+            self.pane.terminal.screen_lines(),
         )?;
-        let (logical_col, _) = self.renderer.logical_column(col, row);
-        crate::hyperlinks::at(&self.terminal, logical_col, row)
+        let (logical_col, _) = self.renderer.pane_logical_column(self.loaded_pane, col, row);
+        crate::hyperlinks::at(&self.pane.terminal, logical_col, row)
     }
 
     fn refresh_link_hover(&mut self) {
         let target = self.link_under_pointer();
-        let unchanged = match (&self.hovered_link, &target) {
+        let unchanged = match (&self.pane.hovered_link, &target) {
             (Some(current), Some(target)) => current.matches(target),
             (None, None) => true,
             _ => false,
         };
         if !unchanged {
             let next = target.map(crate::hyperlinks::LinkTarget::new);
-            let preview = next.as_ref().map(|link| link.preview());
-            if self.hovered_link.as_ref().map(|link| link.preview()) != preview
-                && let Err(error) = crate::link_platform::set_hover(&self.window, preview)
-            {
+            self.pane.hovered_link = next;
+        }
+        let preview = self.pane.hovered_link.as_ref().map(|link| link.preview().to_owned());
+        if self.hovered_preview != preview {
+            if let Err(error) = crate::link_platform::set_hover(&self.window, preview.as_deref()) {
                 log::warn!("link preview failed: {error}");
             }
-            self.hovered_link = next;
+            self.hovered_preview = preview;
         }
         let clickable = self.modifiers.super_key()
-            && self.hovered_link.as_ref().is_some_and(|link| link.can_open());
+            && self.pane.hovered_link.as_ref().is_some_and(|link| link.can_open());
         let icon = if clickable { CursorIcon::Pointer } else { CursorIcon::Text };
         if self.pointer_cursor != Some(icon) {
             self.window.set_cursor(icon);
@@ -202,7 +346,15 @@ pub struct App {
     animations: mechanic_config::theme::AnimationConfig,
     /// Allows forwarding mouse events when the terminal program requests them.
     mouse_tracking: bool,
-    pending_parsers: ParseQueue<WindowId>,
+    pending_parsers: ParseQueue<(WindowId, PaneId, u64)>,
+    notification_policy: NotificationPolicy,
+    native_notifications: NativeNotifications,
+    /// Never reuse a PTY identity even when the platform reuses a WindowId.
+    next_session: u64,
+    session_service: app_session::SessionService,
+    control_service: app_control::ControlService,
+    #[cfg(test)]
+    pub(crate) hidden_windows: bool,
 }
 
 impl App {
@@ -213,6 +365,12 @@ impl App {
         mouse_tracking: bool,
     ) -> Self {
         animations.logo &= config.theme.logo_size > 0;
+        let notification_policy = NotificationPolicy::new(&config.notifications);
+        let notification_proxy = proxy.clone();
+        let native_notifications =
+            NativeNotifications::new(config.notifications.enabled, move |ready| {
+                let _ = notification_proxy.send_event(UserEvent::NotificationReady(ready));
+            });
         Self {
             config,
             windows: HashMap::new(),
@@ -220,11 +378,22 @@ impl App {
             animations,
             mouse_tracking,
             pending_parsers: ParseQueue::new(),
+            notification_policy,
+            native_notifications,
+            next_session: 1,
+            session_service: app_session::SessionService::default(),
+            control_service: app_control::ControlService::default(),
+            #[cfg(test)]
+            hidden_windows: false,
         }
     }
 
-    fn make_waker(&self, window_id: WindowId) -> PtyWaker {
-        make_waker_for(&self.proxy, window_id)
+    fn make_waker(&self, window_id: WindowId, pane_id: PaneId, session: u64) -> PtyWaker {
+        make_waker_for(&self.proxy, window_id, pane_id, session)
+    }
+
+    fn allocate_session(&mut self) -> Option<u64> {
+        allocate_session_token(&mut self.next_session)
     }
 
     fn toggle_animations(&mut self) {
@@ -239,35 +408,75 @@ impl App {
 
     /// Remove a window and exit the event loop if no windows remain.
     fn close_window(&mut self, id: WindowId, event_loop: &ActiveEventLoop) {
-        self.windows.remove(&id);
-        self.pending_parsers.remove(&id);
+        // The last close retains the final nonempty layout for the next launch.
+        if self.windows.len() == 1 && self.windows.contains_key(&id) {
+            self.note_session_change();
+        }
+        if let Some(state) = self.windows.remove(&id) {
+            for pane in state.tree.pane_ids() {
+                let session = if pane == state.loaded_pane {
+                    state.pane.session
+                } else {
+                    state.other_panes[&pane].session
+                };
+                self.pending_parsers.remove(&(id, pane, session));
+                self.control_service.retire(session, crate::control::ErrorCode::Closed);
+            }
+        }
+        self.notification_policy.forget_window(id);
+        self.note_session_change();
         if self.windows.is_empty() {
+            self.flush_session();
             log::info!("all windows closed — exiting");
             event_loop.exit();
         }
     }
 
     fn pump_parser(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(id) = self.pending_parsers.pop() else {
+        let Some((id, pane_id, session)) = self.pending_parsers.pop() else {
             return;
         };
         let Some(state) = self.windows.get_mut(&id) else {
             return;
         };
-        if state.exit_status.is_some() {
+        if !state.load_pane(pane_id)
+            || state.pane.session != session
+            || state.pane.exit_status.is_some()
+        {
+            state.load_pane(state.tree.active());
             return;
         }
-        let mouse_protocol = state.terminal.mouse_protocol();
-        let outcome = state.terminal.process_input();
-        if state.terminal.mouse_protocol() != mouse_protocol
+        let mouse_protocol = state.pane.terminal.mouse_protocol();
+        let outcome = state.pane.terminal.process_input();
+        let directory_changed = app_session::refresh_directory(&mut state.pane);
+        for completion in state.pane.terminal.drain_command_completions().collect::<Vec<_>>() {
+            self.control_service.complete(session, &completion);
+            if self.control_service.server.is_some() {
+                state.pane.completions.push_back(completion.clone());
+                if state.pane.completions.len() > app_control::MAX_COMPLETIONS {
+                    state.pane.completions.pop_front();
+                }
+            }
+            let scope = CompletionScope { window: id, pane: pane_id, session };
+            if let Some(notification) =
+                self.notification_policy.consider(scope, state.focused, &completion)
+            {
+                self.native_notifications.deliver(&state.window, notification);
+            }
+        }
+        if state.pane.terminal.mouse_protocol() != mouse_protocol
             || outcome.child_exit.is_some()
             || outcome.io_error.is_some()
         {
-            state.scroll_accumulator.reset();
-            state.last_mouse_report = None;
+            state.pane.scroll_accumulator.reset();
+            state.pane.last_mouse_report = None;
         }
         if outcome.child_exit.is_some() || outcome.io_error.is_some() {
-            state.preedit = None;
+            if pane_id == state.tree.active() {
+                state.cancel_preedit();
+            } else {
+                state.pane.preedit = None;
+            }
         }
         if outcome.grid_maybe_changed {
             state.invalidate_search();
@@ -279,16 +488,16 @@ impl App {
         if let Some(error) = outcome.io_error {
             state.invalidate_search();
             log::error!("window {id:?} PTY transport failed: {error}");
-            state.terminal.inject_local(
+            state.pane.terminal.inject_local(
                 b"\r\n\x1b[31m[terminal I/O failed; Cmd+R to restart, any key to close]\x1b[0m\r\n",
             );
-            state.exit_status = Some(None);
+            state.pane.exit_status = Some(None);
             state.mark_content_dirty();
             state.request_redraw();
         }
 
         if let Some(status) = outcome.child_exit
-            && state.exit_status.is_none()
+            && state.pane.exit_status.is_none()
         {
             let should_close = match self.config.terminal.close_on_exit {
                 mechanic_config::CloseOnExitPolicy::Always => true,
@@ -301,36 +510,38 @@ impl App {
                 if should_close { "closing" } else { "freezing" },
             );
             if should_close {
-                self.close_window(id, event_loop);
+                self.close_pane(id, pane_id, event_loop);
                 return;
             }
-            inject_exit_banner(&mut state.terminal, status);
+            inject_exit_banner(&mut state.pane.terminal, status);
             state.invalidate_search();
-            state.exit_status = Some(status);
+            state.pane.exit_status = Some(status);
             state.mark_content_dirty();
             state.request_redraw();
         }
 
-        if state.exit_status.is_some() {
-            self.pending_parsers.remove(&id);
+        if state.pane.exit_status.is_some() {
+            self.control_service.retire(session, crate::control::ErrorCode::Closed);
+            self.pending_parsers.remove(&(id, pane_id, session));
         } else if outcome.more_output {
-            self.pending_parsers.enqueue(id);
+            self.pending_parsers.enqueue((id, pane_id, session));
+        }
+        state.load_pane(state.tree.active());
+        if directory_changed {
+            self.note_session_change();
         }
     }
 
     /// Update font metrics and resize the terminal to match.
     fn apply_font_size(state: &mut AppState, new_size: f32) {
-        state.link_press.cancel();
+        state.pane.link_press.cancel();
         let new_metrics = state.renderer.set_font_size(new_size);
         state.cell_metrics = new_metrics;
-        state.scroll_accumulator.reset();
-        state.last_mouse_report = None;
+        state.pane.scroll_accumulator.reset();
+        state.pane.last_mouse_report = None;
         state.current_font_size = new_size;
 
-        let inner = state.window.inner_size();
-        let term_size = Self::terminal_size_from_metrics(inner.width, inner.height, &new_metrics);
-        state.terminal.resize(term_size);
-        state.invalidate_search();
+        state.resize_panes();
 
         state.mark_content_dirty();
         state.request_redraw();
@@ -353,13 +564,59 @@ impl App {
     }
 
     /// Spawn a new Mechanic window with its own PTY, terminal, and renderer.
-    fn spawn_window(&mut self, event_loop: &ActiveEventLoop) -> Option<WindowId> {
+    fn spawn_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        directory: Option<&std::path::Path>,
+    ) -> Option<WindowId> {
+        self.spawn_window_with_snapshot(event_loop, directory, None)
+    }
+
+    fn spawn_restored_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        snapshot: &crate::session::WindowSnapshot,
+    ) -> Option<WindowId> {
+        self.spawn_window_with_snapshot(event_loop, None, Some(snapshot))
+    }
+
+    fn spawn_window_with_snapshot(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        directory: Option<&std::path::Path>,
+        snapshot: Option<&crate::session::WindowSnapshot>,
+    ) -> Option<WindowId> {
+        let session = self.allocate_session()?;
+        if self.windows.len() >= crate::session::MAX_WINDOWS {
+            return None;
+        }
+        let mut tree = match snapshot {
+            Some(snapshot) => PaneTree::from_snapshot(snapshot.panes.clone()).ok()?,
+            None => PaneTree::new(1),
+        };
+        let pane_id = tree.pane_ids()[0];
+        let directory = snapshot
+            .and_then(|snapshot| snapshot.directories.get(&pane_id))
+            .map(std::path::PathBuf::as_path)
+            .or(directory);
+        let font_size = snapshot.map_or(self.config.font.size, |snapshot| snapshot.font_size);
         let offset = (self.windows.len() as i32).saturating_mul(24);
+        let logical_size = snapshot.map_or([1024.0, 768.0], |snapshot| snapshot.logical_size);
         let mut attrs = WindowAttributes::default()
             .with_title("Mechanic")
-            .with_inner_size(LogicalSize::new(1024u32, 768u32))
+            .with_inner_size(LogicalSize::new(logical_size[0], logical_size[1]))
             .with_transparent(true);
-        if offset > 0 {
+        #[cfg(test)]
+        {
+            attrs = attrs.with_visible(!self.hidden_windows);
+        }
+        if let Some(position) =
+            snapshot.and_then(|snapshot| snapshot.logical_position).filter(|position| {
+                app_session::position_is_visible(event_loop, *position, logical_size)
+            })
+        {
+            attrs = attrs.with_position(winit::dpi::LogicalPosition::new(position[0], position[1]));
+        } else if offset > 0 {
             attrs = attrs.with_position(PhysicalPosition::new(offset, offset));
         }
 
@@ -374,12 +631,14 @@ impl App {
         let size = window.inner_size();
         let scale_factor = window.scale_factor() as f32;
 
+        let mut font = self.config.font.clone();
+        font.size = font_size;
         let renderer = match pollster::block_on(Renderer::new(
             window.clone(),
             (size.width, size.height),
             scale_factor,
             &self.config.theme,
-            self.config.font.clone(),
+            font,
         )) {
             Ok(r) => r,
             Err(e) => {
@@ -393,14 +652,62 @@ impl App {
             Self::terminal_size_from_metrics(size.width, size.height, &cell_metrics);
 
         let window_id = window.id();
-        let waker = self.make_waker(window_id);
-        let terminal = match Terminal::new(&self.config, terminal_size, waker) {
-            Ok(t) => t,
-            Err(e) => {
-                log::error!("failed to create terminal: {e}");
-                return None;
+        let waker = self.make_waker(window_id, pane_id, session);
+        let terminal =
+            match Terminal::new_in_directory(&self.config, terminal_size, waker.clone(), directory)
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    log::error!("failed to create terminal: {e}");
+                    // A saved directory may disappear between checking and
+                    // spawn. Retry the configured shell at its normal cwd.
+                    match Terminal::new_in_directory(&self.config, terminal_size, waker, None) {
+                        Ok(terminal) => terminal,
+                        Err(error) => {
+                            log::error!("terminal fallback failed: {error}");
+                            return None;
+                        }
+                    }
+                }
+            };
+        let mut pane = PaneState::new(terminal, session);
+        pane.directory = directory
+            .filter(|path| path.is_dir())
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok());
+        let mut other_panes = HashMap::new();
+        if let Some(snapshot) = snapshot {
+            for other_id in tree.pane_ids().into_iter().filter(|id| *id != pane_id) {
+                let Some(other_session) = self.allocate_session() else {
+                    tree.close(other_id);
+                    continue;
+                };
+                let directory =
+                    snapshot.directories.get(&other_id).map(std::path::PathBuf::as_path);
+                let waker = self.make_waker(window_id, other_id, other_session);
+                let terminal = Terminal::new_in_directory(
+                    &self.config,
+                    terminal_size,
+                    waker.clone(),
+                    directory,
+                )
+                .or_else(|_| Terminal::new_in_directory(&self.config, terminal_size, waker, None));
+                match terminal {
+                    Ok(terminal) => {
+                        let mut pane = PaneState::new(terminal, other_session);
+                        pane.directory = directory
+                            .filter(|path| path.is_dir())
+                            .map(std::path::Path::to_path_buf)
+                            .or_else(|| std::env::current_dir().ok());
+                        other_panes.insert(other_id, pane);
+                    }
+                    Err(error) => {
+                        log::warn!("could not restore pane {other_id}: {error}");
+                        tree.close(other_id);
+                    }
+                }
             }
-        };
+        }
 
         let clipboard =
             arboard::Clipboard::new().map_err(|e| log::warn!("clipboard unavailable: {e}")).ok();
@@ -409,46 +716,117 @@ impl App {
 
         let now = std::time::Instant::now();
         let mut state = AppState {
-            search_panel: None,
-            search: crate::search::Search::default(),
             window: window.clone(),
             window_title: "Mechanic".into(),
-            terminal,
             renderer,
             cell_metrics,
-            mouse_position: (0.0, 0.0),
-            pointer_inside: false,
-            hovered_link: None,
-            link_press: crate::link_input::LinkPress::default(),
-            link_menu_release: false,
+            loaded_pane: pane_id,
+            other_panes,
+            tree,
+            layout: PaneTree::new(pane_id).layout(
+                Rect { x: 0, y: 0, width: size.width, height: size.height },
+                Size { width: 1, height: 1 },
+                4,
+            ),
+            divider_drag: None,
+            captured_pane: None,
+            pointer_position: (0.0, 0.0),
+            pane,
             pointer_cursor: None,
-            mouse_pressed: false,
-            held_buttons: mouse_enc::HeldButtons::default(),
-            scroll_accumulator: mouse_enc::ScrollAccumulator::default(),
-            mouse_press_origin: None,
-            primary_selection: None,
+            hovered_preview: None,
             modifiers: ModifiersState::empty(),
-            preedit: None,
+            cancelled_ime_commit: false,
             clipboard,
             start_time: now,
             focused: true,
-            current_font_size: self.config.font.size,
-            exit_status: None,
-            last_mouse_report: None,
+            current_font_size: font_size,
             content_dirty: true,
-            layout_dirty: true,
             focus_redraw_frames: FOCUS_REDRAW_BURST_FRAMES,
             focus_gain_at: self.animations.logo.then_some(now),
             bloom_start: None,
             frame_pacer: FramePacer::new(now),
         };
 
+        state.resize_panes();
         state.request_redraw();
+        for pane_id in state.tree.pane_ids() {
+            let session = state.pane_state(pane_id)?.session;
+            self.pending_parsers.enqueue((window_id, pane_id, session));
+        }
         self.windows.insert(window_id, state);
-        self.pending_parsers.enqueue(window_id);
+        self.note_session_change();
 
         log::info!("spawned window {window_id:?} (total: {})", self.windows.len());
         Some(window_id)
+    }
+
+    fn split_pane(&mut self, id: WindowId, axis: Axis) -> Option<PaneId> {
+        let session = self.allocate_session()?;
+        let state = self.windows.get_mut(&id)?;
+        state.load_pane(state.tree.active());
+        if !state.tree.can_split_active(axis, &state.layout) {
+            return None;
+        }
+        let directory = state.pane.directory.clone();
+        let original = state.loaded_pane;
+        let pane_id = state.tree.split_active(axis)?;
+        let size = state.pane.terminal.size();
+        let waker = make_waker_for(&self.proxy, id, pane_id, session);
+        let terminal =
+            match Terminal::new_in_directory(&self.config, size, waker, directory.as_deref()) {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    state.tree.close(pane_id);
+                    state.tree.focus(original);
+                    log::error!("could not split pane: {error}");
+                    return None;
+                }
+            };
+        state.cancel_preedit();
+        state.pane.link_press.cancel();
+        if let Some(panel) = &state.pane.search_panel {
+            panel.close();
+        }
+        let mut pane = PaneState::new(terminal, session);
+        pane.directory = directory.or_else(|| std::env::current_dir().ok());
+        state.other_panes.insert(pane_id, pane);
+        state.resize_panes();
+        state.request_redraw();
+        self.pending_parsers.enqueue((id, pane_id, session));
+        self.note_session_change();
+        Some(pane_id)
+    }
+
+    fn close_pane(&mut self, id: WindowId, pane_id: PaneId, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.windows.get_mut(&id) else {
+            return;
+        };
+        if !state.tree.pane_ids().contains(&pane_id) {
+            return;
+        }
+        if state.tree.len() == 1 {
+            self.close_window(id, event_loop);
+            return;
+        }
+        state.load_pane(pane_id);
+        let session = state.pane.session;
+        state.cancel_preedit();
+        self.notification_policy.forget_scope(CompletionScope {
+            window: id,
+            pane: pane_id,
+            session,
+        });
+        if state.captured_pane == Some(pane_id) {
+            state.captured_pane = None;
+        }
+        state.tree.close(pane_id);
+        state.load_pane(state.tree.active());
+        state.other_panes.remove(&pane_id);
+        self.pending_parsers.remove(&(id, pane_id, session));
+        self.control_service.retire(session, crate::control::ErrorCode::Closed);
+        state.resize_panes();
+        state.request_redraw();
+        self.note_session_change();
     }
 }
 
@@ -476,12 +854,13 @@ fn pixel_to_grid_point(
 
 fn logical_selection_point(
     renderer: &Renderer,
+    pane_id: PaneId,
     mut point: GridPoint,
     mut side: GridSide,
     display_offset: usize,
 ) -> (GridPoint, GridSide) {
     let row = (point.line.0 + display_offset as i32).max(0) as usize;
-    let (col, rtl) = renderer.logical_column(point.column.0, row);
+    let (col, rtl) = renderer.pane_logical_column(pane_id, point.column.0, row);
     point.column = GridColumn(col);
     if rtl {
         side = match side {
@@ -492,18 +871,13 @@ fn logical_selection_point(
     (point, side)
 }
 
-impl ApplicationHandler<UserEvent> for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if !self.windows.is_empty() {
-            return;
-        }
-
-        if self.spawn_window(event_loop).is_none() {
-            event_loop.exit();
-        }
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+impl App {
+    fn dispatch_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        id: WindowId,
+        event: WindowEvent,
+    ) {
         if let WindowEvent::KeyboardInput { event: ref key_event, .. } = event
             && key_event.state == ElementState::Pressed
         {
@@ -518,17 +892,21 @@ impl ApplicationHandler<UserEvent> for App {
             }
             if let (Some(modifiers), Key::Character(c)) =
                 (modifiers_snapshot, &key_event.logical_key)
-                && modifiers.super_key()
+                && modifiers == ModifiersState::SUPER
                 && let Some(shortcut) = cmd_shortcut(c.as_str())
                 && shortcut.is_app_level()
             {
                 match shortcut {
                     CmdShortcut::SpawnWindow => {
-                        let _ = self.spawn_window(event_loop);
+                        let directory =
+                            self.windows.get(&id).and_then(|state| state.pane.directory.clone());
+                        let _ = self.spawn_window(event_loop, directory.as_deref());
                     }
                     CmdShortcut::CloseWindow => {
-                        self.close_window(id, event_loop);
+                        let pane = self.windows[&id].tree.active();
+                        self.close_pane(id, pane, event_loop);
                     }
+                    CmdShortcut::Quit => self.quit(event_loop),
                     other => {
                         debug_assert!(!other.is_app_level());
                     }
@@ -541,7 +919,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
 
-        if state.layout_dirty
+        if state.pane.layout_dirty
             && matches!(
                 &event,
                 WindowEvent::MouseInput { .. }
@@ -551,10 +929,13 @@ impl ApplicationHandler<UserEvent> for App {
                     | WindowEvent::CursorEntered { .. }
             )
         {
-            let grid =
-                crate::convert::convert_grid(&state.terminal, &self.config.theme, state.focused);
-            state.renderer.prepare_layout(&grid);
-            state.layout_dirty = false;
+            let grid = crate::convert::convert_grid(
+                &state.pane.terminal,
+                &self.config.theme,
+                state.focused,
+            );
+            state.renderer.prepare_pane_layout(state.loaded_pane, &grid);
+            state.pane.layout_dirty = false;
         }
 
         match event {
@@ -564,24 +945,27 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::Resized(size) => {
-                state.link_press.cancel();
-                state.scroll_accumulator.reset();
-                state.last_mouse_report = None;
+                state.pane.link_press.cancel();
+                state.pane.scroll_accumulator.reset();
+                state.pane.last_mouse_report = None;
                 state.renderer.resize((size.width, size.height));
 
-                let new_term_size =
-                    Self::terminal_size_from_metrics(size.width, size.height, &state.cell_metrics);
-                state.terminal.resize(new_term_size);
-                state.invalidate_search();
+                state.resize_panes();
 
                 state.mark_content_dirty();
                 state.request_redraw();
             }
 
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                state.cell_metrics = state.renderer.set_scale_factor(scale_factor as f32);
+                state.resize_panes();
+                state.request_redraw();
+            }
+
             WindowEvent::ModifiersChanged(mods) => {
                 if state.modifiers != mods.state() {
-                    state.scroll_accumulator.reset();
-                    state.last_mouse_report = None;
+                    state.pane.scroll_accumulator.reset();
+                    state.pane.last_mouse_report = None;
                 }
                 state.modifiers = mods.state();
                 state.refresh_link_hover();
@@ -590,20 +974,33 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(focused) => {
                 log::debug!("window {id:?} focused: {focused}");
                 state.focused = focused;
-                state.mark_content_dirty();
+                let active = state.tree.active();
+                if !focused {
+                    state.load_pane(active);
+                    state.cancel_preedit();
+                }
+                for pane in state.tree.pane_ids() {
+                    state.load_pane(pane);
+                    if !focused {
+                        state.pane.link_press.cancel();
+                        state.pane.preedit = None;
+                        state.pane.held_buttons.clear();
+                        state.pane.mouse_pressed = false;
+                        state.pane.mouse_press_origin = None;
+                        state.pane.last_mouse_report = None;
+                        state.pane.scroll_accumulator.reset();
+                    }
+                    state.mark_content_dirty();
+                }
+                state.load_pane(active);
                 state.focus_redraw_frames = FOCUS_REDRAW_BURST_FRAMES;
 
                 if focused {
                     state.focus_gain_at = self.animations.logo.then(Instant::now);
                     state.bloom_start = None;
                 } else {
-                    state.link_press.cancel();
-                    state.preedit = None;
-                    state.held_buttons.clear();
-                    state.mouse_pressed = false;
-                    state.mouse_press_origin = None;
-                    state.last_mouse_report = None;
-                    state.scroll_accumulator.reset();
+                    state.captured_pane = None;
+                    state.divider_drag = None;
                     // Cancel pending bloom; let an already committed animation finish.
                     state.focus_gain_at = None;
                 }
@@ -615,7 +1012,7 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 if key_event.state == ElementState::Pressed {
-                    state.link_press.cancel();
+                    state.pane.link_press.cancel();
                 }
                 if key_event.state == ElementState::Pressed {
                     match workspace_shortcut(&key_event.logical_key, state.modifiers) {
@@ -625,25 +1022,25 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Some(WorkspaceShortcut::FindNext | WorkspaceShortcut::FindPrevious) => {
                             let backwards = state.modifiers.shift_key();
-                            if !state.search.active {
+                            if !state.pane.search.active {
                                 state.show_search(&self.proxy, id);
                             }
-                            state.search.navigate(&state.terminal, backwards);
+                            state.pane.search.navigate(&state.pane.terminal, backwards);
                             state.reveal_search_match();
                             return;
                         }
                         Some(WorkspaceShortcut::PreviousPrompt | WorkspaceShortcut::NextPrompt) => {
                             if key_event.logical_key == Key::Named(NamedKey::ArrowUp) {
-                                state.terminal.jump_to_previous_prompt();
+                                state.pane.terminal.jump_to_previous_prompt();
                             } else {
-                                state.terminal.jump_to_next_prompt();
+                                state.pane.terminal.jump_to_next_prompt();
                             }
                             state.mark_content_dirty();
                             state.request_redraw();
                             return;
                         }
                         Some(WorkspaceShortcut::CopyCommandOutput) => {
-                            if let Some(output) = state.terminal.last_command_output()
+                            if let Some(output) = state.pane.terminal.last_command_output()
                                 && let Some(clipboard) = &mut state.clipboard
                                 && let Err(error) = clipboard.set_text(output)
                             {
@@ -654,15 +1051,29 @@ impl ApplicationHandler<UserEvent> for App {
                         None => {}
                     }
                 }
-                if state.exit_status.is_some() && key_event.state == ElementState::Pressed {
+                if state.pane.exit_status.is_some() && key_event.state == ElementState::Pressed {
                     let key = &key_event.logical_key;
                     let mods = state.modifiers;
 
                     if mods.super_key() && matches!(key, Key::Character(c) if c.as_str() == "r") {
-                        let waker = make_waker_for(&self.proxy, id);
-                        respawn_shell(state, &self.config, id, waker);
-                        if state.exit_status.is_none() {
-                            self.pending_parsers.enqueue(id);
+                        let pane_id = state.loaded_pane;
+                        let old_session = state.pane.session;
+                        let Some(session) = allocate_session_token(&mut self.next_session) else {
+                            log::error!("terminal session identity space exhausted");
+                            return;
+                        };
+                        let waker = make_waker_for(&self.proxy, id, pane_id, session);
+                        respawn_shell(state, &self.config, id, waker, session);
+                        if state.pane.exit_status.is_none() {
+                            self.control_service
+                                .retire(old_session, crate::control::ErrorCode::Restarted);
+                            self.pending_parsers.remove(&(id, pane_id, old_session));
+                            self.notification_policy.forget_scope(CompletionScope {
+                                window: id,
+                                pane: pane_id,
+                                session: old_session,
+                            });
+                            self.pending_parsers.enqueue((id, pane_id, state.pane.session));
                         }
                         return;
                     }
@@ -672,7 +1083,8 @@ impl ApplicationHandler<UserEvent> for App {
 
                     if !allow_fall_through {
                         if !mods.super_key() && is_dismissal_key(key) {
-                            self.close_window(id, event_loop);
+                            let pane_id = state.loaded_pane;
+                            self.close_pane(id, pane_id, event_loop);
                         }
                         return;
                     }
@@ -684,11 +1096,11 @@ impl ApplicationHandler<UserEvent> for App {
                     && let Some(shortcut) = cmd_shortcut(c.as_str())
                 {
                     match shortcut {
-                        CmdShortcut::SpawnWindow | CmdShortcut::CloseWindow => {
+                        CmdShortcut::SpawnWindow | CmdShortcut::CloseWindow | CmdShortcut::Quit => {
                             debug_assert!(shortcut.is_app_level());
                         }
                         CmdShortcut::Copy => {
-                            if let Some(text) = state.terminal.selection_text()
+                            if let Some(text) = state.pane.terminal.selection_text()
                                 && let Some(cb) = state.clipboard.as_mut()
                                 && let Err(e) = cb.set_text(text)
                             {
@@ -699,7 +1111,7 @@ impl ApplicationHandler<UserEvent> for App {
                         CmdShortcut::Paste => {
                             if let Some(cb) = state.clipboard.as_mut()
                                 && let Ok(text) = cb.get_text()
-                                && let Err(e) = state.terminal.paste(&text)
+                                && let Err(e) = state.pane.terminal.paste(&text)
                             {
                                 log::warn!("PTY paste failed: {e}");
                             }
@@ -708,14 +1120,14 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         CmdShortcut::ClearScrollback => {
-                            state.terminal.clear_history();
+                            state.pane.terminal.clear_history();
                             state.invalidate_search();
                             state.mark_content_dirty();
                             state.request_redraw();
                             return;
                         }
                         CmdShortcut::SelectAll => {
-                            state.terminal.select_all();
+                            state.pane.terminal.select_all();
                             state.mark_content_dirty();
                             state.request_redraw();
                             return;
@@ -735,7 +1147,7 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         CmdShortcut::ReadlineUndo => {
-                            if let Err(e) = state.terminal.write_to_pty(b"\x1f") {
+                            if let Err(e) = state.pane.terminal.write_to_pty(b"\x1f") {
                                 log::warn!("PTY undo write failed: {e}");
                             }
                             state.mark_content_dirty();
@@ -748,13 +1160,13 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(bytes) = crate::input::translate_key(
                     &key_event,
                     state.modifiers,
-                    state.terminal.cursor_app_mode(),
+                    state.pane.terminal.cursor_app_mode(),
                 ) {
                     // Escape must still reach programs such as vim when a selection exists.
-                    if state.terminal.selection_range().is_some() {
-                        state.terminal.clear_selection();
+                    if state.pane.terminal.selection_range().is_some() {
+                        state.pane.terminal.clear_selection();
                     }
-                    if let Err(e) = state.terminal.write_to_pty(&bytes) {
+                    if let Err(e) = state.pane.terminal.write_to_pty(&bytes) {
                         log::warn!("PTY write failed: {e}");
                     }
                 }
@@ -765,36 +1177,52 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Ime(ime_event) => {
                 match ime_event {
                     Ime::Commit(text) => {
-                        state.preedit = None;
-                        if let Err(e) = state.terminal.write_to_pty(text.as_bytes()) {
+                        state.pane.preedit = None;
+                        if state.cancelled_ime_commit {
+                            state.cancelled_ime_commit = false;
+                            state.mark_content_dirty();
+                            state.request_redraw();
+                            return;
+                        }
+                        if let Err(e) = state.pane.terminal.write_to_pty(text.as_bytes()) {
                             log::warn!("PTY IME commit failed: {e}");
                         }
                     }
                     Ime::Preedit(text, cursor) => {
-                        state.preedit = crate::preedit::Preedit::new(text, cursor);
+                        if !text.is_empty() {
+                            state.cancelled_ime_commit = false;
+                        }
+                        state.pane.preedit = crate::preedit::Preedit::new(text, cursor);
                         let mut grid = crate::convert::convert_grid(
-                            &state.terminal,
+                            &state.pane.terminal,
                             &self.config.theme,
-                            state.focused && state.preedit.is_none(),
+                            state.focused && state.pane.preedit.is_none(),
                         );
-                        if let Some(preedit) = &state.preedit {
+                        if let Some(preedit) = &state.pane.preedit {
                             preedit.overlay(&mut grid, &self.config.theme);
                         }
-                        state.renderer.prepare_layout(&grid);
+                        state.renderer.prepare_pane_layout(state.loaded_pane, &grid);
                         let (cx, cy) = grid.cursor_position;
                         let cw = state.cell_metrics.cell_width;
                         let ch = state.cell_metrics.cell_height;
                         if cx < grid.cols && cy < grid.rows {
-                            let px = state.renderer.visual_column(cx, cy) as f64 * cw as f64;
-                            let py = cy as f64 * ch as f64;
+                            let rect = state.layout.pane(state.loaded_pane).unwrap();
+                            let px = f64::from(rect.x)
+                                + state.renderer.pane_visual_column(state.loaded_pane, cx, cy)
+                                    as f64
+                                    * cw as f64;
+                            let py = f64::from(rect.y) + cy as f64 * ch as f64;
                             state.window.set_ime_cursor_area(
                                 winit::dpi::PhysicalPosition::new(px, py),
                                 winit::dpi::PhysicalSize::new(cw as f64, ch as f64),
                             );
                         }
                     }
-                    Ime::Disabled => state.preedit = None,
-                    Ime::Enabled => {}
+                    Ime::Disabled => {
+                        state.pane.preedit = None;
+                        state.cancelled_ime_commit = false;
+                    }
+                    Ime::Enabled => state.cancelled_ime_commit = false,
                 }
                 state.mark_content_dirty();
                 state.request_redraw();
@@ -802,36 +1230,36 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::MouseInput { state: btn_state, button: win_button, .. } => {
                 let route = route_mouse(
-                    state.terminal.mouse_protocol(),
+                    state.pane.terminal.mouse_protocol(),
                     self.mouse_tracking,
                     state.modifiers.shift_key(),
-                    state.exit_status.is_some(),
+                    state.pane.exit_status.is_some(),
                 );
 
                 state.refresh_link_hover();
                 if win_button == MouseButton::Left && btn_state == ElementState::Pressed {
-                    state.link_press = crate::link_input::LinkPress::default();
+                    state.pane.link_press = crate::link_input::LinkPress::default();
                 } else if btn_state == ElementState::Pressed {
-                    state.link_press.cancel();
+                    state.pane.link_press.cancel();
                 }
                 if win_button == MouseButton::Left
                     && btn_state == ElementState::Released
-                    && state.link_press.active()
+                    && state.pane.link_press.active()
                 {
-                    state.link_press.moved(state.mouse_position);
+                    state.pane.link_press.moved(state.pane.mouse_position);
                     let current = state.link_under_pointer();
-                    if let Some(target) = state.link_press.release(current.as_ref()) {
+                    if let Some(target) = state.pane.link_press.release(current.as_ref()) {
                         open_link(&crate::hyperlinks::LinkTarget::new(target));
                     }
                     return;
                 }
                 if win_button == MouseButton::Right {
-                    if btn_state == ElementState::Released && state.link_menu_release {
-                        state.link_menu_release = false;
+                    if btn_state == ElementState::Released && state.pane.link_menu_release {
+                        state.pane.link_menu_release = false;
                         return;
                     }
                     if btn_state == ElementState::Pressed {
-                        state.link_menu_release = false;
+                        state.pane.link_menu_release = false;
                     }
                 }
                 if btn_state == ElementState::Pressed
@@ -844,9 +1272,9 @@ impl ApplicationHandler<UserEvent> for App {
                             target.can_open(),
                         )
                     {
-                        state.link_press.begin(link, state.mouse_position);
-                        state.mouse_pressed = false;
-                        state.mouse_press_origin = None;
+                        state.pane.link_press.begin(link, state.pane.mouse_position);
+                        state.pane.mouse_pressed = false;
+                        state.pane.mouse_press_origin = None;
                         return;
                     }
                     if win_button == MouseButton::Right
@@ -855,11 +1283,11 @@ impl ApplicationHandler<UserEvent> for App {
                             route.is_some(),
                         )
                     {
-                        state.link_menu_release = true;
+                        state.pane.link_menu_release = true;
                         // Keep the clicked target while AppKit runs its menu loop.
                         match crate::link_platform::context_menu(
                             &state.window,
-                            state.mouse_position,
+                            state.pointer_position,
                             target.can_open(),
                         ) {
                             Some(crate::link_platform::LinkAction::Open) => open_link(&target),
@@ -876,35 +1304,40 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 if let Some(button) = winit_to_mouse_button(win_button) {
-                    state.held_buttons.update(button, btn_state == ElementState::Pressed);
-                    state.last_mouse_report = None;
+                    state.pane.held_buttons.update(button, btn_state == ElementState::Pressed);
+                    state.pane.last_mouse_report = None;
                 }
 
                 if let Some(sgr) = route {
                     if let Some(btn) = winit_to_mouse_button(win_button) {
                         let (col, row) = grid_coords_1based(
-                            state.mouse_position,
+                            state.pane.mouse_position,
                             &state.cell_metrics,
-                            state.terminal.columns(),
-                            state.terminal.screen_lines(),
+                            state.pane.terminal.columns(),
+                            state.pane.terminal.screen_lines(),
                         );
-                        let col =
-                            state.renderer.logical_column((col - 1) as usize, (row - 1) as usize).0
-                                as u32
-                                + 1;
+                        let col = state
+                            .renderer
+                            .pane_logical_column(
+                                state.loaded_pane,
+                                (col - 1) as usize,
+                                (row - 1) as usize,
+                            )
+                            .0 as u32
+                            + 1;
                         let kind = match btn_state {
                             ElementState::Pressed => mouse_enc::MouseEventKind::Press,
                             ElementState::Released => mouse_enc::MouseEventKind::Release,
                         };
                         let bytes = mouse_enc::encode(sgr, btn, state.modifiers, kind, col, row);
-                        if let Err(e) = state.terminal.write_to_pty(&bytes) {
+                        if let Err(e) = state.pane.terminal.write_to_pty(&bytes) {
                             log::warn!("PTY mouse write failed: {e}");
                         }
-                        state.mouse_pressed = false;
-                        state.mouse_press_origin = None;
+                        state.pane.mouse_pressed = false;
+                        state.pane.mouse_press_origin = None;
                     }
                     if matches!(btn_state, ElementState::Released) {
-                        state.last_mouse_report = None;
+                        state.pane.last_mouse_report = None;
                     }
                     state.mark_content_dirty();
                     state.request_redraw();
@@ -913,30 +1346,36 @@ impl ApplicationHandler<UserEvent> for App {
 
                 match (btn_state, win_button) {
                     (btn_state, MouseButton::Left) => {
-                        let (x, y) = state.mouse_position;
+                        let (x, y) = state.pane.mouse_position;
                         let cw = state.cell_metrics.cell_width;
                         let ch = state.cell_metrics.cell_height;
-                        let cols = state.terminal.columns();
-                        let rows = state.terminal.screen_lines();
-                        let display_offset = state.terminal.grid().display_offset();
+                        let cols = state.pane.terminal.columns();
+                        let rows = state.pane.terminal.screen_lines();
+                        let display_offset = state.pane.terminal.grid().display_offset();
                         let (point, side) =
                             pixel_to_grid_point(x, y, cw, ch, cols, rows, display_offset);
-                        let (point, side) =
-                            logical_selection_point(&state.renderer, point, side, display_offset);
+                        let (point, side) = logical_selection_point(
+                            &state.renderer,
+                            state.loaded_pane,
+                            point,
+                            side,
+                            display_offset,
+                        );
 
                         match btn_state {
                             ElementState::Pressed => {
-                                state.mouse_pressed = true;
-                                state.mouse_press_origin = Some((x, y));
-                                state.terminal.start_selection(point, side);
+                                state.pane.mouse_pressed = true;
+                                state.pane.mouse_press_origin = Some((x, y));
+                                state.pane.terminal.start_selection(point, side);
                             }
                             ElementState::Released => {
-                                state.mouse_pressed = false;
-                                if state.mouse_press_origin.is_none() {
+                                state.pane.mouse_pressed = false;
+                                if state.pane.mouse_press_origin.is_none() {
                                     return;
                                 }
                                 const CLICK_DRAG_THRESHOLD_PX: f64 = 5.0;
                                 let was_drag = state
+                                    .pane
                                     .mouse_press_origin
                                     .map(|(ox, oy)| {
                                         let dx = x - ox;
@@ -944,13 +1383,13 @@ impl ApplicationHandler<UserEvent> for App {
                                         (dx * dx + dy * dy).sqrt() > CLICK_DRAG_THRESHOLD_PX
                                     })
                                     .unwrap_or(false);
-                                state.mouse_press_origin = None;
+                                state.pane.mouse_press_origin = None;
 
                                 if !was_drag {
-                                    state.terminal.clear_selection();
+                                    state.pane.terminal.clear_selection();
 
                                     let (cursor_row, cursor_col, scrolled) = {
-                                        let grid = state.terminal.grid();
+                                        let grid = state.pane.terminal.grid();
                                         let cp = grid.cursor.point;
                                         (cp.line.0, cp.column.0 as i32, grid.display_offset() != 0)
                                     };
@@ -968,13 +1407,16 @@ impl ApplicationHandler<UserEvent> for App {
                                             for _ in 0..delta.unsigned_abs() {
                                                 payload.extend_from_slice(seq);
                                             }
-                                            if let Err(e) = state.terminal.write_to_pty(&payload) {
+                                            if let Err(e) =
+                                                state.pane.terminal.write_to_pty(&payload)
+                                            {
                                                 log::warn!("PTY cursor-move write failed: {e}");
                                             }
                                         }
                                     }
                                 } else {
-                                    state.primary_selection = state.terminal.selection_text();
+                                    state.pane.primary_selection =
+                                        state.pane.terminal.selection_text();
                                 }
                             }
                         }
@@ -983,8 +1425,8 @@ impl ApplicationHandler<UserEvent> for App {
                     }
 
                     (ElementState::Pressed, MouseButton::Middle) => {
-                        if let Some(text) = state.primary_selection.as_ref() {
-                            if let Err(e) = state.terminal.paste(text) {
+                        if let Some(text) = state.pane.primary_selection.as_ref() {
+                            if let Err(e) = state.pane.terminal.paste(text) {
                                 log::warn!("PTY middle-click paste failed: {e}");
                             }
                             state.mark_content_dirty();
@@ -997,38 +1439,45 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                state.mouse_position = (position.x, position.y);
-                state.pointer_inside = true;
-                state.link_press.moved(state.mouse_position);
+                state.pane.mouse_position = (position.x, position.y);
+                state.pane.pointer_inside = true;
+                state.pane.link_press.moved(state.pane.mouse_position);
                 state.refresh_link_hover();
-                if state.link_press.active() {
+                if state.pane.link_press.active() {
                     return;
                 }
 
                 let route = route_mouse(
-                    state.terminal.mouse_protocol(),
+                    state.pane.terminal.mouse_protocol(),
                     self.mouse_tracking,
                     state.modifiers.shift_key(),
-                    state.exit_status.is_some(),
+                    state.pane.exit_status.is_some(),
                 );
 
                 if let Some(sgr) = route {
-                    let proto = state.terminal.mouse_protocol();
-                    if let Some(btn) =
-                        state.held_buttons.report_button(proto.report_motion, proto.report_drag)
+                    let proto = state.pane.terminal.mouse_protocol();
+                    if let Some(btn) = state
+                        .pane
+                        .held_buttons
+                        .report_button(proto.report_motion, proto.report_drag)
                     {
                         let (col, row) = grid_coords_1based(
-                            state.mouse_position,
+                            state.pane.mouse_position,
                             &state.cell_metrics,
-                            state.terminal.columns(),
-                            state.terminal.screen_lines(),
+                            state.pane.terminal.columns(),
+                            state.pane.terminal.screen_lines(),
                         );
-                        let col =
-                            state.renderer.logical_column((col - 1) as usize, (row - 1) as usize).0
-                                as u32
-                                + 1;
-                        if state.last_mouse_report != Some((col, row, btn)) {
-                            state.last_mouse_report = Some((col, row, btn));
+                        let col = state
+                            .renderer
+                            .pane_logical_column(
+                                state.loaded_pane,
+                                (col - 1) as usize,
+                                (row - 1) as usize,
+                            )
+                            .0 as u32
+                            + 1;
+                        if state.pane.last_mouse_report != Some((col, row, btn)) {
+                            state.pane.last_mouse_report = Some((col, row, btn));
                             let bytes = mouse_enc::encode(
                                 sgr,
                                 btn,
@@ -1037,7 +1486,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 col,
                                 row,
                             );
-                            if let Err(e) = state.terminal.write_to_pty(&bytes) {
+                            if let Err(e) = state.pane.terminal.write_to_pty(&bytes) {
                                 log::warn!("PTY mouse motion write failed: {e}");
                             }
                         }
@@ -1045,14 +1494,14 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                state.last_mouse_report = None;
+                state.pane.last_mouse_report = None;
 
-                if state.mouse_pressed {
+                if state.pane.mouse_pressed {
                     let cw = state.cell_metrics.cell_width;
                     let ch = state.cell_metrics.cell_height;
-                    let cols = state.terminal.columns();
-                    let rows = state.terminal.screen_lines();
-                    let display_offset = state.terminal.grid().display_offset();
+                    let cols = state.pane.terminal.columns();
+                    let rows = state.pane.terminal.screen_lines();
+                    let display_offset = state.pane.terminal.grid().display_offset();
                     let (point, side) = pixel_to_grid_point(
                         position.x,
                         position.y,
@@ -1062,23 +1511,28 @@ impl ApplicationHandler<UserEvent> for App {
                         rows,
                         display_offset,
                     );
-                    let (point, side) =
-                        logical_selection_point(&state.renderer, point, side, display_offset);
-                    state.terminal.update_selection(point, side);
+                    let (point, side) = logical_selection_point(
+                        &state.renderer,
+                        state.loaded_pane,
+                        point,
+                        side,
+                        display_offset,
+                    );
+                    state.pane.terminal.update_selection(point, side);
                     state.mark_content_dirty();
                     state.request_redraw();
                 }
             }
 
             WindowEvent::MouseWheel { delta, phase, .. } => {
-                state.link_press.cancel();
+                state.pane.link_press.cancel();
                 let route = route_mouse(
-                    state.terminal.mouse_protocol(),
+                    state.pane.terminal.mouse_protocol(),
                     self.mouse_tracking,
                     state.modifiers.shift_key(),
-                    state.exit_status.is_some(),
+                    state.pane.exit_status.is_some(),
                 );
-                let lines = state.scroll_accumulator.lines(
+                let lines = state.pane.scroll_accumulator.lines(
                     delta,
                     phase,
                     route,
@@ -1092,15 +1546,20 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(sgr) = route {
                     if lines != 0 {
                         let (col, row) = grid_coords_1based(
-                            state.mouse_position,
+                            state.pane.mouse_position,
                             &state.cell_metrics,
-                            state.terminal.columns(),
-                            state.terminal.screen_lines(),
+                            state.pane.terminal.columns(),
+                            state.pane.terminal.screen_lines(),
                         );
-                        let col =
-                            state.renderer.logical_column((col - 1) as usize, (row - 1) as usize).0
-                                as u32
-                                + 1;
+                        let col = state
+                            .renderer
+                            .pane_logical_column(
+                                state.loaded_pane,
+                                (col - 1) as usize,
+                                (row - 1) as usize,
+                            )
+                            .0 as u32
+                            + 1;
                         let btn = if lines > 0 {
                             mouse_enc::MouseButton::WheelUp
                         } else {
@@ -1115,7 +1574,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 col,
                                 row,
                             );
-                            if let Err(e) = state.terminal.write_to_pty(&bytes) {
+                            if let Err(e) = state.pane.terminal.write_to_pty(&bytes) {
                                 log::warn!("PTY wheel write failed: {e}");
                                 break;
                             }
@@ -1127,9 +1586,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if lines > 0 {
-                    state.terminal.scroll_up(lines as usize);
+                    state.pane.terminal.scroll_up(lines as usize);
                 } else if lines < 0 {
-                    state.terminal.scroll_down(lines.unsigned_abs() as usize);
+                    state.pane.terminal.scroll_down(lines.unsigned_abs() as usize);
                 }
                 state.mark_content_dirty();
                 state.request_redraw();
@@ -1155,18 +1614,240 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::CursorEntered { .. } => {
-                state.pointer_inside = true;
+                state.pane.pointer_inside = true;
                 state.refresh_link_hover();
             }
 
             WindowEvent::CursorLeft { .. } => {
-                state.pointer_inside = false;
-                state.link_press.cancel();
+                state.pane.pointer_inside = false;
+                state.pane.link_press.cancel();
                 state.refresh_link_hover();
             }
 
             _ => {}
         }
+    }
+}
+
+impl App {
+    fn route_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        id: WindowId,
+        mut event: WindowEvent,
+    ) {
+        if let WindowEvent::KeyboardInput { event: ref key, .. } = event
+            && key.state == ElementState::Pressed
+            && let Some(modifiers) = self.windows.get(&id).map(|state| state.modifiers)
+            && let Some(shortcut) = pane_shortcut(&key.logical_key, modifiers)
+        {
+            if !key.repeat {
+                match shortcut {
+                    PaneShortcut::Split(axis) => {
+                        self.split_pane(id, axis);
+                    }
+                    PaneShortcut::CloseWindow => self.close_window(id, event_loop),
+                    PaneShortcut::ClosePane => {
+                        let pane = self.windows[&id].tree.active();
+                        self.close_pane(id, pane, event_loop);
+                    }
+                    PaneShortcut::Next | PaneShortcut::Previous => {
+                        let state = self.windows.get_mut(&id).unwrap();
+                        let original = state.tree.active();
+                        let pane = if shortcut == PaneShortcut::Next {
+                            state.tree.focus_next()
+                        } else {
+                            state.tree.focus_previous()
+                        };
+                        state.tree.focus(original);
+                        state.focus_pane(pane);
+                    }
+                    PaneShortcut::Direction(direction) => {
+                        let state = self.windows.get_mut(&id).unwrap();
+                        let original = state.tree.active();
+                        if let Some(pane) = state.tree.focus_direction(direction, &state.layout) {
+                            state.tree.focus(original);
+                            state.focus_pane(pane);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let Some(state) = self.windows.get_mut(&id) else {
+            return;
+        };
+        state.load_pane(state.tree.active());
+        if matches!(&event, WindowEvent::CursorLeft { .. }) {
+            for pane_id in state.tree.pane_ids() {
+                state.load_pane(pane_id);
+                state.pane.pointer_inside = false;
+                state.pane.link_press.cancel();
+            }
+            state.load_pane(state.tree.active());
+        }
+        if let WindowEvent::ModifiersChanged(modifiers) = &event
+            && state.modifiers != modifiers.state()
+        {
+            for pane_id in state.tree.pane_ids() {
+                state.load_pane(pane_id);
+                state.pane.scroll_accumulator.reset();
+                state.pane.last_mouse_report = None;
+            }
+            state.load_pane(state.tree.active());
+        }
+        if let WindowEvent::CursorMoved { position, .. } = &event {
+            state.pointer_position = (position.x, position.y);
+            if let Some(divider) = state.divider_drag {
+                if state.tree.drag_divider(divider, position.x, position.y, &state.layout) {
+                    state.resize_panes();
+                    state.request_redraw();
+                }
+                return;
+            }
+        }
+        if matches!(
+            &event,
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            }
+        ) && state.divider_drag.take().is_some()
+        {
+            return;
+        }
+        let pointer_event = matches!(
+            &event,
+            WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::CursorEntered { .. }
+        ) || matches!(&event, WindowEvent::ModifiersChanged(_))
+            && matches!(
+                state.layout.hit_test(state.pointer_position.0, state.pointer_position.1),
+                Some(Hit::Pane(_))
+            );
+        if pointer_event {
+            let hit = state.layout.hit_test(state.pointer_position.0, state.pointer_position.1);
+            let captured = if matches!(
+                &event,
+                WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. }
+            ) {
+                state.captured_pane
+            } else {
+                None
+            };
+            let target = if let Some(captured) = captured {
+                Some(captured)
+            } else {
+                match hit {
+                    Some(Hit::Pane(pane)) => Some(pane),
+                    Some(Hit::Divider(divider)) => {
+                        if matches!(
+                            &event,
+                            WindowEvent::MouseInput {
+                                state: ElementState::Pressed,
+                                button: MouseButton::Left,
+                                ..
+                            }
+                        ) {
+                            state.divider_drag = Some(divider);
+                        }
+                        state.window.set_cursor(CursorIcon::Default);
+                        state.pointer_cursor = None;
+                        let _ = crate::link_platform::set_hover(&state.window, None);
+                        state.hovered_preview = None;
+                        None
+                    }
+                    None => None,
+                }
+            };
+            let Some(target) = target else {
+                return;
+            };
+            if matches!(&event, WindowEvent::MouseInput { state: ElementState::Pressed, .. }) {
+                state.focus_pane(target);
+            }
+            state.load_pane(target);
+            if matches!(&event, WindowEvent::MouseInput { state: ElementState::Pressed, .. }) {
+                state.captured_pane = Some(target);
+            }
+            if let Some(rect) = state.layout.pane(target) {
+                state.pane.mouse_position = pane_local_position(rect, state.pointer_position);
+                if let WindowEvent::CursorMoved { position, .. } = &mut event {
+                    position.x = state.pane.mouse_position.0;
+                    position.y = state.pane.mouse_position.1;
+                }
+            }
+        }
+        self.dispatch_window_event(event_loop, id, event);
+        if let Some(state) = self.windows.get_mut(&id) {
+            if let Some(captured) = state.captured_pane
+                && state.pane_state(captured).is_none_or(|pane| {
+                    !pane.mouse_pressed
+                        && pane.held_buttons.report_button(false, true).is_none()
+                        && !pane.link_press.active()
+                        && !pane.link_menu_release
+                })
+            {
+                state.captured_pane = None;
+            }
+            state.load_pane(state.tree.active());
+        }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.windows.is_empty() {
+            return;
+        }
+        if !self.restore_workspace(event_loop) && self.spawn_window(event_loop, None).is_none() {
+            event_loop.exit();
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let geometry_event = matches!(
+            &event,
+            WindowEvent::Resized(_)
+                | WindowEvent::Moved(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+        );
+        let layout_input = match &event {
+            WindowEvent::KeyboardInput { event, .. } => {
+                event.state == ElementState::Pressed
+                    && self.windows.get(&id).is_some_and(|state| state.modifiers.super_key())
+            }
+            WindowEvent::MouseInput { state, .. } => *state == ElementState::Pressed,
+            _ => false,
+        };
+        let changes_layout = self.session_service.store.is_some()
+            && (layout_input
+                || matches!(&event, WindowEvent::CursorMoved { .. })
+                    && self.windows.get(&id).is_some_and(|state| state.divider_drag.is_some()));
+        let before = changes_layout
+            .then(|| self.windows.get(&id).map(AppState::workspace_snapshot))
+            .flatten();
+        self.route_window_event(event_loop, id, event);
+        if geometry_event {
+            self.note_session_change();
+        }
+        if changes_layout {
+            let after = self.windows.get(&id).map(AppState::workspace_snapshot);
+            if before != after {
+                self.note_session_change();
+            }
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Explicit quit snapshots all windows; a last close retains its pending
+        // nonempty snapshot instead of replacing it with an empty workspace.
+        self.note_session_change();
+        self.flush_session();
+        self.control_service.close_all();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1176,10 +1857,12 @@ impl ApplicationHandler<UserEvent> for App {
         self.pump_parser(event_loop);
         let now = Instant::now();
         let mut earliest_deadline: Option<Instant> = None;
+        self.service_session_deadline(now, &mut earliest_deadline);
+        self.control_service.expire(now, &mut earliest_deadline);
 
         for state in self.windows.values_mut() {
             let input = AnimationInputs {
-                is_alive: state.exit_status.is_none(),
+                is_alive: state.has_live_pane(),
                 focused: state.focused,
                 focus_redraw_frames: state.focus_redraw_frames,
                 bloom_start: state.bloom_start,
@@ -1194,7 +1877,7 @@ impl ApplicationHandler<UserEvent> for App {
                 AnimationState::Idle => None,
             };
             if self.animations.logo
-                && state.exit_status.is_none()
+                && state.has_live_pane()
                 && let Some(gain) = state.focus_gain_at
             {
                 let dwell = Duration::from_millis(self.config.theme.opacity.bloom_dwell_ms as u64);
@@ -1221,46 +1904,77 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Search(id, action) => {
+            UserEvent::Control(event) => self.dispatch_control(event),
+            UserEvent::Search(id, pane_id, session, action) => {
                 let Some(state) = self.windows.get_mut(&id) else {
                     return;
                 };
-                if !state.search.active {
+                if state.tree.active() != pane_id
+                    || !state.load_pane(pane_id)
+                    || state.pane.session != session
+                    || !state.pane.search.active
+                {
+                    state.load_pane(state.tree.active());
                     return;
                 }
                 match action {
                     crate::search_platform::SearchAction::Query(query) => {
-                        state.search.set_query(query, &state.terminal)
+                        state.pane.search.set_query(query, &state.pane.terminal)
                     }
                     crate::search_platform::SearchAction::CaseSensitive(enabled) => {
-                        state.search.set_case_sensitive(enabled, &state.terminal)
+                        state.pane.search.set_case_sensitive(enabled, &state.pane.terminal)
                     }
                     crate::search_platform::SearchAction::Next => {
-                        state.search.navigate(&state.terminal, false)
+                        state.pane.search.navigate(&state.pane.terminal, false)
                     }
                     crate::search_platform::SearchAction::Previous => {
-                        state.search.navigate(&state.terminal, true)
+                        state.pane.search.navigate(&state.pane.terminal, true)
                     }
                     crate::search_platform::SearchAction::Close => {
-                        state.search.active = false;
-                        if let Some(panel) = &state.search_panel {
+                        state.pane.search.active = false;
+                        if let Some(panel) = &state.pane.search_panel {
                             panel.close();
                         }
                         state.window.focus_window();
                     }
                 }
-                if state.search.active {
+                if state.pane.search.active {
                     state.reveal_search_match();
                 } else {
                     state.mark_content_dirty();
                     state.request_redraw();
                 }
+                state.load_pane(state.tree.active());
             }
-            UserEvent::PtyOutput(id) => {
-                if let Some(state) = self.windows.get(&id)
-                    && state.exit_status.is_none()
-                {
-                    self.pending_parsers.enqueue(id);
+            UserEvent::PtyOutput(id, pane_id, session) => {
+                if let Some(state) = self.windows.get(&id) {
+                    let pane = if state.loaded_pane == pane_id {
+                        Some(&state.pane)
+                    } else {
+                        state.other_panes.get(&pane_id)
+                    };
+                    if pane
+                        .is_some_and(|pane| pane.session == session && pane.exit_status.is_none())
+                    {
+                        self.pending_parsers.enqueue((id, pane_id, session));
+                    }
+                }
+            }
+            UserEvent::NotificationReady(notification) => {
+                let scope = notification.scope;
+                if let Some(state) = self.windows.get(&scope.window) {
+                    let pane = if state.loaded_pane == scope.pane {
+                        Some(&state.pane)
+                    } else {
+                        state.other_panes.get(&scope.pane)
+                    };
+                    if completion_delivery_allowed(
+                        state.focused,
+                        scope.session,
+                        pane.map(|pane| pane.session),
+                    ) {
+                        self.native_notifications.deliver(&state.window, notification);
+                    }
                 }
             }
         }
@@ -1316,10 +2030,15 @@ fn grid_coords_1based(
 }
 
 /// Wake the event loop for output from the specified window.
-fn make_waker_for(proxy: &EventLoopProxy<UserEvent>, window_id: WindowId) -> PtyWaker {
+fn make_waker_for(
+    proxy: &EventLoopProxy<UserEvent>,
+    window_id: WindowId,
+    pane_id: PaneId,
+    session: u64,
+) -> PtyWaker {
     let proxy = proxy.clone();
     Arc::new(move || {
-        let _ = proxy.send_event(UserEvent::PtyOutput(window_id));
+        let _ = proxy.send_event(UserEvent::PtyOutput(window_id, pane_id, session));
     })
 }
 
@@ -1336,6 +2055,8 @@ fn text_opacity_for_focus(focused: bool, config: &mechanic_config::OpacityConfig
 /// Cmd shortcuts intercepted before keyboard input reaches the PTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CmdShortcut {
+    /// Cmd+Q saves the complete workspace before terminating the application.
+    Quit,
     /// Cmd+N — spawn a new Mechanic window.
     SpawnWindow,
     /// Cmd+W — close the current window.
@@ -1361,7 +2082,7 @@ enum CmdShortcut {
 impl CmdShortcut {
     /// Dispatch window lifecycle shortcuts before borrowing individual window state.
     fn is_app_level(self) -> bool {
-        matches!(self, Self::SpawnWindow | Self::CloseWindow)
+        matches!(self, Self::SpawnWindow | Self::CloseWindow | Self::Quit)
     }
 }
 
@@ -1369,6 +2090,7 @@ impl CmdShortcut {
 fn cmd_shortcut(c: &str) -> Option<CmdShortcut> {
     match c {
         "n" => Some(CmdShortcut::SpawnWindow),
+        "q" => Some(CmdShortcut::Quit),
         "w" => Some(CmdShortcut::CloseWindow),
         "c" => Some(CmdShortcut::Copy),
         "v" => Some(CmdShortcut::Paste),
@@ -1385,6 +2107,67 @@ fn cmd_shortcut(c: &str) -> Option<CmdShortcut> {
 fn animation_toggle_shortcut(key: PhysicalKey, modifiers: ModifiersState) -> bool {
     key == PhysicalKey::Code(KeyCode::KeyA)
         && modifiers == (ModifiersState::SUPER | ModifiersState::SHIFT)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneShortcut {
+    Split(Axis),
+    ClosePane,
+    CloseWindow,
+    Next,
+    Previous,
+    Direction(Direction),
+}
+
+fn pane_shortcut(key: &Key, modifiers: ModifiersState) -> Option<PaneShortcut> {
+    if modifiers == ModifiersState::SUPER {
+        return match key {
+            Key::Character(c) if c.eq_ignore_ascii_case("d") => {
+                Some(PaneShortcut::Split(Axis::Vertical))
+            }
+            Key::Character(c) if c.eq_ignore_ascii_case("w") => Some(PaneShortcut::ClosePane),
+            Key::Character(c) if c == "]" => Some(PaneShortcut::Next),
+            Key::Character(c) if c == "[" => Some(PaneShortcut::Previous),
+            _ => None,
+        };
+    }
+    if modifiers == (ModifiersState::SUPER | ModifiersState::SHIFT) {
+        return match key {
+            Key::Character(c) if c.eq_ignore_ascii_case("d") => {
+                Some(PaneShortcut::Split(Axis::Horizontal))
+            }
+            Key::Character(c) if c.eq_ignore_ascii_case("w") => Some(PaneShortcut::CloseWindow),
+            _ => None,
+        };
+    }
+    if modifiers == (ModifiersState::SUPER | ModifiersState::ALT) {
+        return match key {
+            Key::Named(NamedKey::ArrowLeft) => Some(PaneShortcut::Direction(Direction::Left)),
+            Key::Named(NamedKey::ArrowRight) => Some(PaneShortcut::Direction(Direction::Right)),
+            Key::Named(NamedKey::ArrowUp) => Some(PaneShortcut::Direction(Direction::Up)),
+            Key::Named(NamedKey::ArrowDown) => Some(PaneShortcut::Direction(Direction::Down)),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn completion_delivery_allowed(
+    focused: bool,
+    expected_session: u64,
+    current_session: Option<u64>,
+) -> bool {
+    !focused && current_session == Some(expected_session)
+}
+
+fn allocate_session_token(next: &mut u64) -> Option<u64> {
+    let session = *next;
+    *next = session.checked_add(1)?;
+    Some(session)
+}
+
+fn pane_local_position(rect: Rect, position: (f64, f64)) -> (f64, f64) {
+    (position.0 - f64::from(rect.x), position.1 - f64::from(rect.y))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1498,25 +2281,64 @@ fn render_frame(
         let conversion_started =
             log::log_enabled!(target: "mechanic_render_profile", log::Level::Trace)
                 .then(Instant::now);
-        let mut grid = crate::convert::convert_grid(
-            &state.terminal,
-            &config.theme,
-            state.focused && state.preedit.is_none(),
-        );
-        state.search.highlight(&mut grid, &state.terminal, &config.theme);
-        if let Some(preedit) = &state.preedit {
-            preedit.overlay(&mut grid, &config.theme);
+        let active = state.tree.active();
+        for pane_id in state.tree.pane_ids() {
+            state.load_pane(pane_id);
+            if !state.pane.content_dirty && state.pane.cached_grid.is_some() {
+                continue;
+            }
+            let mut grid = crate::convert::convert_grid(
+                &state.pane.terminal,
+                &config.theme,
+                state.focused && pane_id == active && state.pane.preedit.is_none(),
+            );
+            state.pane.search.highlight(&mut grid, &state.pane.terminal, &config.theme);
+            if let Some(preedit) = &state.pane.preedit {
+                preedit.overlay(&mut grid, &config.theme);
+            }
+            state.pane.cached_grid = Some(grid);
+            state.pane.content_dirty = false;
+            state.pane.layout_dirty = false;
         }
+        state.load_pane(active);
         if let Some(started) = conversion_started {
             let conversion_ns = started.elapsed().as_nanos();
             log::trace!(target: "mechanic_render_profile",
                 "render-profile conversion_ns={conversion_ns} cols={} rows={}",
-                grid.cols, grid.rows,
+                state.pane.terminal.columns(), state.pane.terminal.screen_lines(),
             );
         }
-        state.content_dirty = !state.renderer.render(&grid, uniforms);
-        state.layout_dirty = false;
-        state.refresh_link_hover();
+        let panes: Vec<_> = state
+            .layout
+            .panes
+            .iter()
+            .map(|item| {
+                let pane = if item.id == state.loaded_pane {
+                    &state.pane
+                } else {
+                    &state.other_panes[&item.id]
+                };
+                RenderPane {
+                    id: item.id,
+                    rect: mechanic_renderer::PaneRect {
+                        x: item.rect.x,
+                        y: item.rect.y,
+                        width: item.rect.width,
+                        height: item.rect.height,
+                    },
+                    grid: pane.cached_grid.as_ref().unwrap(),
+                    active: item.id == active,
+                }
+            })
+            .collect();
+        state.content_dirty = !state.renderer.render_panes(&panes, uniforms);
+        if let Some(Hit::Pane(pane)) =
+            state.layout.hit_test(state.pointer_position.0, state.pointer_position.1)
+        {
+            state.load_pane(pane);
+            state.refresh_link_hover();
+            state.load_pane(active);
+        }
     }
 
     if let Some(t) = state.bloom_start
@@ -1525,17 +2347,17 @@ fn render_frame(
         state.bloom_start = None;
     }
 
-    let shell = state.terminal.shell_integration();
-    let shell_running = state.exit_status.is_none() && shell.is_running();
+    let shell = state.pane.terminal.shell_integration();
+    let shell_running = state.pane.exit_status.is_none() && shell.is_running();
     let integrated_title = shell_window_title(
-        state.terminal.title(),
+        state.pane.terminal.title(),
         shell.cwd(),
         shell_running,
-        state.exit_status.is_none().then(|| shell.last_exit_status()).flatten(),
+        state.pane.exit_status.is_none().then(|| shell.last_exit_status()).flatten(),
     );
     let base_title = integrated_title.as_str();
     let base = if base_title.is_empty() { "Mechanic" } else { base_title };
-    let title_string = match state.exit_status {
+    let title_string = match state.pane.exit_status {
         Some(status) => format!("{base} — {}", format_title_suffix(status)),
         None => base.to_string(),
     };
@@ -1663,20 +2485,33 @@ fn is_dismissal_key(key: &Key) -> bool {
 }
 
 /// Respawn the shell inside an already-frozen window.
-fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId, waker: PtyWaker) {
-    let size = state.terminal.size();
-    match Terminal::new(config, size, waker) {
+fn respawn_shell(
+    state: &mut AppState,
+    config: &Config,
+    id: WindowId,
+    waker: PtyWaker,
+    session: u64,
+) {
+    let size = state.pane.terminal.size();
+    let directory = state.pane.directory.clone();
+    match Terminal::new_in_directory(config, size, waker, directory.as_deref()) {
         Ok(new_term) => {
             state.invalidate_search();
-            state.terminal = new_term;
-            state.link_press.cancel();
-            state.preedit = None;
-            state.held_buttons.clear();
-            state.scroll_accumulator.reset();
-            state.last_mouse_report = None;
-            state.mouse_pressed = false;
-            state.mouse_press_origin = None;
-            state.exit_status = None;
+            state.pane.terminal = new_term;
+            state.pane.session = session;
+            state.pane.completions.clear();
+            state.pane.directory_metadata = (None, None);
+            state.pane.cached_grid = None;
+            state.pane.search_panel = None;
+            state.pane.search.active = false;
+            state.pane.link_press.cancel();
+            state.pane.preedit = None;
+            state.pane.held_buttons.clear();
+            state.pane.scroll_accumulator.reset();
+            state.pane.last_mouse_report = None;
+            state.pane.mouse_pressed = false;
+            state.pane.mouse_press_origin = None;
+            state.pane.exit_status = None;
             state.mark_content_dirty();
             let occluded = state.frame_pacer.is_occluded();
             state.frame_pacer = FramePacer::new(Instant::now());
@@ -1765,8 +2600,158 @@ fn format_exit_status(status: Option<std::process::ExitStatus>) -> String {
 }
 
 #[cfg(test)]
+#[path = "app_pane_smoke.rs"]
+#[allow(dead_code, reason = "used by the explicit native pane smoke example")]
+mod pane_smoke;
+
+#[cfg(test)]
+#[path = "app_session_control_smoke.rs"]
+#[allow(dead_code, reason = "used by the explicit native session and control smoke example")]
+mod app_session_control_smoke;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_shortcuts_require_exact_chords_and_leave_prompt_navigation_available() {
+        let command = ModifiersState::SUPER;
+        let shifted = command | ModifiersState::SHIFT;
+        assert_eq!(
+            pane_shortcut(&Key::Character("d".into()), command),
+            Some(PaneShortcut::Split(Axis::Vertical))
+        );
+        assert_eq!(
+            pane_shortcut(&Key::Character("D".into()), shifted),
+            Some(PaneShortcut::Split(Axis::Horizontal))
+        );
+        assert_eq!(
+            pane_shortcut(&Key::Character("w".into()), command),
+            Some(PaneShortcut::ClosePane)
+        );
+        assert_eq!(
+            pane_shortcut(&Key::Character("W".into()), shifted),
+            Some(PaneShortcut::CloseWindow)
+        );
+        for (key, expected) in [
+            (Key::Character("]".into()), PaneShortcut::Next),
+            (Key::Character("[".into()), PaneShortcut::Previous),
+        ] {
+            assert_eq!(pane_shortcut(&key, command), Some(expected));
+        }
+        for modifiers in [
+            ModifiersState::empty(),
+            ModifiersState::CONTROL,
+            ModifiersState::ALT,
+            command | ModifiersState::ALT,
+            shifted | ModifiersState::CONTROL,
+        ] {
+            assert_eq!(pane_shortcut(&Key::Character("d".into()), modifiers), None);
+        }
+        for key in [NamedKey::ArrowUp, NamedKey::ArrowDown] {
+            assert_eq!(pane_shortcut(&Key::Named(key), shifted), None);
+        }
+        for (key, direction) in [
+            (NamedKey::ArrowUp, Direction::Up),
+            (NamedKey::ArrowDown, Direction::Down),
+            (NamedKey::ArrowLeft, Direction::Left),
+            (NamedKey::ArrowRight, Direction::Right),
+        ] {
+            assert_eq!(
+                pane_shortcut(&Key::Named(key), command | ModifiersState::ALT),
+                Some(PaneShortcut::Direction(direction))
+            );
+        }
+    }
+
+    #[test]
+    fn pane_shortcuts_follow_logical_letters_on_non_us_keyboard_layouts() {
+        // AZERTY's physical KeyW produces logical z; closing must follow w.
+        assert_eq!(pane_shortcut(&Key::Character("z".into()), ModifiersState::SUPER), None);
+        assert_eq!(
+            pane_shortcut(&Key::Character("w".into()), ModifiersState::SUPER),
+            Some(PaneShortcut::ClosePane)
+        );
+        // Shifted letters and characters remain interpreted by their value.
+        assert_eq!(
+            pane_shortcut(
+                &Key::Character("D".into()),
+                ModifiersState::SUPER | ModifiersState::SHIFT
+            ),
+            Some(PaneShortcut::Split(Axis::Horizontal))
+        );
+        assert_eq!(pane_shortcut(&Key::Character("{".into()), ModifiersState::SUPER), None);
+    }
+
+    #[test]
+    fn asynchronous_notification_authorization_accepts_current_frozen_panes_and_rechecks_focus() {
+        // A frozen pane retains its session, so delayed authorization must
+        // deliver the same completion as an already-authorized native center.
+        assert!(completion_delivery_allowed(false, 3, Some(3)));
+        assert!(!completion_delivery_allowed(true, 3, Some(3)));
+        assert!(!completion_delivery_allowed(false, 3, Some(4)));
+        assert!(!completion_delivery_allowed(false, 3, None));
+    }
+
+    #[test]
+    fn reused_window_and_pane_ids_cannot_reuse_terminal_sessions() {
+        let mut next = 1;
+        let original = CompletionScope {
+            window: WindowId::from(42),
+            pane: 1,
+            session: allocate_session_token(&mut next).unwrap(),
+        };
+        // Splits and restarts consume the same sequence as new windows.
+        let split_session = allocate_session_token(&mut next).unwrap();
+        let restart_session = allocate_session_token(&mut next).unwrap();
+        let replacement =
+            CompletionScope { session: allocate_session_token(&mut next).unwrap(), ..original };
+        assert!(original.session < split_session && split_session < restart_session);
+        assert!(restart_session < replacement.session);
+        assert!(!completion_delivery_allowed(false, original.session, Some(replacement.session)));
+        assert!(completion_delivery_allowed(false, replacement.session, Some(replacement.session)));
+        // Find and PTY callbacks also compare the same immutable session token.
+        assert_ne!(original, replacement);
+    }
+
+    #[test]
+    fn session_identity_exhaustion_never_wraps() {
+        let mut next = u64::MAX - 1;
+        assert_eq!(allocate_session_token(&mut next), Some(u64::MAX - 1));
+        assert_eq!(allocate_session_token(&mut next), None);
+        assert_eq!(allocate_session_token(&mut next), None);
+        assert_eq!(next, u64::MAX);
+    }
+
+    #[test]
+    fn pointer_coordinates_follow_nested_pane_bounds_without_changing_keyboard_focus() {
+        let mut tree = PaneTree::new(1);
+        let right = tree.split_active(Axis::Vertical).unwrap();
+        let bottom = tree.split_active(Axis::Horizontal).unwrap();
+        let layout = tree.layout(
+            Rect { x: 0, y: 0, width: 804, height: 404 },
+            Size { width: 80, height: 60 },
+            4,
+        );
+        for id in [1, right, bottom] {
+            let rect = layout.pane(id).unwrap();
+            let position = (f64::from(rect.x) + 15.0, f64::from(rect.y) + 25.0);
+            assert_eq!(layout.hit_test(position.0, position.1), Some(Hit::Pane(id)));
+            assert_eq!(pane_local_position(rect, position), (15.0, 25.0));
+            assert_eq!(tree.active(), bottom);
+            let metrics = CellMetrics { cell_width: 10.0, cell_height: 20.0, ascent: 15.0 };
+            assert_eq!(
+                grid_coords_1based(pane_local_position(rect, position), &metrics, 20, 10),
+                (2, 2)
+            );
+            // A captured drag leaving this pane stays outside for link tests,
+            // while terminal mouse coordinates clamp to the edge.
+            let outside =
+                pane_local_position(rect, (f64::from(rect.x) - 1.0, f64::from(rect.y) + 1.0));
+            assert_eq!(link_cell(outside, &metrics, 20, 10), None);
+            assert_eq!(grid_coords_1based(outside, &metrics, 20, 10), (1, 1));
+        }
+    }
 
     #[test]
     fn workspace_shortcuts_do_not_capture_shell_keys() {
@@ -2288,6 +3273,7 @@ mod tests {
     #[test]
     fn cmd_shortcut_known_keys_map_to_actions() {
         assert_eq!(cmd_shortcut("n"), Some(CmdShortcut::SpawnWindow));
+        assert_eq!(cmd_shortcut("q"), Some(CmdShortcut::Quit));
         assert_eq!(cmd_shortcut("w"), Some(CmdShortcut::CloseWindow));
         assert_eq!(cmd_shortcut("c"), Some(CmdShortcut::Copy));
         assert_eq!(cmd_shortcut("v"), Some(CmdShortcut::Paste));
@@ -2308,8 +3294,8 @@ mod tests {
     #[test]
     fn cmd_shortcut_unknown_characters_are_none() {
         for unclaimed in [
-            "b", "d", "e", "f", "g", "h", "i", "j", "l", "m", "o", "p", "q", "r", "s", "t", "u",
-            "x", "y", "1", "2", "9", "!", "@", "#", "~", ".", "/", "",
+            "b", "d", "e", "f", "g", "h", "i", "j", "l", "m", "o", "p", "r", "s", "t", "u", "x",
+            "y", "1", "2", "9", "!", "@", "#", "~", ".", "/", "",
         ] {
             assert_eq!(cmd_shortcut(unclaimed), None, "{unclaimed:?} should be unclaimed");
         }
@@ -2333,6 +3319,7 @@ mod tests {
     fn cmd_shortcut_is_app_level_only_for_window_lifecycle() {
         assert!(CmdShortcut::SpawnWindow.is_app_level());
         assert!(CmdShortcut::CloseWindow.is_app_level());
+        assert!(CmdShortcut::Quit.is_app_level());
 
         for window_level in [
             CmdShortcut::Copy,

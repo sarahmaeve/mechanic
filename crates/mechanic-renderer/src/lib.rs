@@ -6,6 +6,7 @@ pub mod text;
 
 pub use grid::{CellFlags, CursorStyle, RenderCell, RenderGrid};
 pub use pipeline::FrameUniforms;
+pub use pipeline::{PaneRect, RenderPane};
 pub use text::CellMetrics;
 
 use mechanic_config::{font::FontConfig, theme::Theme};
@@ -23,6 +24,19 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Refresh one pane's bidi layout before processing input or IME geometry.
+    pub fn prepare_pane_layout(&mut self, id: u64, grid: &RenderGrid) {
+        self.state.prepare_pane_layout(id, grid, &mut self.text, &self.font_config);
+    }
+
+    pub fn pane_visual_column(&self, id: u64, col: usize, row: usize) -> usize {
+        self.state.pane_visual_column(id, col, row)
+    }
+
+    pub fn pane_logical_column(&self, id: u64, col: usize, row: usize) -> (usize, bool) {
+        self.state.pane_logical_column(id, col, row)
+    }
+
     /// Refresh bidi hit testing when input precedes a pending redraw.
     pub fn prepare_layout(&mut self, grid: &RenderGrid) {
         self.state.prepare_layout(grid, &mut self.text, &self.font_config);
@@ -58,7 +72,7 @@ impl Renderer {
 
         let cell_metrics = text.cell_metrics();
         let atlas_gen = text.atlas_generation();
-        let state = RenderState::new_with_atlas(
+        let mut state = RenderState::new_with_atlas(
             surface_init,
             &text.atlas_view,
             atlas_gen,
@@ -66,6 +80,7 @@ impl Renderer {
             theme.background,
             theme.logo,
         )?;
+        state.set_pane_colors(theme.cursor, theme.ansi.bright_black);
 
         Ok(Self { state, text, font_config, scale_factor })
     }
@@ -83,6 +98,11 @@ impl Renderer {
     /// Render one frame from the given terminal grid.
     pub fn render(&mut self, grid: &RenderGrid, uniforms: FrameUniforms) -> bool {
         self.state.render(grid, &mut self.text, &self.font_config, uniforms)
+    }
+
+    /// Render all panes with one window surface acquisition, submission and presentation.
+    pub fn render_panes(&mut self, panes: &[RenderPane<'_>], uniforms: FrameUniforms) -> bool {
+        self.state.render_panes(panes, &mut self.text, &self.font_config, uniforms)
     }
 
     /// Draw cached instances with new uniforms; true only after presentation.
@@ -108,6 +128,15 @@ impl Renderer {
         let metrics = self.text.cell_metrics();
         self.state.set_cell_size((metrics.cell_width, metrics.cell_height));
         metrics
+    }
+
+    /// Rebuild shared text rendering at a new window DPI scale.
+    pub fn set_scale_factor(&mut self, scale_factor: f32) -> CellMetrics {
+        if !scale_factor.is_finite() || scale_factor <= 0.0 || scale_factor == self.scale_factor {
+            return self.cell_metrics();
+        }
+        self.scale_factor = scale_factor;
+        self.set_font_size(self.font_config.size)
     }
 }
 

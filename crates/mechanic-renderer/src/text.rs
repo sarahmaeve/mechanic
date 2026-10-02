@@ -221,7 +221,7 @@ struct ParagraphKey {
     suffix: String,
 }
 
-const SHAPING_FLAGS: CellFlags = CellFlags::BOLD
+pub(crate) const SHAPING_FLAGS: CellFlags = CellFlags::BOLD
     .union(CellFlags::ITALIC)
     .union(CellFlags::WIDE_CHAR)
     .union(CellFlags::WIDE_CHAR_SPACER)

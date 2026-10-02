@@ -1,5 +1,6 @@
 //! Terminal state wrapper.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::Grid;
@@ -19,7 +20,7 @@ use crate::TerminalSize;
 use crate::error::TerminalError;
 use crate::event::{EventProxy, TerminalEvent};
 use crate::pty::PtyHandle;
-use crate::shell_state::{ShellIntegration, ShellPosition};
+use crate::shell_state::{CommandCompletion, ShellIntegration, ShellPosition};
 
 /// Result of one [`Terminal::process_input`] call.
 #[derive(Debug, Clone, Default)]
@@ -101,6 +102,17 @@ impl Terminal {
         size: TerminalSize,
         waker: PtyWaker,
     ) -> Result<Self, TerminalError> {
+        Self::new_in_directory(config, size, waker, None)
+    }
+
+    /// Create a terminal whose child starts in an optional inherited directory.
+    /// Missing or unavailable directories fall back to the normal shell cwd.
+    pub fn new_in_directory(
+        config: &Config,
+        size: TerminalSize,
+        waker: PtyWaker,
+        directory: Option<&Path>,
+    ) -> Result<Self, TerminalError> {
         if size.columns == 0 || size.rows == 0 {
             return Err(TerminalError::InvalidSize { columns: size.columns, rows: size.rows });
         }
@@ -115,7 +127,7 @@ impl Terminal {
         let dimensions = TermDimensions { columns: size.columns, screen_lines: size.rows };
         let term = Term::new(term_config, &dimensions, event_proxy.clone());
 
-        let pty = PtyHandle::spawn(config, size, waker)?;
+        let pty = PtyHandle::spawn_in_directory(config, size, waker, directory)?;
 
         Ok(Self {
             term,
@@ -372,14 +384,28 @@ impl Terminal {
     /// Filter clipboard text and wrap it when DECSET 2004 is enabled.
     /// See [`crate::paste::filter`] for the filtering contract.
     pub fn paste(&mut self, text: &str) -> Result<(), TerminalError> {
+        self.paste_with_enter(text, false)
+    }
+
+    /// Queue filtered paste and an optional following Enter atomically.
+    pub fn paste_with_enter(&mut self, text: &str, enter: bool) -> Result<(), TerminalError> {
         let bracketed = self.bracketed_paste();
         let filtered = crate::paste::filter(text, bracketed);
 
-        if bracketed {
-            let mut payload = Vec::with_capacity(filtered.len() + BRACKETED_PASTE_WRAP_OVERHEAD);
-            payload.extend_from_slice(BRACKETED_PASTE_START);
+        if bracketed || enter {
+            let mut payload = Vec::with_capacity(
+                filtered.len() + BRACKETED_PASTE_WRAP_OVERHEAD + usize::from(enter),
+            );
+            if bracketed {
+                payload.extend_from_slice(BRACKETED_PASTE_START);
+            }
             payload.extend_from_slice(filtered.as_bytes());
-            payload.extend_from_slice(BRACKETED_PASTE_END);
+            if bracketed {
+                payload.extend_from_slice(BRACKETED_PASTE_END);
+            }
+            if enter {
+                payload.push(b'\r');
+            }
             self.write_to_pty(&payload)
         } else {
             self.write_to_pty(filtered.as_bytes())
@@ -421,6 +447,12 @@ impl Terminal {
     /// Shell cwd, command boundaries and last completion status.
     pub fn shell_integration(&self) -> &ShellIntegration {
         &self.shell_integration
+    }
+
+    /// Drain completions recorded while parsing PTY output, once per execution.
+    /// Consume after [`Self::process_input`] on the existing PTY wake path.
+    pub fn drain_command_completions(&mut self) -> impl Iterator<Item = CommandCompletion> + '_ {
+        self.shell_integration.drain_completions()
     }
 
     fn shell_point(&self, position: ShellPosition) -> Option<Point> {
@@ -734,6 +766,43 @@ mod tests {
 
     fn parse_one_chunk(terminal: &mut Terminal) -> ProcessOutcome {
         terminal.process_input_with_budget(Instant::now(), Duration::ZERO, PARSE_BYTE_BUDGET)
+    }
+
+    #[test]
+    fn shell_completions_drain_all_fast_commands_in_one_input_turn() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(
+            b"\x1b]7;file:///tmp/a%20b\x07\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;130\x07\x1b]133;D;0\x07".to_vec(),
+        );
+        let outcome = terminal.process_input();
+        assert!(outcome.grid_maybe_changed);
+        assert!(!terminal.shell_integration().is_running());
+        let completions = terminal.drain_command_completions().collect::<Vec<_>>();
+        assert_eq!(completions.iter().map(|c| c.id).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(
+            completions.iter().map(|c| c.exit_status).collect::<Vec<_>>(),
+            [Some(0), Some(130)]
+        );
+        assert!(completions.iter().all(|c| c.cwd.as_deref() == Some("/tmp/a b")));
+        assert!(terminal.drain_command_completions().next().is_none());
+        terminal.process_input();
+        assert!(terminal.drain_command_completions().next().is_none());
+    }
+
+    #[test]
+    fn shell_completion_survives_clear_and_real_grid_reflow() {
+        let (mut terminal, _) = buffered_terminal();
+        terminal.parse_chunk(b"\x1b]133;A\x07\x1b]133;C\x07output");
+        // Exercise the same grid reflow as resize without requiring a live
+        // descriptor from the buffered test transport.
+        terminal.shell_integration.invalidate();
+        terminal.term.resize(TermDimensions { columns: 40, screen_lines: 24 });
+        terminal.size.columns = 40;
+        terminal.parse_chunk(b"\x1b[2J\x1b]133;D;7\x07");
+        assert!(terminal.shell_integration().commands().is_empty());
+        let completion = terminal.drain_command_completions().next().unwrap();
+        assert_eq!(completion.id, 1);
+        assert_eq!(completion.exit_status, Some(7));
     }
 
     #[test]
@@ -1443,6 +1512,43 @@ mod tests {
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
         term.paste("echo hello\n").expect("plain paste should succeed");
+    }
+
+    #[test]
+    fn paste_with_enter_keeps_bracket_end_before_enter_in_one_queue_slot() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(b"\x1b[?2004h".to_vec());
+        terminal.process_input();
+        assert!(terminal.bracketed_paste());
+        // Only one of the transport's 1024 message slots remains. Paste and
+        // Enter must both fit, without executing Enter inside bracketed text.
+        for _ in 0..1023 {
+            terminal.write_to_pty(b"x").unwrap();
+        }
+        terminal.paste_with_enter("日本語\r\n\x1b[201~tail", true).unwrap();
+        for _ in 0..1023 {
+            assert_eq!(peer.reply(), b"x");
+        }
+        assert_eq!(peer.reply(), "\x1b[200~日本語\ntail\x1b[201~\r".as_bytes());
+    }
+
+    #[test]
+    fn paste_with_enter_rejects_the_whole_payload_at_the_input_byte_limit() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(b"\x1b[?2004h".to_vec());
+        terminal.process_input();
+        // Leave room for the framed paste, but not for its following Enter.
+        // A split enqueue would accept text before rejecting Enter, making a
+        // client's retry duplicate input or accidentally execute old text.
+        let filler = vec![b'x'; 8 * 1024 * 1024 - b"\x1b[200~run\x1b[201~".len()];
+        terminal.write_to_pty(&filler).unwrap();
+        assert!(
+            matches!(terminal.paste_with_enter("run", true), Err(TerminalError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(peer.reply(), filler);
+        terminal.write_to_pty(b"TAIL").unwrap();
+        // Any accepted paste fragment would precede TAIL in the queue.
+        assert_eq!(peer.reply(), b"TAIL");
     }
 
     #[test]

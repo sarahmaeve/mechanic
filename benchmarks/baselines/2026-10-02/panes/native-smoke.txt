@@ -1,0 +1,1 @@
+native pane smoke passed: independent PTYs, inherited cwd, splits, pointer routing, selection/search isolation, divider drag, font resize, render preparation, close/collapse and stale wake

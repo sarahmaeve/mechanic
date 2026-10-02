@@ -3,6 +3,7 @@
 //!        [--sample-secs N] [--label LABEL]
 //!        [--workload idle|cell|row|full|scroll|unicode|atlas|text-fixture]
 //!        [--render-profile] [--fixture-cursor block|bar|underline|hidden]
+//!        [--services] (enable restoration/control in temporary directories)
 //! CPU is percent of one core, excluding the peer, WindowServer, and GPU work.
 
 #[cfg(target_os = "macos")]
@@ -107,6 +108,7 @@ mod macos {
         label: Option<String>,
         workload: Workload,
         render_profile: bool,
+        services: bool,
         fixture_cursor: Option<FixtureCursor>,
     }
 
@@ -117,7 +119,7 @@ mod macos {
             let app = args.next().ok_or(usage)?;
             if app == "--help" || app == "-h" {
                 println!(
-                    "{usage}\nKeep window size and focus unchanged during sampling; animation requires focus.\nDefaults: settle 3s, sample 5s. Existing output files are never overwritten."
+                    "{usage}\n--services enables restoration/control in temporary directories.\nKeep window size and focus unchanged during sampling; animation requires focus.\nDefaults: settle 3s, sample 5s. Existing output files are never overwritten."
                 );
                 std::process::exit(0);
             }
@@ -132,6 +134,7 @@ mod macos {
                 label: None,
                 workload: Workload::Idle,
                 render_profile: false,
+                services: false,
                 fixture_cursor: None,
             };
             while let Some(arg) = args.next() {
@@ -162,6 +165,7 @@ mod macos {
                         };
                     }
                     "--render-profile" => options.render_profile = true,
+                    "--services" => options.services = true,
                     "--fixture-cursor" => {
                         options.fixture_cursor = Some(FixtureCursor::parse(
                             args.next()
@@ -441,16 +445,22 @@ mod macos {
     }
 
     fn sample(options: &Options, report: &mut Report, log_path: &Path) -> Result<()> {
-        let isolated = tempfile::tempdir()?;
+        // Unix socket paths must fit macOS sockaddr_un (103 bytes).
+        let isolated = tempfile::tempdir_in("/tmp")?;
         let config_dir = isolated.path().join("mechanic");
         fs::create_dir(&config_dir)?;
+        let runtime = isolated.path().join("runtime");
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&runtime)?;
         let peer = env::current_exe()?;
         // JSON string escaping also gives a valid TOML basic string for this path.
         let peer_string = serde_json::to_string(peer.to_str().ok_or("non-UTF8 peer path")?)?;
         fs::write(
             config_dir.join("mechanic.toml"),
             format!(
-                "[font]\nfamily = \"Menlo\"\nsize = 14.0\n[shell]\nprogram = {peer_string}\n[theme]\nlogo = \"{}\"\nlogo_size = 180\n[theme.animation]\nlogo = {}\nbackground = {}\n[theme.opacity]\ntitle_bar_opacity = 1.0\ncontent_active_opacity = 1.0\ncontent_idle_opacity = 1.0\ntext_idle_opacity = 1.0\n",
+                "[session]\nrestore = {}\n[control]\nenabled = {}\n[font]\nfamily = \"Menlo\"\nsize = 14.0\n[shell]\nprogram = {peer_string}\n[theme]\nlogo = \"{}\"\nlogo_size = 180\n[theme.animation]\nlogo = {}\nbackground = {}\n[theme.opacity]\ntitle_bar_opacity = 1.0\ncontent_active_opacity = 1.0\ncontent_idle_opacity = 1.0\ntext_idle_opacity = 1.0\n",
+                options.services,
+                options.services,
                 options.logo,
                 matches!(options.animation, "logo" | "both"),
                 matches!(options.animation, "background" | "both"),
@@ -459,6 +469,8 @@ mod macos {
         let mut command = Command::new(&options.app);
         command
             .env("XDG_CONFIG_HOME", isolated.path())
+            .env("XDG_STATE_HOME", isolated.path().join("state"))
+            .env("XDG_RUNTIME_DIR", runtime)
             .env(PEER_ENV, "1")
             .env(WORKLOAD_ENV, options.workload.name())
             .env(FIXTURE_CURSOR_ENV, options.fixture_cursor.unwrap_or(FixtureCursor::Block).name())
@@ -481,6 +493,16 @@ mod macos {
         let pid = app.0.id();
         report.pid = Some(pid);
         wait_alive(&mut app, Duration::from_secs(options.settle))?;
+        if options.services {
+            use std::os::unix::fs::FileTypeExt;
+            let saved = isolated.path().join("state/mechanic/session.json").is_file();
+            let socket = fs::read_dir(isolated.path().join("runtime/mechanic"))?
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.file_type().is_ok_and(|kind| kind.is_socket()));
+            if !saved || !socket {
+                return Err("session save or control socket did not initialize".into());
+            }
+        }
         let before_log = fs::read_to_string(log_path)?;
         let before_events = focus_events(&before_log);
         report.focused_at_start = before_events.last().copied();
@@ -824,6 +846,7 @@ mod macos {
                 "opacity": 1.0, "pty_peer": "controlled Rust peer",
                 "workload": options.workload.name(),
                 "animation": options.animation,
+                "session_and_control_enabled": options.services,
                 "logo": options.logo,
                 "logo_size_physical_pixels": 180,
                 "workload_update_interval_ms": if options.workload == Workload::Idle { None } else { Some(50) },
