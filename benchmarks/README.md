@@ -402,6 +402,10 @@ cargo rustc -p mechanic-app --example panes_native_smoke --locked -- --cfg test
 ./target/debug/examples/panes_native_smoke
 cargo rustc -p mechanic-app --example pane_move_native_smoke --locked -- --cfg test
 ./target/debug/examples/pane_move_native_smoke
+cargo rustc -p mechanic-app --example workspace_native_smoke --locked -- --cfg test
+./target/debug/examples/workspace_native_smoke
+cargo rustc -p mechanic-app --example palette_native_smoke --locked -- --cfg test
+./target/debug/examples/palette_native_smoke
 ```
 
 The first exercises inherited directories, splits, hover scrolling, selection/search
@@ -413,6 +417,25 @@ shell, scrollback, selection, Find query, and control handle, including PTY
 output and command completion after closing the source window.
 Neither captures the screen. The shell fixture uses
 `/bin/sh` with integration disabled and never loads user zsh startup files.
+
+The workspace smoke checks loadout directories/appearance, fresh session handles,
+zoom/focus, palette validation, ANSI colors, and a surviving shell after real GPU
+device destruction and recovery. The palette smoke checks native filtering,
+keyboard/mouse actions, prompts, editing focus, limits, and callback teardown.
+
+The paired renderer benchmark compares two panes (3,840 cells), with and without
+titles and custom outlines. It alternates order over 100 measured pairs after
+20 warmups for idle and one-pane updates. It checks zero idle geometry uploads
+and reuse of static text shaping. Preparation timings exclude GPU completion
+and presentation. Run serially, without other builds or tests:
+
+```sh
+MECHANIC_WORKSPACE_RENDER_BENCH_CSV=/tmp/mechanic-workspace-renderer.csv cargo test --release --locked -p mechanic-renderer workspace_decoration_update_benchmark -- --ignored --nocapture --test-threads=1
+cargo run --release --locked -p mechanic-app --example services_bench
+```
+
+The services benchmark also measures explicit durable save and in-memory retrieval
+of a styled 16-pane loadout, excluding shell/window creation. All state is temporary.
 
 ## Hyperlinks
 

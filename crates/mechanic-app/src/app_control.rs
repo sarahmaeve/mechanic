@@ -98,7 +98,98 @@ impl ControlService {
 }
 
 impl App {
-    pub(super) fn dispatch_control(&mut self, event: ControlEvent) {
+    pub(super) fn set_pane_appearance(
+        &mut self,
+        window: WindowId,
+        pane: PaneId,
+        mut appearance: crate::session::PaneAppearance,
+    ) -> Result<(), String> {
+        appearance.validate()?;
+        for value in
+            [&mut appearance.text_color, &mut appearance.outline_color].into_iter().flatten()
+        {
+            *value = crate::session::normalize_color(value)?;
+        }
+        let state = self.windows.get_mut(&window).ok_or("window is absent")?;
+        if !state.load_pane(pane) {
+            return Err("pane is absent".into());
+        }
+        state.pane.appearance = appearance;
+        let theme = state.pane.theme(&self.config.theme).into_owned();
+        state.pane.terminal.set_theme(&theme);
+        state.mark_content_dirty();
+        state.load_pane(state.tree.active());
+        state.request_redraw();
+        self.note_session_change();
+        Ok(())
+    }
+
+    fn control_target(&self, session: &SessionSelector) -> Option<(WindowId, PaneId)> {
+        self.windows.iter().find_map(|(id, state)| {
+            state
+                .tree
+                .pane_ids()
+                .into_iter()
+                .find(|pane| {
+                    state.pane_state(*pane).is_some_and(|pane| pane.session == session.session_id)
+                })
+                .map(|pane| (*id, pane))
+        })
+    }
+
+    fn control_pane_info(
+        &self,
+        window_id: WindowId,
+        pane_id: PaneId,
+        instance: &str,
+    ) -> Option<PaneInfo> {
+        let state = self.windows.get(&window_id)?;
+        let pane = state.pane_state(pane_id)?;
+        let shell = pane.terminal.shell_integration();
+        Some(PaneInfo {
+            session: SessionSelector { instance_id: instance.to_owned(), session_id: pane.session },
+            window_id: format!("{window_id:?}"),
+            pane_id,
+            title: pane
+                .appearance
+                .title
+                .as_deref()
+                .unwrap_or_else(|| pane.terminal.title())
+                .to_owned(),
+            appearance: pane.appearance.clone(),
+            zoomed: state.pane_zoomed && state.tree.active() == pane_id,
+            cwd: shell.cwd().map(str::to_owned).or_else(|| {
+                pane.directory.as_ref().map(|directory| directory.to_string_lossy().into_owned())
+            }),
+            focused: state.focused && state.tree.active() == pane_id,
+            active: state.tree.active() == pane_id,
+            running: pane.exit_status.is_none() && shell.is_running(),
+            rows: pane.terminal.screen_lines(),
+            columns: pane.terminal.columns(),
+            shell_integration: shell.cwd().is_some() || !shell.commands().is_empty(),
+            latest_command_id: pane.completions.back().map_or(0, |completion| completion.id),
+            last_command: None,
+            last_status: shell.last_exit_status(),
+        })
+    }
+
+    fn control_reply_pane(
+        &self,
+        event: &ControlEvent,
+        window: WindowId,
+        pane: PaneId,
+        instance: &str,
+    ) {
+        let response = match self.control_pane_info(window, pane, instance) {
+            Some(pane) => Response::new(instance, ResponseResult::Pane { pane }),
+            None => {
+                Response::error(instance, ErrorCode::Internal, "pane disappeared during mutation")
+            }
+        };
+        let _ = event.reply.try_send(response);
+    }
+
+    pub(super) fn dispatch_control(&mut self, event_loop: &ActiveEventLoop, event: ControlEvent) {
         let instance = self.control_service.instance_id().to_owned();
         let error = |code, message: &str| {
             let _ = event.reply.try_send(Response::error(&instance, code, message));
@@ -115,7 +206,17 @@ impl App {
             error(ErrorCode::Deadline, "request expired before dispatch");
             return;
         }
-        match event.request.operation {
+        match &event.request.operation {
+            Operation::CreatePane { directory: Some(directory), .. }
+            | Operation::SplitPane { directory: Some(directory), .. }
+                if !directory.is_dir() =>
+            {
+                error(ErrorCode::InvalidRequest, "directory does not exist or is not a directory");
+                return;
+            }
+            _ => {}
+        }
+        match event.request.operation.clone() {
             Operation::Ping => {
                 let _ = event.reply.try_send(Response::new(instance, ResponseResult::Pong));
             }
@@ -123,59 +224,183 @@ impl App {
                 let mut panes = Vec::new();
                 for (window_id, state) in &self.windows {
                     for pane_id in state.tree.pane_ids() {
-                        let Some(pane) = state.pane_state(pane_id) else { continue };
-                        let shell = pane.terminal.shell_integration();
-                        panes.push(PaneInfo {
-                            session: SessionSelector {
-                                instance_id: instance.clone(),
-                                session_id: pane.session,
-                            },
-                            window_id: format!("{window_id:?}"),
-                            pane_id,
-                            title: pane.terminal.title().to_owned(),
-                            cwd: shell.cwd().map(str::to_owned).or_else(|| {
-                                pane.directory
-                                    .as_ref()
-                                    .map(|directory| directory.to_string_lossy().into_owned())
-                            }),
-                            focused: state.focused && state.tree.active() == pane_id,
-                            active: state.tree.active() == pane_id,
-                            running: pane.exit_status.is_none() && shell.is_running(),
-                            rows: pane.terminal.screen_lines(),
-                            columns: pane.terminal.columns(),
-                            shell_integration: shell.cwd().is_some()
-                                || !shell.commands().is_empty(),
-                            latest_command_id: pane
-                                .completions
-                                .back()
-                                .map_or(0, |completion| completion.id),
-                            last_command: None,
-                            last_status: shell.last_exit_status(),
-                        });
+                        if let Some(pane) = self.control_pane_info(*window_id, pane_id, &instance) {
+                            panes.push(pane);
+                        }
                     }
                 }
                 panes.sort_by_key(|pane| pane.session.session_id);
                 let _ =
                     event.reply.try_send(Response::new(instance, ResponseResult::Panes { panes }));
             }
+            Operation::CreatePane { session, directory } => {
+                if self.windows.len() >= crate::session::MAX_WINDOWS {
+                    error(ErrorCode::Busy, "window limit reached");
+                    return;
+                }
+                let directory = if let Some(session) = session {
+                    let Some((window, pane)) = self.control_target(&session) else {
+                        error(ErrorCode::UnknownSession, "source pane is absent");
+                        return;
+                    };
+                    directory.or_else(|| {
+                        self.windows
+                            .get(&window)
+                            .and_then(|state| state.pane_state(pane))
+                            .and_then(|pane| pane.directory.clone())
+                    })
+                } else {
+                    directory
+                };
+                match self.spawn_window(event_loop, directory.as_deref()) {
+                    Some(window) => {
+                        let pane = self.windows[&window].tree.active();
+                        self.control_reply_pane(&event, window, pane, &instance);
+                    }
+                    None => error(ErrorCode::Internal, "could not create terminal window"),
+                }
+            }
+            Operation::ListLoadouts => match self.list_loadouts() {
+                Ok(loadouts) => {
+                    let _ = event
+                        .reply
+                        .try_send(Response::new(instance, ResponseResult::Loadouts { loadouts }));
+                }
+                Err(message) => error(ErrorCode::Internal, &message.to_string()),
+            },
+            Operation::SaveLoadout { name, include_directories } => match self
+                .save_loadout(&name, include_directories)
+            {
+                Ok(()) => {
+                    let _ = event
+                        .reply
+                        .try_send(Response::new(instance, ResponseResult::LoadoutSaved { name }));
+                }
+                Err(message) => error(ErrorCode::Internal, &message.to_string()),
+            },
+            Operation::DeleteLoadout { name } => match self.delete_loadout(&name) {
+                Ok(()) => {
+                    let _ = event
+                        .reply
+                        .try_send(Response::new(instance, ResponseResult::LoadoutDeleted { name }));
+                }
+                Err(message) => error(ErrorCode::Internal, &message.to_string()),
+            },
+            Operation::OpenLoadout { name, restore_directories } => {
+                match self.open_loadout(event_loop, &name, restore_directories) {
+                    Ok(windows) => {
+                        let mut panes = Vec::new();
+                        for window in windows {
+                            for pane in self.windows[&window].tree.pane_ids() {
+                                if let Some(info) = self.control_pane_info(window, pane, &instance)
+                                {
+                                    panes.push(info);
+                                }
+                            }
+                        }
+                        panes.sort_by_key(|pane| pane.session.session_id);
+                        let _ = event.reply.try_send(Response::new(
+                            instance,
+                            ResponseResult::LoadoutOpened { name, panes },
+                        ));
+                    }
+                    Err(message) => error(ErrorCode::Internal, &message.to_string()),
+                }
+            }
             operation => {
                 let session = operation.session().expect("targeted operation").clone();
-                let target = self.windows.iter().find_map(|(id, state)| {
-                    state
-                        .tree
-                        .pane_ids()
-                        .into_iter()
-                        .find(|pane_id| {
-                            state
-                                .pane_state(*pane_id)
-                                .is_some_and(|pane| pane.session == session.session_id)
-                        })
-                        .map(|pane| (*id, pane))
-                });
+                let target = self.control_target(&session);
                 let Some((window_id, pane_id)) = target else {
                     error(ErrorCode::UnknownSession, "terminal session is absent or was restarted");
                     return;
                 };
+                match &operation {
+                    Operation::SplitPane { axis, directory, .. } => {
+                        self.windows
+                            .get_mut(&window_id)
+                            .expect("target window")
+                            .focus_pane(pane_id);
+                        match self.split_pane_in_directory(window_id, *axis, directory.as_deref()) {
+                            Some(pane) => {
+                                self.control_reply_pane(&event, window_id, pane, &instance)
+                            }
+                            None => {
+                                error(ErrorCode::Busy, "pane cannot split at this size or capacity")
+                            }
+                        }
+                        return;
+                    }
+                    Operation::FocusPane { .. } => {
+                        let state = self.windows.get_mut(&window_id).expect("target window");
+                        state.focus_pane(pane_id);
+                        state.window.focus_window();
+                        self.note_session_change();
+                        self.control_reply_pane(&event, window_id, pane_id, &instance);
+                        return;
+                    }
+                    Operation::MovePane { target, edge, new_window, .. } => {
+                        let destination = if *new_window {
+                            self.detach_pane(event_loop, window_id, pane_id, None).and_then(
+                                |window| {
+                                    self.control_target(&session).map(|(_, pane)| (window, pane))
+                                },
+                            )
+                        } else {
+                            let Some((window, target_pane)) =
+                                self.control_target(target.as_ref().expect("validated target"))
+                            else {
+                                error(ErrorCode::UnknownSession, "target pane is absent");
+                                return;
+                            };
+                            self.dock_pane(
+                                window_id,
+                                pane_id,
+                                window,
+                                target_pane,
+                                (*edge).expect("validated edge").into(),
+                            )
+                            .map(|pane| (window, pane))
+                        };
+                        match destination {
+                            Some((window, pane)) => {
+                                self.control_reply_pane(&event, window, pane, &instance)
+                            }
+                            None => error(ErrorCode::Busy, "pane cannot move to this destination"),
+                        }
+                        return;
+                    }
+                    Operation::ClosePane { .. } => {
+                        self.close_pane(window_id, pane_id, event_loop);
+                        let _ = event.reply.try_send(Response::new(
+                            instance,
+                            ResponseResult::PaneClosed { session },
+                        ));
+                        return;
+                    }
+                    Operation::ZoomPane { .. } => {
+                        let state = self.windows.get_mut(&window_id).expect("target window");
+                        state.focus_pane(pane_id);
+                        state.toggle_pane_zoom();
+                        self.control_reply_pane(&event, window_id, pane_id, &instance);
+                        return;
+                    }
+                    Operation::SetPane { appearance, .. } => {
+                        let mut updated = self.windows[&window_id]
+                            .pane_state(pane_id)
+                            .expect("target pane")
+                            .appearance
+                            .clone();
+                        appearance.apply(&mut updated);
+                        match self.set_pane_appearance(window_id, pane_id, updated) {
+                            Ok(()) => {
+                                self.control_reply_pane(&event, window_id, pane_id, &instance)
+                            }
+                            Err(message) => error(ErrorCode::InvalidRequest, &message),
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 let state = self.windows.get_mut(&window_id).expect("target window");
                 state.load_pane(pane_id);
                 match operation {

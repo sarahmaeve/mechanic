@@ -1,5 +1,7 @@
 #[allow(dead_code, unused_imports, reason = "explicit native smoke shares application internals")]
 #[path = "../src/app.rs"] mod app;
+#[allow(dead_code, unused_imports)] #[path = "../src/palette.rs"] mod palette;
+#[allow(dead_code, unused_imports)] #[path = "../src/palette_platform.rs"] mod palette_platform;
 #[allow(dead_code, unused_imports)] #[path = "../src/control.rs"] mod control;
 #[allow(dead_code, unused_imports)] #[path = "../src/session.rs"] mod session;
 #[allow(dead_code, unused_imports)] #[path = "../src/convert.rs"] mod convert;

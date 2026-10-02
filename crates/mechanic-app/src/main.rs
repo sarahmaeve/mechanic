@@ -11,6 +11,8 @@ mod link_platform;
 mod mouse;
 mod notifications;
 mod notifications_platform;
+mod palette;
+mod palette_platform;
 mod panes;
 mod preedit;
 mod scheduling;
@@ -213,6 +215,10 @@ fn print_help() {
     println!("    Cmd+D splits side by side; Cmd+Shift+D splits top and bottom.");
     println!("    Cmd+[ / Cmd+] cycles panes; Cmd+W closes a pane; Cmd+Shift+W closes a window.");
     println!("    Cmd+Option+arrow focuses the pane in that direction.");
+    println!("    Cmd+Shift+Return toggles pane zoom; Cmd+Shift+P opens the command palette.");
+    println!(
+        "    Drag pane grips to dock/detach; use the palette for titles, colors, and loadouts."
+    );
 }
 
 /// Resolve the user's `mechanic.toml` config path using XDG then HOME.

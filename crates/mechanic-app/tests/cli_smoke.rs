@@ -1,6 +1,9 @@
 //! Smoke tests for Mechanic's command-line surface.
 
 use std::io::Write;
+use std::io::{BufRead, BufReader};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
 
 /// Cargo supplies the integration-test binary path.
@@ -146,9 +149,20 @@ fn control_help_exits_without_starting_the_gui() {
         let output = headless().args(args).output().expect("spawn control help");
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for expected in
-            ["--socket", "--pane", "--stdin", "--raw", "--enter", "--after", "instances"]
-        {
+        for expected in [
+            "--socket",
+            "--pane",
+            "--stdin",
+            "--raw",
+            "--enter",
+            "--after",
+            "instances",
+            "split",
+            "--edge",
+            "--clear-title",
+            "loadout",
+            "--no-directories",
+        ] {
             assert!(stdout.contains(expected), "missing {expected}: {stdout}");
         }
         assert!(output.stderr.is_empty());
@@ -164,6 +178,19 @@ fn invalid_control_commands_return_json_without_starting_the_gui() {
         vec!["ctl", "read", "--pane", "17"],
         vec!["ctl", "wait", "--pane", "stale:17"],
         vec!["ctl", "send", "--pane", "stale:17", "--stdin", "--text", "x"],
+        vec!["ctl", "create", "--directory", "relative"],
+        vec!["ctl", "split", "--pane", "0123456789abcdef0123456789abcdef:17", "--axis", "diagonal"],
+        vec!["ctl", "set", "--pane", "0123456789abcdef0123456789abcdef:17", "--text-color", "red"],
+        vec![
+            "ctl",
+            "move",
+            "--pane",
+            "0123456789abcdef0123456789abcdef:17",
+            "--new-window",
+            "--edge",
+            "left",
+        ],
+        vec!["ctl", "loadout", "save", "--name", " bad"],
     ] {
         let output = headless().args(&args).output().expect("spawn invalid control command");
         assert_eq!(
@@ -177,6 +204,109 @@ fn invalid_control_commands_return_json_without_starting_the_gui() {
         assert_eq!(response["status"], "error");
         assert_eq!(response["code"], "invalid_arguments");
         assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn workspace_control_commands_encode_expected_protocol_over_a_socket() {
+    const HANDLE: &str = "0123456789abcdef0123456789abcdef:17";
+    let cases = [
+        (
+            vec!["create", "--pane", HANDLE, "--directory", "/tmp"],
+            serde_json::json!({"op":"create_pane","directory":"/tmp"}),
+        ),
+        (
+            vec!["split", "--pane", HANDLE, "--axis", "horizontal"],
+            serde_json::json!({"op":"split_pane","axis":"horizontal"}),
+        ),
+        (vec!["focus", "--pane", HANDLE], serde_json::json!({"op":"focus_pane"})),
+        (
+            vec!["move", "--pane", HANDLE, "--target", HANDLE, "--edge", "top"],
+            serde_json::json!({"op":"move_pane","edge":"top","new_window":false}),
+        ),
+        (
+            vec!["move", "--pane", HANDLE, "--new-window"],
+            serde_json::json!({"op":"move_pane","new_window":true}),
+        ),
+        (vec!["close", "--pane", HANDLE], serde_json::json!({"op":"close_pane"})),
+        (vec!["zoom", "--pane", HANDLE], serde_json::json!({"op":"zoom_pane"})),
+        (
+            vec!["set", "--pane", HANDLE, "--clear-title", "--text-color", "#123ABC"],
+            serde_json::json!({"op":"set_pane","appearance":{"title":null,"text_color":"#123ABC"}}),
+        ),
+        (
+            vec!["loadout", "save", "--name", "work", "--no-directories"],
+            serde_json::json!({"op":"save_loadout","name":"work","include_directories":false}),
+        ),
+        (vec!["loadout", "list"], serde_json::json!({"op":"list_loadouts"})),
+        (
+            vec!["loadout", "open", "--name", "work"],
+            serde_json::json!({"op":"open_loadout","name":"work","restore_directories":true}),
+        ),
+        (
+            vec!["loadout", "delete", "--name", "work"],
+            serde_json::json!({"op":"delete_loadout","name":"work"}),
+        ),
+    ];
+    let directory = std::path::PathBuf::from(format!("/tmp/mcli-{}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .expect("create private CLI fixture directory");
+    let socket = directory.join("ctl.sock");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let listener = UnixListener::bind(&socket).expect("bind CLI fixture socket");
+    let _cleanup = Cleanup(directory);
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let expected_requests = cases.len();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..expected_requests {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            requests.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+            stream.write_all(b"{\"version\":1,\"instance_id\":\"0123456789abcdef0123456789abcdef\",\"status\":\"pong\"}\n").unwrap();
+        }
+        requests
+    });
+    for (args, _) in &cases {
+        let output = headless()
+            .arg("--socket")
+            .arg(&socket)
+            .arg("ctl")
+            .args(args)
+            .output()
+            .expect("spawn workspace control command");
+        assert!(
+            output.status.success(),
+            "args={args:?}, stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["status"],
+            "pong"
+        );
+    }
+    let requests = server.join().unwrap();
+    for ((args, expected), request) in cases.into_iter().zip(requests) {
+        assert_eq!(request["version"], 1);
+        for (field, value) in expected.as_object().unwrap() {
+            assert_eq!(&request[field], value, "args={args:?}, request={request}");
+        }
+        if args.contains(&"--pane") {
+            assert_eq!(
+                request["session"],
+                serde_json::json!({"instance_id":"0123456789abcdef0123456789abcdef","session_id":17})
+            );
+            assert_eq!(request["instance_id"], "0123456789abcdef0123456789abcdef");
+        }
     }
 }
 

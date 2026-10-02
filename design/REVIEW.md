@@ -35,11 +35,9 @@ underline styles and strikeout, OSC palette overrides and color query replies,
 viewport size replies, and visible IME preedit text. IME composition remains a
 display overlay until commit and clips to the current row.
 
-Remaining issues:
-
-| Priority | Finding | Location |
-| --- | --- | --- |
-| P2 | GPU device loss is detected but requires device/resource recreation. | `renderer/pipeline.rs` |
+GPU device loss now wakes the app and recreates the device, atlas, and rendering
+resources while retaining PTYs. Failed attempts retry after 250 ms; occluded
+windows defer recovery. Native tests destroy a real device and verify recovery.
 
 Text limits: terminal wrapping is by cells, not words. Ligatures stay within
 physical rows. Offscreen bidi context is bounded to 64 KiB per side;

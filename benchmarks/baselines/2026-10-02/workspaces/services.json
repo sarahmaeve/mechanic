@@ -1,0 +1,28 @@
+{
+  "scope": "16-pane JSON encode; atomic durable save including worker queue; styled 16-pane named loadout durable save and in-memory retrieval; authenticated socket transport with immediate empty-list callback. Excludes GUI dispatch, PTY/window creation and output extraction.",
+  "snapshot_encode": {
+    "median_ns": 4208,
+    "p95_ns": 4958,
+    "samples": 2000
+  },
+  "snapshot_save_flush": {
+    "median_ns": 8075667,
+    "p95_ns": 10059958,
+    "samples": 100
+  },
+  "socket_roundtrip": {
+    "median_ns": 55375,
+    "p95_ns": 97750,
+    "samples": 500
+  },
+  "styled_loadout_retrieve": {
+    "median_ns": 5375,
+    "p95_ns": 7584,
+    "samples": 2000
+  },
+  "styled_loadout_save": {
+    "median_ns": 9183375,
+    "p95_ns": 12862250,
+    "samples": 100
+  }
+}

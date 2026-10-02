@@ -5,6 +5,23 @@ transfer that previously deadlocked. Output batching also improves most tested
 GUI workloads. These are initial observations from one machine, not stable
 cross-terminal rankings.
 
+## Workspace controls, styling, and loadouts — 2026-10-02
+
+Two-pane renderer preparation with titles/custom outlines averaged **12.25 µs**
+idle versus **11.78 µs** plain, and **56.52 µs** versus **55.39 µs** when one pane
+changed. Each workload used 100 alternating-order pairs after 20 warmups. Idle
+geometry uploads stayed at zero; busy upload bytes were identical. GPU completion,
+presentation, and whole-app CPU are outside these measurements.
+
+A styled 16-pane loadout took **9.18 ms** median to save durably and **5.38 µs**
+to retrieve from memory, excluding shell/window creation. Saving is explicit;
+ordinary automatic workspace persistence still uses its worker.
+
+All **564 workspace tests** passed, plus native docking, palette, control, and
+loadout checks. A real GPU device destruction/recovery test retained the original
+shell variable and Find match. Strict Clippy, formatting, and release build pass.
+[Raw results and scope](baselines/2026-10-02/workspaces/README.md).
+
 ## Pane rearrangement and detachment — 2026-10-02
 
 A balanced 16-pane preview-and-move benchmark measured **2.27 µs per operation**

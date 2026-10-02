@@ -27,6 +27,8 @@ use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 #[path = "app_control.rs"]
 mod app_control;
+#[path = "app_palette.rs"]
+mod app_palette;
 #[path = "app_pane_drag.rs"]
 mod app_pane_drag;
 #[path = "app_pane_move.rs"]
@@ -45,6 +47,8 @@ pub enum UserEvent {
     Search(WindowId, PaneId, u64, crate::search_platform::SearchAction),
     NotificationReady(CompletionNotification),
     Control(crate::control::ControlEvent),
+    Palette(WindowId, crate::palette_platform::PaletteAction),
+    RendererLost(WindowId),
 }
 
 /// Independent terminal state retained when focus or pointer routing changes.
@@ -55,6 +59,7 @@ struct PaneState {
     session: u64,
     directory: Option<std::path::PathBuf>,
     directory_metadata: (Option<String>, Option<String>),
+    appearance: crate::session::PaneAppearance,
     completions: std::collections::VecDeque<mechanic_core::CommandCompletion>,
     cached_grid: Option<RenderGrid>,
     /// Current physical mouse cursor position in pixels.
@@ -79,12 +84,26 @@ struct PaneState {
 }
 
 impl PaneState {
+    fn theme<'a>(
+        &self,
+        theme: &'a mechanic_config::theme::Theme,
+    ) -> std::borrow::Cow<'a, mechanic_config::theme::Theme> {
+        if let Some(color) = self.appearance.text_color.as_deref().and_then(pane_color) {
+            let mut themed = theme.clone();
+            themed.foreground = color;
+            std::borrow::Cow::Owned(themed)
+        } else {
+            std::borrow::Cow::Borrowed(theme)
+        }
+    }
+
     fn new(terminal: Terminal, session: u64) -> Self {
         Self {
             terminal,
             session,
             directory: None,
             directory_metadata: (None, None),
+            appearance: Default::default(),
             completions: std::collections::VecDeque::new(),
             cached_grid: None,
             search_panel: None,
@@ -123,6 +142,10 @@ struct AppState {
     divider_drag: Option<u64>,
     divider_hover: Option<u64>,
     pane_drag_visual: app_pane_drag::PaneDragVisual,
+    pane_zoomed: bool,
+    palette: Option<crate::palette_platform::PalettePanel>,
+    palette_target: Option<(PaneId, u64)>,
+    palette_open: bool,
     captured_pane: Option<PaneId>,
     pointer_position: (f64, f64),
     pointer_inside: bool,
@@ -179,6 +202,9 @@ impl AppState {
         self.mark_content_dirty();
         if self.tree.focus(id) {
             self.load_pane(id);
+            if self.pane_zoomed {
+                self.resize_panes();
+            }
             self.mark_content_dirty();
             self.request_redraw();
         }
@@ -210,10 +236,11 @@ impl AppState {
 
     fn resize_panes(&mut self) {
         let size = self.window.inner_size();
-        self.layout = self.tree.layout(
+        self.layout = self.tree.view_layout(
             Rect { x: 0, y: 0, width: size.width, height: size.height },
             self.minimum_pane_size(),
             (6.0 * self.window.scale_factor()).round().max(1.0) as u32,
+            self.pane_zoomed,
         );
         let active = self.tree.active();
         for item in self.layout.panes.clone() {
@@ -566,7 +593,11 @@ impl App {
         }
         if outcome.grid_maybe_changed {
             state.invalidate_search();
-            state.mark_content_dirty();
+            state.pane.content_dirty = true;
+            state.pane.layout_dirty = true;
+            if state.layout.pane(pane_id).is_some() {
+                state.content_dirty = true;
+            }
         }
 
         // Fatal transport failures freeze the window even if a child exit was
@@ -733,6 +764,10 @@ impl App {
                 }
             };
         let mut pane = PaneState::new(terminal, session);
+        pane.appearance =
+            snapshot.and_then(|s| s.appearances.get(&pane_id)).cloned().unwrap_or_default();
+        let pane_theme = pane.theme(&self.config.theme);
+        pane.terminal.set_theme(&pane_theme);
         pane.directory = directory
             .filter(|path| path.is_dir())
             .map(std::path::Path::to_path_buf)
@@ -757,6 +792,10 @@ impl App {
                 match terminal {
                     Ok(terminal) => {
                         let mut pane = PaneState::new(terminal, other_session);
+                        pane.appearance =
+                            snapshot.appearances.get(&other_id).cloned().unwrap_or_default();
+                        let pane_theme = pane.theme(&self.config.theme);
+                        pane.terminal.set_theme(&pane_theme);
                         pane.directory = directory
                             .filter(|path| path.is_dir())
                             .map(std::path::Path::to_path_buf)
@@ -820,6 +859,10 @@ impl App {
             divider_drag: None,
             divider_hover: None,
             pane_drag_visual: Default::default(),
+            pane_zoomed: false,
+            palette: None,
+            palette_target: None,
+            palette_open: false,
             captured_pane: None,
             pointer_position: (0.0, 0.0),
             pointer_inside: false,
@@ -841,13 +884,23 @@ impl App {
     }
 
     fn split_pane(&mut self, id: WindowId, axis: Axis) -> Option<PaneId> {
+        self.split_pane_in_directory(id, axis, None)
+    }
+
+    fn split_pane_in_directory(
+        &mut self,
+        id: WindowId,
+        axis: Axis,
+        directory: Option<&std::path::Path>,
+    ) -> Option<PaneId> {
         let session = self.allocate_session()?;
         let state = self.windows.get_mut(&id)?;
         state.load_pane(state.tree.active());
-        if !state.tree.can_split_active(axis, &state.layout) {
+        if !state.tree.can_split_active(axis, &state.unzoomed_layout()) {
             return None;
         }
-        let directory = state.pane.directory.clone();
+        let directory =
+            directory.map(std::path::Path::to_path_buf).or_else(|| state.pane.directory.clone());
         let original = state.loaded_pane;
         let pane_id = state.tree.split_active(axis)?;
         let size = state.pane.terminal.size();
@@ -870,6 +923,7 @@ impl App {
         let mut pane = PaneState::new(terminal, session);
         pane.directory = directory.or_else(|| std::env::current_dir().ok());
         state.other_panes.insert(pane_id, pane);
+        state.pane_zoomed = false;
         state.resize_panes();
         state.request_redraw();
         self.pending_parsers.enqueue((id, pane_id, session));
@@ -1735,6 +1789,10 @@ impl App {
                     PaneShortcut::Split(axis) => {
                         self.split_pane(id, axis);
                     }
+                    PaneShortcut::Palette => self.show_palette(id),
+                    PaneShortcut::Zoom => {
+                        self.windows.get_mut(&id).unwrap().toggle_pane_zoom();
+                    }
                     PaneShortcut::CloseWindow => self.close_window(id, event_loop),
                     PaneShortcut::ClosePane => {
                         let pane = self.windows[&id].tree.active();
@@ -1754,7 +1812,9 @@ impl App {
                     PaneShortcut::Direction(direction) => {
                         let state = self.windows.get_mut(&id).unwrap();
                         let original = state.tree.active();
-                        if let Some(pane) = state.tree.focus_direction(direction, &state.layout) {
+                        if let Some(pane) =
+                            state.tree.focus_direction(direction, &state.unzoomed_layout())
+                        {
                             state.tree.focus(original);
                             state.focus_pane(pane);
                         }
@@ -1963,6 +2023,19 @@ impl ApplicationHandler<UserEvent> for App {
         self.control_service.expire(now, &mut earliest_deadline);
 
         for state in self.windows.values_mut() {
+            if state.renderer.needs_device_recovery() {
+                if state.frame_pacer.is_occluded() {
+                    continue;
+                }
+                if let Some(retry) =
+                    state.renderer.device_recovery_retry_at().filter(|retry| *retry > now)
+                {
+                    merge_deadline(&mut earliest_deadline, retry);
+                } else {
+                    state.window.request_redraw();
+                }
+                continue;
+            }
             let input = AnimationInputs {
                 is_alive: state.has_live_pane(),
                 focused: state.focused,
@@ -2006,7 +2079,14 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Control(event) => self.dispatch_control(event),
+            UserEvent::Control(event) => self.dispatch_control(_event_loop, event),
+            UserEvent::Palette(id, action) => self.dispatch_palette(_event_loop, id, action),
+            UserEvent::RendererLost(id) => {
+                if let Some(state) = self.windows.get_mut(&id) {
+                    state.content_dirty = true;
+                    state.request_redraw();
+                }
+            }
             UserEvent::Search(id, pane_id, session, action) => {
                 let Some(state) = self.windows.get_mut(&id) else {
                     return;
@@ -2222,6 +2302,8 @@ fn animation_toggle_shortcut(key: PhysicalKey, modifiers: ModifiersState) -> boo
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneShortcut {
+    Palette,
+    Zoom,
     Split(Axis),
     ClosePane,
     CloseWindow,
@@ -2244,6 +2326,8 @@ fn pane_shortcut(key: &Key, modifiers: ModifiersState) -> Option<PaneShortcut> {
     }
     if modifiers == (ModifiersState::SUPER | ModifiersState::SHIFT) {
         return match key {
+            Key::Character(c) if c.eq_ignore_ascii_case("p") => Some(PaneShortcut::Palette),
+            Key::Named(NamedKey::Enter) => Some(PaneShortcut::Zoom),
             Key::Character(c) if c.eq_ignore_ascii_case("d") => {
                 Some(PaneShortcut::Split(Axis::Horizontal))
             }
@@ -2315,6 +2399,11 @@ fn workspace_shortcut(key: &Key, modifiers: ModifiersState) -> Option<WorkspaceS
     None
 }
 
+fn pane_color(value: &str) -> Option<mechanic_config::theme::Rgb> {
+    let [r, g, b] = crate::session::parse_color(value).ok()?;
+    Some(mechanic_config::theme::Rgb::new(r, g, b))
+}
+
 fn shell_window_title(
     title: &str,
     cwd: Option<&str>,
@@ -2353,6 +2442,25 @@ fn render_frame(
     animations: mechanic_config::theme::AnimationConfig,
 ) {
     let now = Instant::now();
+    if state.renderer.needs_device_recovery() {
+        match pollster::block_on(state.renderer.recover_device()) {
+            Ok(true) => {
+                let metrics = state.renderer.cell_metrics();
+                let resized = metrics.cell_width != state.cell_metrics.cell_width
+                    || metrics.cell_height != state.cell_metrics.cell_height;
+                state.cell_metrics = metrics;
+                if resized {
+                    state.resize_panes();
+                }
+                state.content_dirty = true;
+            }
+            Ok(false) => return,
+            Err(error) => {
+                log::warn!("GPU recovery failed; retrying: {error}");
+                return;
+            }
+        }
+    }
 
     let dwell = Duration::from_millis(config.theme.opacity.bloom_dwell_ms as u64);
     let duration = Duration::from_millis(config.theme.opacity.bloom_duration_ms as u64);
@@ -2406,7 +2514,10 @@ fn render_frame(
         .panes
         .iter()
         .map(|pane| {
-            let rect = state.pane_header_rect(pane.id).unwrap();
+            let mut rect = state.pane_header_rect(pane.id).unwrap();
+            if state.pane_state(pane.id).is_some_and(|pane| pane.appearance.title.is_some()) {
+                rect.width = rect.width.min((24.0 * state.window.scale_factor()).round() as u32);
+            }
             RenderPaneHandle {
                 rect: mechanic_renderer::PaneRect {
                     x: rect.x,
@@ -2420,6 +2531,48 @@ fn render_frame(
         })
         .collect();
     state.renderer.set_pane_handles(&handles);
+    let outlines: Vec<_> = state
+        .layout
+        .panes
+        .iter()
+        .map(|item| {
+            let color = state
+                .pane_state(item.id)
+                .and_then(|pane| pane.appearance.outline_color.as_deref())
+                .and_then(pane_color);
+            (item.id, color)
+        })
+        .collect();
+    state.renderer.set_pane_outline_colors(&outlines);
+    let headers: Vec<_> = state
+        .layout
+        .panes
+        .iter()
+        .filter_map(|item| {
+            let pane = state.pane_state(item.id)?;
+            let title = pane.appearance.title.as_ref()?;
+            let mut rect = state.pane_header_rect(item.id)?;
+            let inset = (28.0 * state.window.scale_factor()).round() as u32;
+            rect.x += inset.min(rect.width);
+            rect.width = rect.width.saturating_sub(inset);
+            Some(mechanic_renderer::RenderPaneHeader {
+                rect: mechanic_renderer::PaneRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                },
+                title: title.clone(),
+                color: pane
+                    .appearance
+                    .outline_color
+                    .as_deref()
+                    .or(pane.appearance.text_color.as_deref())
+                    .and_then(pane_color),
+            })
+        })
+        .collect();
+    state.renderer.set_pane_headers(&headers);
     state.renderer.set_pane_drop_preview(state.pane_drag_visual.preview.map(|rect| {
         mechanic_renderer::PaneRect { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
     }));
@@ -2431,14 +2584,14 @@ fn render_frame(
             log::log_enabled!(target: "mechanic_render_profile", log::Level::Trace)
                 .then(Instant::now);
         let active = state.tree.active();
-        for pane_id in state.tree.pane_ids() {
+        for pane_id in state.layout.panes.iter().map(|item| item.id).collect::<Vec<_>>() {
             state.load_pane(pane_id);
             if !state.pane.content_dirty && state.pane.cached_grid.is_some() {
                 continue;
             }
             let mut grid = crate::convert::convert_grid(
                 &state.pane.terminal,
-                &config.theme,
+                &state.pane.theme(&config.theme),
                 state.focused && pane_id == active && state.pane.preedit.is_none(),
             );
             state.pane.search.highlight(&mut grid, &state.pane.terminal, &config.theme);
@@ -2495,7 +2648,7 @@ fn render_frame(
     let shell = state.pane.terminal.shell_integration();
     let shell_running = state.pane.exit_status.is_none() && shell.is_running();
     let integrated_title = shell_window_title(
-        state.pane.terminal.title(),
+        state.pane.appearance.title.as_deref().unwrap_or_else(|| state.pane.terminal.title()),
         shell.cwd(),
         shell_running,
         state.pane.exit_status.is_none().then(|| shell.last_exit_status()).flatten(),
@@ -2643,6 +2796,8 @@ fn respawn_shell(
         Ok(new_term) => {
             state.invalidate_search();
             state.pane.terminal = new_term;
+            let pane_theme = state.pane.theme(&config.theme);
+            state.pane.terminal.set_theme(&pane_theme);
             state.pane.session = session;
             state.pane.completions.clear();
             state.pane.directory_metadata = (None, None);
@@ -2750,6 +2905,11 @@ fn format_exit_status(status: Option<std::process::ExitStatus>) -> String {
 mod pane_smoke;
 
 #[cfg(test)]
+#[path = "app_workspace_smoke.rs"]
+#[allow(dead_code, reason = "used by the explicit native workspace smoke example")]
+mod workspace_smoke;
+
+#[cfg(test)]
 #[path = "app_pane_drag_smoke.rs"]
 #[allow(dead_code, reason = "used by the explicit native pane smoke example")]
 mod app_pane_drag_smoke;
@@ -2767,6 +2927,22 @@ mod app_pane_move_smoke;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palette_and_zoom_shortcuts_leave_shell_chords_available() {
+        let chord = ModifiersState::SUPER | ModifiersState::SHIFT;
+        assert_eq!(pane_shortcut(&Key::Character("P".into()), chord), Some(PaneShortcut::Palette));
+        assert_eq!(pane_shortcut(&Key::Named(NamedKey::Enter), chord), Some(PaneShortcut::Zoom));
+        for modifiers in [
+            ModifiersState::empty(),
+            ModifiersState::SUPER,
+            chord | ModifiersState::ALT,
+            chord | ModifiersState::CONTROL,
+        ] {
+            assert_eq!(pane_shortcut(&Key::Character("p".into()), modifiers), None);
+            assert_eq!(pane_shortcut(&Key::Named(NamedKey::Enter), modifiers), None);
+        }
+    }
 
     #[test]
     fn pane_shortcuts_require_exact_chords_and_leave_prompt_navigation_available() {

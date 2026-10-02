@@ -1,5 +1,6 @@
 //! Transfer live pane state without replacing its PTY or execution identity.
 use super::*;
+use crate::panes::DropEdge;
 
 pub(super) struct WindowResources {
     pub(super) window: Arc<Window>,
@@ -26,6 +27,64 @@ impl SessionRoute {
 }
 
 impl App {
+    /// Dock a live session beside a pane in an existing window. Build and check
+    /// the receiving tree before taking ownership from the source window.
+    pub(super) fn dock_pane(
+        &mut self,
+        source_window: WindowId,
+        source_pane: PaneId,
+        destination_window: WindowId,
+        target_pane: PaneId,
+        edge: DropEdge,
+    ) -> Option<PaneId> {
+        let source = self.windows.get(&source_window)?;
+        source.pane_state(source_pane)?;
+        if !source.tree.pane_ids().contains(&source_pane) {
+            return None;
+        }
+        let destination = self.windows.get(&destination_window)?;
+        destination.pane_state(target_pane)?;
+        let receiving_layout = destination.unzoomed_layout();
+        if source_window == destination_window {
+            destination.tree.move_preview(source_pane, target_pane, edge, &receiving_layout)?;
+            let state = self.windows.get_mut(&source_window)?;
+            if !state.tree.move_pane(source_pane, target_pane, edge) {
+                return None;
+            }
+            state.pane_zoomed = false;
+            state.resize_panes();
+            state.request_redraw();
+            self.note_session_change();
+            return Some(source_pane);
+        }
+        let mut receiving_tree = destination.tree.clone();
+        let destination_pane = receiving_tree.insert_pane(target_pane, edge, &receiving_layout)?;
+        let moved = self.take_live_pane(source_window, source_pane)?;
+        let session = moved.session;
+        let state = self.windows.get_mut(&destination_window).expect("validated docking window");
+        state.load_pane(state.tree.active());
+        state.cancel_preedit();
+        state.pane.link_press.cancel();
+        if let Some(panel) = &state.pane.search_panel {
+            panel.close();
+        }
+        state.other_panes.insert(destination_pane, moved);
+        state.tree = receiving_tree;
+        state.pane_zoomed = false;
+        state.resize_panes();
+        state.request_redraw();
+        state.window.focus_window();
+        self.retarget_live_session(
+            session,
+            source_window,
+            source_pane,
+            destination_window,
+            destination_pane,
+        );
+        self.note_session_change();
+        Some(destination_pane)
+    }
+
     pub(super) fn create_window_resources(
         &self,
         event_loop: &ActiveEventLoop,
@@ -46,7 +105,7 @@ impl App {
         let size = window.inner_size();
         let mut font = self.config.font.clone();
         font.size = font_size;
-        let renderer = match pollster::block_on(Renderer::new(
+        let mut renderer = match pollster::block_on(Renderer::new(
             window.clone(),
             (size.width, size.height),
             window.scale_factor() as f32,
@@ -59,6 +118,11 @@ impl App {
                 return None;
             }
         };
+        let proxy = self.proxy.clone();
+        let id = window.id();
+        renderer.set_device_lost_waker(Arc::new(move || {
+            let _ = proxy.send_event(UserEvent::RendererLost(id));
+        }));
         Some(WindowResources { window, renderer, font_size })
     }
 
@@ -85,7 +149,7 @@ impl App {
             log::warn!("cannot detach pane: window limit reached");
             return None;
         }
-        let rect = source.layout.pane(pane)?;
+        let rect = source.layout.pane(pane).or_else(|| source.unzoomed_layout().pane(pane))?;
         let scale = source.window.scale_factor();
         let font_size = source.current_font_size;
         let mut attributes = WindowAttributes::default()
@@ -122,10 +186,12 @@ impl App {
 
     fn take_live_pane(&mut self, window: WindowId, pane: PaneId) -> Option<PaneState> {
         let state = self.windows.get_mut(&window)?;
-        if !state.tree.pane_ids().contains(&pane) {
+        if !state.tree.pane_ids().contains(&pane) || state.pane_state(pane).is_none() {
             return None;
         }
-        state.load_pane(pane);
+        if !state.load_pane(pane) {
+            return None;
+        }
         state.cancel_preedit();
         if let Some(panel) = state.pane.search_panel.take() {
             panel.close();
@@ -151,8 +217,11 @@ impl App {
             return Some(state.pane);
         }
         state.tree.close(pane);
-        state.load_pane(state.tree.active());
-        let moved = state.other_panes.remove(&pane)?;
+        assert!(state.load_pane(state.tree.active()), "validated surviving pane");
+        let moved = state.other_panes.remove(&pane).expect("validated moved pane");
+        if state.tree.len() == 1 {
+            state.pane_zoomed = false;
+        }
         state.resize_panes();
         state.request_redraw();
         Some(moved)

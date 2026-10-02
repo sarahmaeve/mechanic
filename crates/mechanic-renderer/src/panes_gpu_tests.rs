@@ -1,5 +1,5 @@
 //! Offscreen tests exercise the same pane preparation and render-pass code as a window.
-use std::{collections::HashMap, sync::atomic::AtomicBool, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use wgpu::util::DeviceExt as _;
 
@@ -16,6 +16,7 @@ fn fixture() -> (RenderState, TextRenderer, FontConfig) {
     });
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let (device_lost, device_lost_waker) = crate::pipeline::install_device_lost_callback(&device);
     let config = FontConfig { family: "Menlo".into(), size: 14.0, ..Default::default() };
     let text = TextRenderer::new(&device, &queue, &config, 1.0);
     let metrics = text.cell_metrics();
@@ -58,10 +59,13 @@ fn fixture() -> (RenderState, TextRenderer, FontConfig) {
         device,
         queue,
         surface: None,
-        surface_factory: Box::new(|| panic!("offscreen fixture cannot acquire a window surface")),
+        surface_factory: Arc::new(|| panic!("offscreen fixture cannot acquire a window surface")),
+        instance,
         adapter,
-        device_lost: Arc::new(AtomicBool::new(false)),
+        device_lost,
+        device_lost_waker,
         surface_recovery: SurfaceRecovery::default(),
+        device_recovery: SurfaceRecovery::default(),
         surface_config: wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -94,7 +98,9 @@ fn fixture() -> (RenderState, TextRenderer, FontConfig) {
         pane_order: vec![],
         pane_frame_cached: false,
         pane_colors: (Rgb::new(100, 200, 255), Rgb::new(50, 60, 70)),
+        pane_outline_colors: HashMap::new(),
         dividers: DividerState::default(),
+        headers: HeaderState::default(),
     };
     (state, text, config)
 }
@@ -182,6 +188,130 @@ fn assert_idle(state: &mut RenderState, id: u64, grid: &RenderGrid, text: &TextR
             )
             .is_empty()
     );
+}
+
+#[test]
+#[ignore = "requires a Metal device; run explicitly on macOS"]
+fn pane_headers_clip_color_and_retain_idle_terminal_geometry() {
+    let (mut state, mut text, config) = fixture();
+    let mut grid = RenderGrid::new(16, 3);
+    grid.cursor_visible = false;
+    for cell in &mut grid.cells {
+        cell.bg = Rgb::new(0, 0, 0);
+    }
+    let scene = [RenderPane {
+        id: 7,
+        rect: PaneRect { x: 0, y: 32, width: 160, height: 64 },
+        grid: &grid,
+        active: true,
+    }];
+    let header = RenderPaneHeader {
+        rect: PaneRect { x: 8, y: 4, width: 40, height: 18 },
+        title: "Long pane title".into(),
+        color: Some(Rgb::new(255, 0, 0)),
+    };
+    state.set_pane_outline_colors(&[(7, Some(Rgb::new(0, 255, 0)))]);
+    state.set_pane_headers(std::slice::from_ref(&header));
+    assert!(state.prepare_panes_frame(&scene, &mut text, &config, uniforms()).unwrap() > 0);
+    let image = pixels(&state);
+    let pixel = |x: usize, y: usize| &image[(y * 160 + x) * 4..(y * 160 + x + 1) * 4];
+    assert_eq!(pixel(0, 50), [0, 255, 0, 255], "explicit outline missing on lone pane");
+    let mut colored = 0;
+    for y in 0..32 {
+        for x in 0..160 {
+            let rgb = &pixel(x, y)[..3];
+            if rgb != [0, 0, 0] {
+                assert!((8..48).contains(&x) && (4..22).contains(&y), "header leaked at {x},{y}");
+                assert!(rgb[0] > 0 && rgb[1] == 0 && rgb[2] == 0, "header lost custom color");
+                colored += 1;
+            }
+        }
+    }
+    assert!(colored > 20, "header did not produce readable glyph coverage");
+    let terminal_rows = state.panes[&7].layout.rows.clone();
+    state.pane_frame_cached = true;
+    state.set_pane_headers(std::slice::from_ref(&header));
+    state.set_pane_outline_colors(&[(7, Some(Rgb::new(0, 255, 0)))]);
+    assert!(state.pane_frame_cached, "unchanged appearance discarded cached presentation");
+    assert_eq!(state.prepare_panes_frame(&scene, &mut text, &config, uniforms()), Some(0));
+    state.set_pane_headers(&[RenderPaneHeader { title: "Changed".into(), ..header }]);
+    assert!(!state.pane_frame_cached, "changed title left cached presentation stale");
+    assert!(state.prepare_panes_frame(&scene, &mut text, &config, uniforms()).unwrap() > 0);
+    assert!(terminal_rows.iter().zip(&state.panes[&7].layout.rows).all(|(a, b)| Arc::ptr_eq(a, b)));
+    assert_idle(&mut state, 7, &grid, &text);
+    state.set_pane_headers(&[]);
+    state.set_pane_outline_colors(&[]);
+    state.prepare_panes_frame(&scene, &mut text, &config, uniforms()).unwrap();
+    let cleared = pixels(&state);
+    assert_eq!(&cleared[(50 * 160) * 4..(50 * 160) * 4 + 4], [0, 0, 0, 255]);
+    assert!(
+        cleared[..32 * 160 * 4].as_chunks::<4>().0.iter().all(|pixel| *pixel == [0, 0, 0, 255])
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal device; run explicitly on macOS"]
+fn device_loss_wakes_idle_renderer_and_fresh_resources_preserve_scene_settings() {
+    let (mut lost, mut old_text, config) = fixture();
+    let (tx, rx) = std::sync::mpsc::channel();
+    lost.set_device_lost_waker(Arc::new(move || {
+        let _ = tx.send(());
+    }));
+    let mut grid = RenderGrid::new(12, 3);
+    grid.cursor_visible = false;
+    let scene = [RenderPane {
+        id: 42,
+        rect: PaneRect { x: 0, y: 24, width: 140, height: 60 },
+        grid: &grid,
+        active: true,
+    }];
+    lost.set_pane_headers(&[RenderPaneHeader {
+        rect: PaneRect { x: 20, y: 0, width: 100, height: 18 },
+        title: "Survives loss".into(),
+        color: Some(Rgb::new(255, 0, 0)),
+    }]);
+    lost.set_pane_outline_colors(&[(42, Some(Rgb::new(0, 255, 0)))]);
+    lost.set_pane_handles(&[RenderPaneHandle {
+        rect: PaneRect { x: 0, y: 0, width: 18, height: 18 },
+        highlighted: true,
+    }]);
+    lost.set_pane_drop_preview(Some(PaneRect { x: 150, y: 20, width: 10, height: 40 }));
+    lost.prepare_panes_frame(&scene, &mut old_text, &config, uniforms()).unwrap();
+    lost.dividers.update(&lost.device, &lost.queue, None);
+    let before = pixels(&lost);
+    lost.device.destroy();
+    lost.device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).expect("loss did not wake idle application");
+    assert!(lost.needs_device_recovery());
+    lost.device_recovery_failed();
+    assert!(lost.device_recovery_retry_at().unwrap() > Instant::now());
+    // A paced retry must not even invoke the offscreen fixture's surface factory.
+    assert!(pollster::block_on(lost.replacement_surface_init()).unwrap().is_none());
+    let (mut restored, mut new_text, new_config) = fixture();
+    restored.copy_pane_settings_from(&lost);
+    assert!(!restored.needs_device_recovery(), "old loss flag contaminated fresh device");
+    assert!(restored.device_recovery_retry_at().is_none());
+    assert!(restored.panes.is_empty(), "replacement retained buffers from lost device");
+    assert!(!restored.pane_frame_cached);
+    assert!(
+        restored.prepare_panes_frame(&scene, &mut new_text, &new_config, uniforms()).unwrap() > 0
+    );
+    restored.dividers.update(&restored.device, &restored.queue, None);
+    assert_eq!(pixels(&restored), before, "fresh device changed retained pane appearance");
+    restored.device.destroy();
+    restored
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).expect("replacement did not retain loss wake hook");
 }
 
 #[test]
@@ -359,6 +489,121 @@ fn multi_pane_bidi_hit_mapping_and_global_font_invalidation() {
         assert_eq!(pane.layout.rows.len(), 2);
         assert!(!pane.cache.instances.is_empty());
     }
+}
+
+#[test]
+#[ignore = "offscreen CPU preparation benchmark; coordinate timing and run with --release"]
+fn workspace_decoration_update_benchmark() {
+    use std::io::Write as _;
+    let path = std::env::var_os("MECHANIC_WORKSPACE_RENDER_BENCH_CSV")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("mechanic-workspace-decoration-update.csv"));
+    let mut csv = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    writeln!(csv, "workload,iteration,plain_prepare_ns,styled_prepare_ns,plain_upload_bytes,styled_upload_bytes,total_cells").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut plain = fixture();
+    let mut styled = fixture();
+    let headers = [
+        RenderPaneHeader {
+            rect: PaneRect { x: 24, y: 0, width: 52, height: 18 },
+            title: "Server".into(),
+            color: Some(Rgb::new(255, 160, 80)),
+        },
+        RenderPaneHeader {
+            rect: PaneRect { x: 104, y: 0, width: 52, height: 18 },
+            title: "Tests".into(),
+            color: Some(Rgb::new(80, 160, 255)),
+        },
+    ];
+    let outlines = [(0, Some(Rgb::new(255, 160, 80))), (1, Some(Rgb::new(80, 160, 255)))];
+    let mut grids: Vec<_> = (0..2)
+        .map(|index| {
+            let mut grid = RenderGrid::new(80, 24);
+            grid.cursor_visible = false;
+            for (cell_index, cell) in grid.cells.iter_mut().enumerate() {
+                cell.character = char::from(b'A' + ((cell_index + index) % 26) as u8);
+            }
+            grid
+        })
+        .collect();
+    for workload in ["idle", "busy_one"] {
+        for iteration in 0..120 {
+            assert!(Instant::now() < deadline, "decoration benchmark exceeded 60 seconds");
+            if workload == "busy_one" {
+                grids[0].cells[17].character = char::from(b'A' + (iteration % 26) as u8);
+            }
+            let scene: Vec<_> = grids
+                .iter()
+                .enumerate()
+                .map(|(index, grid)| RenderPane {
+                    id: index as u64,
+                    rect: PaneRect { x: index as u32 * 80, y: 24, width: 76, height: 72 },
+                    grid,
+                    active: index == 0,
+                })
+                .collect();
+            let mut timings = [0u128; 2];
+            let mut uploads = [0usize; 2];
+            for variant in if iteration % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let (state, text, config) = if variant == 0 { &mut plain } else { &mut styled };
+                let idle_rows = state.panes.get(&1).map(|pane| pane.layout.rows.clone());
+                let header_rows: Vec<_> = state
+                    .headers
+                    .labels
+                    .iter()
+                    .flat_map(|label| label.rows.iter().cloned())
+                    .collect();
+                let started = Instant::now();
+                if variant == 1 {
+                    // Match the application, which supplies decoration inputs every frame.
+                    state.set_pane_headers(&headers);
+                    state.set_pane_outline_colors(&outlines);
+                }
+                uploads[variant] =
+                    state.prepare_panes_frame(&scene, text, config, uniforms()).unwrap();
+                timings[variant] = started.elapsed().as_nanos();
+                if let Some(rows) = idle_rows {
+                    assert!(
+                        rows.iter()
+                            .zip(&state.panes[&1].layout.rows)
+                            .all(|(a, b)| Arc::ptr_eq(a, b)),
+                        "idle terminal reshaped"
+                    );
+                    assert_idle(state, 1, &grids[1], text);
+                }
+                if variant == 1 && !header_rows.is_empty() {
+                    assert!(
+                        header_rows
+                            .iter()
+                            .zip(state.headers.labels.iter().flat_map(|label| &label.rows))
+                            .all(|(a, b)| Arc::ptr_eq(a, b)),
+                        "static header reshaped"
+                    );
+                }
+                if workload == "idle" && iteration > 0 {
+                    assert_eq!(uploads[variant], 0, "idle frame uploaded cached geometry");
+                }
+                state.queue.submit(std::iter::empty());
+                state
+                    .device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: Some(Duration::from_secs(10)),
+                    })
+                    .unwrap();
+            }
+            if iteration >= 20 {
+                writeln!(
+                    csv,
+                    "{workload},{iteration},{},{},{},{},3840",
+                    timings[0], timings[1], uploads[0], uploads[1]
+                )
+                .unwrap();
+            }
+        }
+    }
+    csv.flush().unwrap();
+    eprintln!("workspace decoration benchmark: {}", path.display());
 }
 
 #[test]

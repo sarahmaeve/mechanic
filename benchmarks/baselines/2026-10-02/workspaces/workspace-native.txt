@@ -1,0 +1,3 @@
+[2026-10-02T21:11:33Z WARN  workspace_native_smoke::app::app_palette] palette: pane colors must use #RRGGBB
+[2026-10-02T21:11:33Z ERROR mechanic_renderer::pipeline] GPU device lost (Destroyed): ; scheduling device recovery
+workspace native smoke passed: loadouts preserve original sessions and directories, Unicode appearance, zoom layout/focus, ANSI foreground, real device destruction/recovery, live shell retained

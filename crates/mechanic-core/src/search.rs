@@ -60,20 +60,37 @@ pub struct SearchResults {
     pub query_too_long: bool,
 }
 
+/// Canonical caseless text (NFD → full case fold → NFD), matching scrollback
+/// search. Returns None instead of truncating if either the raw or normalized
+/// text exceeds max_chars, bounding normalization's combining-run buffers.
+pub fn normalize_search_text(text: &str, max_chars: usize) -> Option<String> {
+    canonical_caseless_characters(text, max_chars)
+        .map(|characters| characters.into_iter().collect())
+}
+
+fn canonical_caseless_characters(text: &str, max_chars: usize) -> Option<Vec<char>> {
+    let inspected = max_chars.saturating_add(1);
+    if text.chars().take(inspected).count() > max_chars {
+        return None;
+    }
+    let characters: Vec<_> = if text.is_ascii() {
+        text.chars().map(|c| c.to_ascii_lowercase()).collect()
+    } else {
+        text.chars().nfd().default_case_fold().nfd().take(inspected).collect()
+    };
+    (characters.len() <= max_chars).then_some(characters)
+}
+
 /// Search the supplied active grid. Coordinates remain valid until it changes.
 pub fn search_grid(grid: &Grid<Cell>, query: &str, options: SearchOptions) -> SearchResults {
     let mut results = SearchResults::default();
-    // Bound raw input before normalization can buffer a long combining run.
-    if query.chars().take(MAX_QUERY_CHARS + 1).count() > MAX_QUERY_CHARS {
+    let needle: Vec<_> = if options.case_sensitive {
+        query.chars().take(MAX_QUERY_CHARS + 1).collect()
+    } else if let Some(characters) = canonical_caseless_characters(query, MAX_QUERY_CHARS) {
+        characters
+    } else {
         results.query_too_long = true;
         return results;
-    }
-    let needle: Vec<_> = if options.case_sensitive {
-        query.chars().collect()
-    } else if query.is_ascii() {
-        query.chars().map(|c| c.to_ascii_lowercase()).collect()
-    } else {
-        query.chars().nfd().default_case_fold().nfd().take(MAX_QUERY_CHARS + 1).collect()
     };
     if needle.len() > MAX_QUERY_CHARS {
         results.query_too_long = true;
@@ -223,6 +240,25 @@ impl Matcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_text_normalization_is_canonical_and_fully_caseless() {
+        assert_eq!(normalize_search_text("Straße STRAẞE", 64).as_deref(), Some("strasse strasse"));
+        assert_eq!(normalize_search_text("Mu\u{308}ller", 64), normalize_search_text("MÜLLER", 64));
+        assert_eq!(normalize_search_text("Café", 64), normalize_search_text("CAFE\u{301}", 64));
+        assert_ne!(normalize_search_text("ü", 64), normalize_search_text("u", 64));
+        assert_eq!(normalize_search_text("ABC", 3).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn shared_text_normalization_bounds_raw_text_and_unicode_expansion() {
+        assert_eq!(normalize_search_text("", 0).as_deref(), Some(""));
+        assert_eq!(normalize_search_text("a", 0), None);
+        assert_eq!(normalize_search_text("ß", 1), None);
+        assert_eq!(normalize_search_text("ß", 2).as_deref(), Some("ss"));
+        assert_eq!(normalize_search_text("é", 1), None);
+        assert_eq!(normalize_search_text(&"\u{301}".repeat(100_000), 256), None);
+    }
     use alacritty_terminal::Term;
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::term::Config;

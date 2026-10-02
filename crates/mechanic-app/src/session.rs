@@ -19,6 +19,71 @@ pub const MAX_WINDOWS: usize = 16;
 pub const MAX_SESSION_BYTES: u64 = 1024 * 1024;
 const SESSION_FILE: &str = "session.json";
 const LOCK_FILE: &str = "session.lock";
+const LOADOUT_FILE: &str = "loadouts.json";
+const LOADOUT_LOCK_FILE: &str = "loadouts.lock";
+pub const MAX_LOADOUTS: usize = 64;
+pub const MAX_LOADOUT_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_PANE_TITLE_CHARS: usize = 128;
+pub const MAX_PANE_TITLE_BYTES: usize = 512;
+
+/// User supplied labels and colors are independent of terminal OSC titles.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PaneAppearance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline_color: Option<String>,
+}
+
+impl PaneAppearance {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(title) = &self.title
+            && (title.len() > MAX_PANE_TITLE_BYTES
+                || title.chars().count() > MAX_PANE_TITLE_CHARS
+                || title.chars().any(char::is_control))
+        {
+            return Err("pane title must contain at most 128 characters without controls".into());
+        }
+        for color in [&self.text_color, &self.outline_color].into_iter().flatten() {
+            parse_color(color)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn parse_color(color: &str) -> Result<[u8; 3], String> {
+    let bytes = color.as_bytes();
+    if bytes.len() != 7 || bytes[0] != b'#' || !bytes[1..].iter().all(u8::is_ascii_hexdigit) {
+        return Err("pane colors must use #RRGGBB".into());
+    }
+    Ok([
+        u8::from_str_radix(&color[1..3], 16).expect("validated ASCII hexadecimal"),
+        u8::from_str_radix(&color[3..5], 16).expect("validated ASCII hexadecimal"),
+        u8::from_str_radix(&color[5..7], 16).expect("validated ASCII hexadecimal"),
+    ])
+}
+
+pub fn normalize_color(color: &str) -> Result<String, String> {
+    let [red, green, blue] = parse_color(color)?;
+    Ok(format!("#{red:02X}{green:02X}{blue:02X}"))
+}
+
+pub fn validate_loadout_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.trim() != name
+        || name.len() > 256
+        || name.chars().count() > 64
+        || name.chars().any(char::is_control)
+    {
+        return Err(
+            "loadout name must contain 1–64 characters without outer whitespace or controls".into(),
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +93,8 @@ pub struct WindowSnapshot {
     pub font_size: f32,
     pub panes: PaneTreeSnapshot,
     pub directories: BTreeMap<PaneId, PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub appearances: BTreeMap<PaneId, PaneAppearance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,6 +143,12 @@ impl SessionSnapshot {
                 {
                     return Err("invalid pane directory".into());
                 }
+            }
+            for (id, appearance) in &window.appearances {
+                if !ids.contains(id) {
+                    return Err("appearance references an unknown pane".into());
+                }
+                appearance.validate()?;
             }
         }
         Ok(())
@@ -165,27 +238,32 @@ fn validate_private_file(file: &File, allow_unlinked: bool) -> io::Result<()> {
 }
 
 fn load_at(directory: &File) -> io::Result<SessionSnapshot> {
-    let file = open_at(directory, SESSION_FILE, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
-    // An atomic replacement may unlink this already-open, complete old snapshot.
-    validate_private_file(&file, true)?;
-    if file.metadata()?.len() > MAX_SESSION_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "session file exceeds the byte limit",
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_SESSION_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_SESSION_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "session file exceeds the byte limit",
-        ));
-    }
+    let bytes = read_private_bytes(directory, SESSION_FILE, MAX_SESSION_BYTES)?;
     let snapshot: SessionSnapshot = serde_json::from_slice(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     snapshot.validate().map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(snapshot)
+}
+
+fn read_private_bytes(directory: &File, name: &str, limit: u64) -> io::Result<Vec<u8>> {
+    let file = open_at(directory, name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+    // An atomic replacement may unlink this already-open, complete old snapshot.
+    validate_private_file(&file, true)?;
+    if file.metadata()?.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "state file exceeds the byte limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "state file exceeds the byte limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn unlink_at(directory: &File, name: &CString) {
@@ -196,20 +274,24 @@ fn unlink_at(directory: &File, name: &CString) {
 fn write_at(directory: &File, snapshot: &SessionSnapshot) -> io::Result<()> {
     snapshot.validate().map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let bytes = serde_json::to_vec(snapshot).map_err(io::Error::other)?;
-    if bytes.len() as u64 > MAX_SESSION_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "session exceeds the byte limit"));
+    write_private_bytes(directory, SESSION_FILE, &bytes, MAX_SESSION_BYTES)
+}
+
+fn write_private_bytes(directory: &File, name: &str, bytes: &[u8], limit: u64) -> io::Result<()> {
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "state exceeds the byte limit"));
     }
     // Refuse directory, hard-link, or symlink collisions instead of clobbering them.
-    match open_at(directory, SESSION_FILE, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+    match open_at(directory, name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
         Ok(file) => validate_private_file(&file, false)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let (mut temporary, name) = (0..128)
+    let (mut temporary, temporary_name) = (0..128)
         .find_map(|_| {
             let name = format!(
-                ".session-{}-{}.tmp",
+                ".mechanic-{}-{}.tmp",
                 std::process::id(),
                 NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
             );
@@ -228,19 +310,19 @@ fn write_at(directory: &File, snapshot: &SessionSnapshot) -> io::Result<()> {
                 "too many temporary session filename collisions",
             ))
         })?;
-    let destination = CString::new(SESSION_FILE).expect("static filename contains no nul");
+    let destination = CString::new(name).map_err(io::Error::other)?;
     let result = (|| {
         // SAFETY: temporary is an owned regular file descriptor.
         if unsafe { libc::fchmod(temporary.as_raw_fd(), 0o600) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        temporary.write_all(&bytes)?;
+        temporary.write_all(bytes)?;
         temporary.sync_all()?;
         // SAFETY: both names are valid and both directory descriptors are live.
         if unsafe {
             libc::renameat(
                 directory.as_raw_fd(),
-                name.as_ptr(),
+                temporary_name.as_ptr(),
                 directory.as_raw_fd(),
                 destination.as_ptr(),
             )
@@ -250,7 +332,7 @@ fn write_at(directory: &File, snapshot: &SessionSnapshot) -> io::Result<()> {
         }
         directory.sync_all()
     })();
-    unlink_at(directory, &name);
+    unlink_at(directory, &temporary_name);
     result
 }
 
@@ -370,6 +452,179 @@ impl Drop for SessionStore {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadoutInfo {
+    pub name: String,
+    pub windows: usize,
+    pub panes: usize,
+    pub include_directories: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Loadout {
+    include_directories: bool,
+    workspace: SessionSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoadoutCollection {
+    version: u32,
+    loadouts: BTreeMap<String, Loadout>,
+}
+
+impl Default for LoadoutCollection {
+    fn default() -> Self {
+        Self { version: 1, loadouts: BTreeMap::new() }
+    }
+}
+
+impl LoadoutCollection {
+    fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!("unsupported loadout version {}", self.version));
+        }
+        if self.loadouts.len() > MAX_LOADOUTS {
+            return Err("loadout count exceeds the limit".into());
+        }
+        for (name, loadout) in &self.loadouts {
+            validate_loadout_name(name)?;
+            loadout.workspace.validate()?;
+            if loadout.workspace.windows.is_empty() {
+                return Err("loadout must contain at least one window".into());
+            }
+            if !loadout.include_directories
+                && loadout.workspace.windows.iter().any(|window| !window.directories.is_empty())
+            {
+                return Err(
+                    "loadout includes directories despite disabling saved directories".into()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Named layouts share private atomic persistence with automatic sessions, but
+/// have a separate lock and never contain commands or running shell state.
+pub struct LoadoutStore {
+    directory: File,
+    _lock: File,
+    collection: LoadoutCollection,
+}
+
+impl LoadoutStore {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let directory = ensure_private_directory(path)?;
+        let lock = open_at(
+            &directory,
+            LOADOUT_LOCK_FILE,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
+            0o600,
+        )?;
+        validate_private_file(&lock, false)?;
+        // SAFETY: lock is a live owned file descriptor and the mode is valid.
+        if unsafe { libc::fchmod(lock.as_raw_fd(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: lock is a live descriptor and the lock operation is valid.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let collection = match read_private_bytes(&directory, LOADOUT_FILE, MAX_LOADOUT_BYTES) {
+            Ok(bytes) => {
+                let collection: LoadoutCollection = serde_json::from_slice(&bytes)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                collection.validate().map_err(invalid_data)?;
+                collection
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => LoadoutCollection::default(),
+            Err(error) => return Err(error),
+        };
+        Ok(Self { directory, _lock: lock, collection })
+    }
+
+    pub fn list(&self) -> Vec<LoadoutInfo> {
+        self.collection
+            .loadouts
+            .iter()
+            .map(|(name, loadout)| LoadoutInfo {
+                name: name.clone(),
+                windows: loadout.workspace.windows.len(),
+                panes: loadout
+                    .workspace
+                    .windows
+                    .iter()
+                    .map(|window| window.panes.pane_ids().len())
+                    .sum(),
+                include_directories: loadout.include_directories,
+            })
+            .collect()
+    }
+
+    pub fn load(&self, name: &str, restore_directories: bool) -> io::Result<SessionSnapshot> {
+        validate_loadout_name(name).map_err(invalid_input)?;
+        let mut workspace = self
+            .collection
+            .loadouts
+            .get(name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "loadout does not exist"))?
+            .workspace
+            .clone();
+        if !restore_directories {
+            for window in &mut workspace.windows {
+                window.directories.clear();
+            }
+        }
+        Ok(workspace)
+    }
+
+    /// Saving an existing name replaces that layout only after durable publication.
+    pub fn save(
+        &mut self,
+        name: &str,
+        mut workspace: SessionSnapshot,
+        include_directories: bool,
+    ) -> io::Result<()> {
+        validate_loadout_name(name).map_err(invalid_input)?;
+        if !include_directories {
+            for window in &mut workspace.windows {
+                window.directories.clear();
+            }
+        }
+        let mut updated = self.collection.clone();
+        updated.loadouts.insert(name.to_owned(), Loadout { include_directories, workspace });
+        self.publish(updated)
+    }
+
+    pub fn delete(&mut self, name: &str) -> io::Result<()> {
+        validate_loadout_name(name).map_err(invalid_input)?;
+        let mut updated = self.collection.clone();
+        if updated.loadouts.remove(name).is_none() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "loadout does not exist"));
+        }
+        self.publish(updated)
+    }
+
+    fn publish(&mut self, updated: LoadoutCollection) -> io::Result<()> {
+        updated.validate().map_err(invalid_input)?;
+        let bytes = serde_json::to_vec(&updated).map_err(io::Error::other)?;
+        write_private_bytes(&self.directory, LOADOUT_FILE, &bytes, MAX_LOADOUT_BYTES)?;
+        self.collection = updated;
+        Ok(())
+    }
+}
+
+fn invalid_data(error: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+fn invalid_input(error: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +644,7 @@ mod tests {
                 (0, directory.join("日本語 café")),
                 (1, directory.to_owned()),
             ]),
+            appearances: BTreeMap::new(),
         }])
     }
 
@@ -404,6 +660,183 @@ mod tests {
         );
         assert!(default_directory(None, None).is_err());
         assert!(default_directory(None, Some(Path::new("relative"))).is_err());
+    }
+
+    #[test]
+    fn appearance_defaults_keep_existing_sessions_compatible_and_validate_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = snapshot(temporary.path());
+        let legacy = serde_json::to_vec(&original).unwrap();
+        assert!(!String::from_utf8_lossy(&legacy).contains("appearances"));
+        let decoded: SessionSnapshot = serde_json::from_slice(&legacy).unwrap();
+        assert_eq!(decoded, original);
+        let mut updated = original;
+        let appearance = PaneAppearance {
+            title: Some("作業 🌟".into()),
+            text_color: Some("#FaAb09".into()),
+            outline_color: Some("#102030".into()),
+        };
+        updated.windows[0].appearances.insert(0, appearance.clone());
+        assert!(updated.validate().is_ok());
+        assert_eq!(parse_color("#FaAb09").unwrap(), [250, 171, 9]);
+        assert_eq!(normalize_color("#FaAb09").unwrap(), "#FAAB09");
+        let roundtrip: SessionSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&updated).unwrap()).unwrap();
+        assert_eq!(roundtrip, updated);
+        updated.windows[0].appearances.insert(999, appearance);
+        assert!(updated.validate().is_err());
+        for color in ["red", "#fff", "#12345678", "#12é45", "#aabbgg", "#aabbcc\n"] {
+            assert!(parse_color(color).is_err());
+        }
+        for title in ["bad\nlabel".to_owned(), "x".repeat(129), "🌟".repeat(129)] {
+            assert!(
+                PaneAppearance { title: Some(title), ..PaneAppearance::default() }
+                    .validate()
+                    .is_err()
+            );
+        }
+        assert!(
+            PaneAppearance { title: Some("🌟".repeat(128)), ..PaneAppearance::default() }
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            serde_json::from_str::<PaneAppearance>(r#"{"title":"ok","command":"unexpected"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn loadout_names_are_bounded_unicode_labels() {
+        for name in ["Work", "日本語 café", "a/b", &"🌟".repeat(64)] {
+            assert!(validate_loadout_name(name).is_ok());
+        }
+        for name in ["", " leading", "trailing ", "bad\nname", &"x".repeat(65)] {
+            assert!(validate_loadout_name(name).is_err());
+        }
+    }
+
+    #[test]
+    fn named_layouts_replace_list_reload_and_delete_without_touching_automatic_sessions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("state");
+        let automatic = SessionStore::open(&directory).unwrap();
+        let mut store = LoadoutStore::open(&directory).unwrap();
+        assert!(store.list().is_empty());
+        let mut workspace = snapshot(temporary.path());
+        workspace.windows[0].appearances.insert(
+            0,
+            PaneAppearance {
+                title: Some("Build".into()),
+                text_color: Some("#aabbcc".into()),
+                outline_color: Some("#123456".into()),
+            },
+        );
+        automatic.save(workspace.clone()).unwrap();
+        automatic.flush().unwrap();
+        store.save("作業", workspace.clone(), true).unwrap();
+        store.save("No cwd", workspace.clone(), false).unwrap();
+        assert_eq!(
+            store.list().iter().map(|item| item.name.as_str()).collect::<Vec<_>>(),
+            ["No cwd", "作業"]
+        );
+        assert_eq!(
+            store.list()[1],
+            LoadoutInfo { name: "作業".into(), windows: 1, panes: 3, include_directories: true }
+        );
+        assert_eq!(store.load("作業", true).unwrap(), workspace);
+        let without_directories = store.load("作業", false).unwrap();
+        assert!(without_directories.windows[0].directories.is_empty());
+        assert_eq!(without_directories.windows[0].appearances, workspace.windows[0].appearances);
+        assert_eq!(store.load("No cwd", true).unwrap(), without_directories);
+        workspace.windows[0].font_size = 22.0;
+        store.save("作業", workspace.clone(), true).unwrap();
+        assert_eq!(store.list().len(), 2);
+        assert_eq!(store.load("作業", true).unwrap(), workspace);
+        assert_eq!(
+            std::fs::metadata(directory.join(LOADOUT_FILE)).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(directory.join(LOADOUT_LOCK_FILE)).unwrap().permissions().mode()
+                & 0o777,
+            0o600
+        );
+        assert!(LoadoutStore::open(&directory).is_err());
+        store.delete("No cwd").unwrap();
+        assert_eq!(store.delete("missing").unwrap_err().kind(), io::ErrorKind::NotFound);
+        drop(store);
+        let mut reopened = LoadoutStore::open(&directory).unwrap();
+        assert_eq!(reopened.load("作業", true).unwrap(), workspace);
+        reopened.delete("作業").unwrap();
+        assert!(reopened.list().is_empty());
+        assert_eq!(automatic.load().unwrap().windows[0].font_size, 18.0);
+    }
+
+    #[test]
+    fn loadout_invalid_input_and_file_collisions_preserve_saved_layouts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("state");
+        let mut store = LoadoutStore::open(&directory).unwrap();
+        let original = snapshot(temporary.path());
+        store.save("Keep", original.clone(), true).unwrap();
+        let original_bytes = std::fs::read(directory.join(LOADOUT_FILE)).unwrap();
+        assert!(store.save("bad\nname", original.clone(), true).is_err());
+        assert!(store.save("Empty", SessionSnapshot::new(Vec::new()), true).is_err());
+        let mut invalid = original.clone();
+        invalid.windows[0].appearances.insert(
+            0,
+            PaneAppearance { text_color: Some("blue".into()), ..PaneAppearance::default() },
+        );
+        assert!(store.save("Keep", invalid, true).is_err());
+        assert_eq!(store.load("Keep", true).unwrap(), original);
+        assert_eq!(std::fs::read(directory.join(LOADOUT_FILE)).unwrap(), original_bytes);
+
+        let destination = directory.join(LOADOUT_FILE);
+        let target = temporary.path().join("target");
+        std::fs::write(&target, "keep target").unwrap();
+        std::fs::remove_file(&destination).unwrap();
+        symlink(&target, &destination).unwrap();
+        assert!(store.save("New", original.clone(), true).is_err());
+        assert!(store.delete("Keep").is_err());
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep target");
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::hard_link(&target, &destination).unwrap();
+        assert!(store.save("New", original, true).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep target");
+    }
+
+    #[test]
+    fn loadout_count_limit_and_corrupt_files_are_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = LoadoutStore::open(temporary.path()).unwrap();
+        let workspace = snapshot(temporary.path());
+        let mut collection = LoadoutCollection::default();
+        for index in 0..MAX_LOADOUTS {
+            collection.loadouts.insert(
+                format!("Layout {index:02}"),
+                Loadout { include_directories: true, workspace: workspace.clone() },
+            );
+        }
+        store.publish(collection).unwrap();
+        assert!(store.save("Beyond limit", workspace.clone(), true).is_err());
+        assert_eq!(store.list().len(), MAX_LOADOUTS);
+        store.save("Layout 00", workspace, false).unwrap();
+        assert_eq!(store.list().len(), MAX_LOADOUTS);
+        drop(store);
+        let path = temporary.path().join(LOADOUT_FILE);
+        for bytes in [
+            b"not json".as_slice(),
+            br#"{"version":999,"loadouts":{}}"#,
+            br#"{"version":1,"loadouts":{},"command":"unexpected"}"#,
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(LoadoutStore::open(temporary.path()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        File::create(&path).unwrap().set_len(MAX_LOADOUT_BYTES + 1).unwrap();
+        assert!(LoadoutStore::open(temporary.path()).is_err());
     }
 
     #[test]
@@ -544,6 +977,7 @@ mod tests {
             font_size: 16.0,
             panes: tree.snapshot(),
             directories: tree.pane_ids().into_iter().map(|id| (id, directory.clone())).collect(),
+            appearances: BTreeMap::new(),
         };
         let oversized = SessionSnapshot::new(vec![window; MAX_WINDOWS]);
         assert!(oversized.validate().is_ok());

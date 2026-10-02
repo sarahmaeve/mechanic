@@ -1,0 +1,6 @@
+    Checking objc2-app-kit v0.3.2
+    Checking mechanic-renderer v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-renderer)
+    Checking arboard v3.6.1
+    Checking mechanic-bench v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-bench)
+    Checking mechanic-app v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-app)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.56s

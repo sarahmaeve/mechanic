@@ -50,6 +50,10 @@ enabled = true
 
 Restart Mechanic after changing configuration.
 
+Cmd+Shift+P opens the command palette. Type to filter, use Up/Down to select,
+Return to run, and Escape to close. It includes pane actions, titles/colors,
+loadouts, Find, and animation controls.
+
 Zsh shell integration is automatic and leaves your startup files unchanged.
 The title shows the working directory and running/completed command status.
 Cmd+Shift+Up/Down navigates recorded prompts; Cmd+Shift+C copies the last
@@ -94,11 +98,27 @@ and Find queries. Scrolling targets the hovered pane; keyboard input targets
 the focused pane. Font-size changes apply to all panes in the window.
 
 Drag the small grip above a pane onto another pane's left, right, top, or bottom
-edge in the same window to rearrange them. The outline previews the resulting
+edge in the same or another Mechanic window to rearrange them. The outline previews the resulting
 pane bounds. Release outside the window to detach the pane into its own window;
 its running shell, scrollback, and local-control session handle survive the move.
 Escape cancels a drag. Text below the grip retains normal selection and TUI mouse
 behavior.
+
+Cmd+Shift+Return zooms the active pane to fill its window; press it again to
+restore the layout. Focus shortcuts work while zoomed. Other shells keep running.
+Splitting or docking into a window reveals its full layout.
+
+Use the palette to set an optional pane title, text color, or outline color.
+Colors use `#RRGGBB`; submit an empty value to reset that field. Text color changes
+the default foreground; explicit ANSI/OSC colors remain available to programs.
+Titles and colors follow live panes and survive workspace restoration.
+
+Save a named loadout from the palette, with or without starting directories.
+Loadouts contain all current windows, pane layouts, titles/colors, and font sizes.
+Opening one adds fresh shells in new windows; existing shells keep running.
+Loadouts do not save commands or scrollback. Saving an existing name replaces it.
+They live in `loadouts.json` beside `session.json` and remain available when
+automatic session restoration is disabled. Temporary pane zoom is not saved.
 
 Mechanic saves window sizes/positions, pane layouts, active panes, font sizes,
 and reported local directories. Relaunching starts fresh configured shells;
@@ -121,6 +141,32 @@ mechanic ctl read --pane INSTANCE:SESSION --lines 100
 mechanic ctl send --pane INSTANCE:SESSION --text 'cargo test' --enter
 mechanic ctl wait --pane INSTANCE:SESSION --after 0 --timeout 30
 ```
+
+Pane management and loadouts are also available to local automation:
+
+```sh
+mechanic ctl create --directory /absolute/project/path
+mechanic ctl split --pane INSTANCE:SESSION --axis vertical
+mechanic ctl focus --pane INSTANCE:SESSION
+mechanic ctl zoom --pane INSTANCE:SESSION
+mechanic ctl move --pane INSTANCE:SESSION --target INSTANCE:OTHER_SESSION --edge bottom
+mechanic ctl move --pane INSTANCE:SESSION --new-window
+mechanic ctl set --pane INSTANCE:SESSION --title Tests --text-color '#71DABC' --outline-color '#C081E8'
+mechanic ctl loadout save --name Development
+mechanic ctl loadout list
+mechanic ctl loadout open --name Development
+mechanic ctl loadout delete --name Development
+mechanic ctl close --pane INSTANCE:SESSION
+```
+
+`vertical` splits side by side; `horizontal` stacks panes. Create/split accept
+`--directory`; otherwise they use the selected pane's directory when available.
+Explicit directories must exist and be absolute; a directory becoming unavailable
+during shell launch can still fall back to the normal shell directory.
+Use `--no-directories` with loadout save/open to omit or ignore saved directories.
+Use `--clear-title`, `--clear-text-color`, or `--clear-outline-color` to reset a
+pane field. Mutation replies include the resulting pane's session handle;
+moving a pane keeps that handle. `close` terminates the selected shell.
 
 `send` uses terminal paste handling; `--enter` appends Enter and `--raw` sends
 unfiltered input. Embedded newlines follow the shell's normal paste behavior.
@@ -197,7 +243,9 @@ The event loop waits when parsing and animations are idle.
 Content frames reuse unchanged row geometry and upload changed buffer ranges.
 Snapshots and surface presentation still cover the whole visible grid.
 Lost window surfaces are recreated while retaining the atlas and cached frames.
-GPU device loss is detected but is not yet recoverable.
+GPU device loss recreates the device, atlas, and rendering resources while
+retaining shells and pane state. Failed recovery attempts retry after 250 ms;
+occluded windows defer recovery until visible.
 
 See [benchmarks](benchmarks/README.md) for Rust microbenchmarks and identical
 workloads for Mechanic, iTerm2, and Ghostty.

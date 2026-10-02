@@ -1,0 +1,6 @@
+Command: target/debug/examples/session_control_native_smoke
+Exit status: 0
+Captured stdout:
+native session/control smoke passed: workspace save/restore, fresh PTYs, split ratios/active pane/font/cwd, discovery, list/read, paste and explicit Enter, raw input, pending and retained completion waits, timeout, stale handles, background focus
+
+The compiled fixture also executed exercise_workspace_control(), covering pane create/split/focus/zoom/dock/detach/close, appearance set/clear, live session/output preservation, loadout save/list/open/delete, saved directories, and background pane cache invalidation. The stdout summary was updated after this run to list that expanded coverage.

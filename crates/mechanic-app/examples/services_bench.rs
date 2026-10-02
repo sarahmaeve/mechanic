@@ -45,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         logical_position: Some([32.0, 48.0]),
         font_size: 14.0,
         panes: tree.snapshot(),
+        appearances: BTreeMap::new(),
         directories: tree
             .pane_ids()
             .into_iter()
@@ -65,7 +66,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         100,
     );
-    assert_eq!(store.load(), Some(snapshot));
+    assert_eq!(store.load(), Some(snapshot.clone()));
+
+    let mut styled = snapshot.clone();
+    styled.windows[0].appearances = tree
+        .pane_ids()
+        .into_iter()
+        .map(|id| {
+            (
+                id,
+                session::PaneAppearance {
+                    title: Some(format!("Pane {id} · Straße · 日本語 · العربية")),
+                    text_color: Some("#71DABC".into()),
+                    outline_color: Some("#C081E8".into()),
+                },
+            )
+        })
+        .collect();
+    let mut loadouts = session::LoadoutStore::open(&temporary.path().join("loadouts"))?;
+    let loadout_save = measure(
+        || {
+            loadouts.save("Development", styled.clone(), true).unwrap();
+        },
+        100,
+    );
+    let loadout_load = measure(
+        || {
+            black_box(loadouts.load("Development", true).unwrap());
+        },
+        2000,
+    );
+    assert_eq!(loadouts.load("Development", true)?, styled);
 
     let server = control::ControlServer::start_in(temporary.path().join("ctl"), |event| {
         event
@@ -89,8 +120,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "scope": "16-pane JSON encode; atomic durable save including worker queue; authenticated socket transport with immediate empty-list callback. Excludes GUI dispatch, PTY and output extraction.",
-            "snapshot_encode": encode, "snapshot_save_flush": save, "socket_roundtrip": roundtrip
+            "scope": "16-pane JSON encode; atomic durable save including worker queue; styled 16-pane named loadout durable save and in-memory retrieval; authenticated socket transport with immediate empty-list callback. Excludes GUI dispatch, PTY/window creation and output extraction.",
+            "snapshot_encode": encode, "snapshot_save_flush": save, "socket_roundtrip": roundtrip,
+            "styled_loadout_save": loadout_save, "styled_loadout_retrieve": loadout_load
         }))?
     );
     Ok(())

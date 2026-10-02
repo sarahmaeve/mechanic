@@ -1,6 +1,7 @@
 //! Live PTY detachment smoke: the worker waits on real original reader wakes.
 use super::*;
 use crate::control::{ControlEvent, Operation, Request, Response, ResponseResult, SessionSelector};
+use crate::panes::DropEdge;
 
 pub(crate) struct LivePaneMoveFixture {
     socket: std::path::PathBuf,
@@ -51,9 +52,16 @@ impl App {
         {
             let state = self.windows.get_mut(&source).unwrap();
             state.load_pane(pane_id);
-            state.pane.terminal.write_to_pty(format!(
+            state
+                .pane
+                .terminal
+                .write_to_pty(
+                    format!(
                 "mechanic_live_token={token}; printf 'READY_%s\\n' \"$mechanic_live_token\"\n"
-            ).as_bytes()).map_err(|error| error.to_string())?;
+            )
+                    .as_bytes(),
+                )
+                .map_err(|error| error.to_string())?;
         }
         self.live_move_wait_text(events, source, pane_id, &format!("READY_{token}"))?;
         eprintln!("live move smoke: original shell variable ready");
@@ -83,18 +91,21 @@ impl App {
         }
         let selector = SessionSelector { instance_id: instance.clone(), session_id: session };
         let (reply, waiter) = std::sync::mpsc::sync_channel(1);
-        self.dispatch_control(ControlEvent {
-            request: Request::new(
-                Some(instance.clone()),
-                Operation::Wait {
-                    session: selector.clone(),
-                    after_command_id: 0,
-                    timeout_ms: 10_000,
-                },
-            ),
-            reply,
-            deadline: Instant::now() + Duration::from_secs(12),
-        });
+        self.dispatch_control(
+            events,
+            ControlEvent {
+                request: Request::new(
+                    Some(instance.clone()),
+                    Operation::Wait {
+                        session: selector.clone(),
+                        after_command_id: 0,
+                        timeout_ms: 10_000,
+                    },
+                ),
+                reply,
+                deadline: Instant::now() + Duration::from_secs(12),
+            },
+        );
         check(
             waiter.try_recv().is_err(),
             "completion waiter did not remain pending before detach",
@@ -106,7 +117,7 @@ impl App {
         );
         let destination = self.detach_pane(events, source, pane_id, None);
         self.config.shell.program = program;
-        let destination = destination.ok_or("live pane detachment failed")?;
+        let mut destination = destination.ok_or("live pane detachment failed")?;
         eprintln!("live move smoke: pane detached");
         check(
             destination != source && self.next_session == session_counter,
@@ -130,6 +141,47 @@ impl App {
                 "detachment retained window-bound input state",
             )?;
         }
+        let source_tree = self.windows[&source].tree.snapshot();
+        let destination_tree = self.windows[&destination].tree.snapshot();
+        check(
+            self.dock_pane(destination, 1, source, u64::MAX, DropEdge::Right).is_none(),
+            "dock accepted an absent target pane",
+        )?;
+        check(
+            self.windows[&source].tree.snapshot() == source_tree
+                && self.windows[&destination].tree.snapshot() == destination_tree
+                && self.windows[&destination].pane.session == session,
+            "failed docking modified source or destination",
+        )?;
+        let target = self.windows[&source].tree.active();
+        let program = std::mem::replace(
+            &mut self.config.shell.program,
+            "/mechanic-native-smoke-no-such-shell".into(),
+        );
+        let docked = self.dock_pane(destination, 1, source, target, DropEdge::Right);
+        self.config.shell.program = program;
+        let docked = docked.ok_or("live docking into existing window failed")?;
+        check(
+            !self.windows.contains_key(&destination)
+                && self.windows[&source].tree.len() == 2
+                && self.windows[&source].pane_state(docked).unwrap().session == session
+                && self.next_session == session_counter,
+            "docking replaced PTY identity or retained its empty source window",
+        )?;
+        check(
+            self.session_routes[&session].resolve(source, pane_id) == Some((source, docked)),
+            "docking did not retarget the original PTY wake",
+        )?;
+        let state = self.windows.get_mut(&source).unwrap();
+        state.load_pane(docked);
+        check(
+            state.pane.terminal.selection_text() == selection && state.pane.search.active,
+            "docking lost terminal selection or Find state",
+        )?;
+        destination = self
+            .detach_pane(events, source, docked, None)
+            .ok_or("detaching previously docked live pane failed")?;
+        check(self.next_session == session_counter, "repeated live moves restarted shell")?;
         check(
             self.session_routes[&session].resolve(source, pane_id) == Some((destination, 1)),
             "original PTY reader wake did not retarget",

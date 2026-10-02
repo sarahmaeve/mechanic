@@ -23,7 +23,7 @@ use instance_cache::InstanceCache;
 
 #[path = "panes.rs"]
 mod panes;
-pub use panes::{PaneRect, RenderDivider, RenderPane, RenderPaneHandle};
+pub use panes::{PaneRect, RenderDivider, RenderPane, RenderPaneHandle, RenderPaneHeader};
 
 /// Instanced vertex data. Field offsets must match the shader attributes.
 #[repr(C)]
@@ -176,12 +176,16 @@ pub struct SurfaceInit {
     pub surface: wgpu::Surface<'static>,
     pub surface_config: wgpu::SurfaceConfiguration,
     surface_factory: SurfaceFactory,
+    instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device_lost: Arc<AtomicBool>,
+    device_lost_waker: DeviceLostWaker,
 }
 
+type DeviceLostWaker = Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
 type SurfaceFactory =
-    Box<dyn Fn() -> Result<wgpu::Surface<'static>, wgpu::CreateSurfaceError> + Send + Sync>;
+    Arc<dyn Fn() -> Result<wgpu::Surface<'static>, wgpu::CreateSurfaceError> + Send + Sync>;
 
 const SURFACE_RECOVERY_BACKOFF: Duration = Duration::from_millis(250);
 
@@ -206,9 +210,12 @@ pub struct RenderState {
     pub queue: wgpu::Queue,
     surface: Option<wgpu::Surface<'static>>,
     surface_factory: SurfaceFactory,
+    instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device_lost: Arc<AtomicBool>,
+    device_lost_waker: DeviceLostWaker,
     surface_recovery: SurfaceRecovery,
+    device_recovery: SurfaceRecovery,
     surface_config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     foreground_pipeline: wgpu::RenderPipeline,
@@ -237,7 +244,9 @@ pub struct RenderState {
     pane_order: Vec<u64>,
     pane_frame_cached: bool,
     pane_colors: (Rgb, Rgb),
+    pane_outline_colors: std::collections::HashMap<u64, Rgb>,
     dividers: panes::DividerState,
+    headers: panes::HeaderState,
 }
 
 /// Initialise the wgpu instance, adapter, device, queue, and configured surface — without building any pipelines or textures.
@@ -254,10 +263,18 @@ where
     });
 
     let window = Arc::new(window);
-    let surface_factory: SurfaceFactory = Box::new({
+    let surface_factory: SurfaceFactory = Arc::new({
         let instance = instance.clone();
         move || instance.create_surface(Arc::clone(&window))
     });
+    init_surface_with_factory(instance, surface_factory, size).await
+}
+
+async fn init_surface_with_factory(
+    instance: wgpu::Instance,
+    surface_factory: SurfaceFactory,
+    size: (u32, u32),
+) -> Result<SurfaceInit, Box<dyn std::error::Error>> {
     let surface = surface_factory()?;
 
     let adapter = instance
@@ -281,20 +298,16 @@ where
         })
         .await?;
 
-    let device_lost = Arc::new(AtomicBool::new(false));
-    device.set_device_lost_callback({
-        let device_lost = Arc::clone(&device_lost);
-        move |reason, message| {
-            device_lost.store(true, Ordering::Release);
-            log::error!(
-                "GPU device lost ({reason:?}): {message}; device recreation is unsupported"
-            );
-        }
-    });
+    let (device_lost, device_lost_waker) = install_device_lost_callback(&device);
 
     let caps = surface.get_capabilities(&adapter);
-    let surface_format =
-        caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+    let surface_format = caps
+        .formats
+        .iter()
+        .copied()
+        .find(|f| f.is_srgb())
+        .or_else(|| caps.formats.first().copied())
+        .ok_or("surface exposes no supported formats")?;
 
     // The shader emits straight alpha; the surface must use post-multiplied alpha.
     log::info!("surface alpha modes available: {:?}", caps.alpha_modes);
@@ -303,22 +316,24 @@ where
     } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
         wgpu::CompositeAlphaMode::PreMultiplied
     } else {
-        caps.alpha_modes[0]
+        *caps.alpha_modes.first().ok_or("surface exposes no supported alpha modes")?
     };
     log::info!("selected surface alpha mode: {alpha_mode:?}");
 
     let surface_config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format: surface_format,
-        width: size.0,
-        height: size.1,
+        width: size.0.max(1),
+        height: size.1.max(1),
         present_mode: wgpu::PresentMode::Fifo,
         desired_maximum_frame_latency: 2,
         alpha_mode,
         view_formats: vec![],
         color_space: wgpu::SurfaceColorSpace::Auto,
     };
-    surface.configure(&device, &surface_config);
+    if !configure_surface_checked(&surface, &adapter, &device, &surface_config, &device_lost) {
+        return Err("GPU surface configuration failed".into());
+    }
 
     Ok(SurfaceInit {
         device,
@@ -326,12 +341,63 @@ where
         surface,
         surface_config,
         surface_factory,
+        instance,
         adapter,
         device_lost,
+        device_lost_waker,
     })
 }
 
 impl RenderState {
+    /// Wake the application when the driver reports a loss, even if it is idle.
+    /// The callback can run on a driver thread; dispatch work to the event loop.
+    pub fn set_device_lost_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) {
+        *self.device_lost_waker.lock().unwrap() = Some(Arc::clone(&waker));
+        if self.needs_device_recovery() {
+            waker();
+        }
+    }
+
+    /// A device loss invalidates every GPU resource, including all pane buffers.
+    pub fn needs_device_recovery(&self) -> bool {
+        self.device_lost.load(Ordering::Acquire)
+    }
+
+    /// Failed GPU recreation attempts are paced independently of surface recovery.
+    pub fn device_recovery_retry_at(&self) -> Option<Instant> {
+        self.needs_device_recovery().then_some(self.device_recovery.retry_at).flatten()
+    }
+
+    /// Request a fresh adapter/device for the same native window. The caller must
+    /// replace the text atlas and all rendering resources before using this result.
+    /// Call on the window event-loop thread, as Metal surface creation requires.
+    pub(crate) async fn replacement_surface_init(
+        &mut self,
+    ) -> Result<Option<SurfaceInit>, Box<dyn std::error::Error>> {
+        if !self.needs_device_recovery() || !self.device_recovery.ready(Instant::now()) {
+            return Ok(None);
+        }
+        // A native window must not own two swapchains during replacement.
+        self.surface = None;
+        match init_surface_with_factory(
+            self.instance.clone(),
+            Arc::clone(&self.surface_factory),
+            self.size,
+        )
+        .await
+        {
+            Ok(init) => Ok(Some(init)),
+            Err(error) => {
+                self.device_recovery.failed(Instant::now());
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn device_recovery_failed(&mut self) {
+        self.device_recovery.failed(Instant::now());
+    }
+
     pub fn prepare_layout(
         &mut self,
         grid: &RenderGrid,
@@ -363,8 +429,10 @@ impl RenderState {
             surface,
             surface_config,
             surface_factory,
+            instance,
             adapter,
             device_lost,
+            device_lost_waker,
         }: SurfaceInit,
         atlas_view: &wgpu::TextureView,
         atlas_generation: u64,
@@ -450,9 +518,12 @@ impl RenderState {
             queue,
             surface: Some(surface),
             surface_factory,
+            instance,
             adapter,
             device_lost,
+            device_lost_waker,
             surface_recovery: SurfaceRecovery::default(),
+            device_recovery: SurfaceRecovery::default(),
             surface_config,
             pipeline,
             foreground_pipeline,
@@ -475,7 +546,9 @@ impl RenderState {
             pane_order: Vec::new(),
             pane_frame_cached: false,
             pane_colors: (Rgb::new(173, 255, 255), Rgb::new(26, 58, 64)),
+            pane_outline_colors: std::collections::HashMap::new(),
             dividers: panes::DividerState::default(),
+            headers: panes::HeaderState::default(),
         })
     }
 
@@ -542,6 +615,9 @@ impl RenderState {
         self.size = new_size;
         self.surface_config.width = new_size.0;
         self.surface_config.height = new_size.1;
+        if self.needs_device_recovery() {
+            return;
+        }
         if let Some(surface) = &self.surface
             && !self.configure_surface(surface)
         {
@@ -569,35 +645,17 @@ impl RenderState {
         self.shaped_rows.clear();
         self.instance_cache.invalidate();
         self.pane_frame_cached = false;
+        self.headers.invalidate();
     }
 
     fn configure_surface(&self, surface: &wgpu::Surface<'static>) -> bool {
-        if self.device_lost.load(Ordering::Acquire) {
-            return false;
-        }
-        let caps = surface.get_capabilities(&self.adapter);
-        if !surface_config_supported(&self.surface_config, &caps)
-            || self.surface_config.width > self.device.limits().max_texture_dimension_2d
-            || self.surface_config.height > self.device.limits().max_texture_dimension_2d
-        {
-            log::error!("replacement surface does not support the existing GPU configuration");
-            return false;
-        }
-        // Device loss or a driver error during configure must not become an
-        // uncaptured validation panic. GPU resource/device recreation is separate.
-        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
-        let memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        surface.configure(&self.device, &self.surface_config);
-        let errors = [
-            pollster::block_on(memory.pop()),
-            pollster::block_on(internal.pop()),
-            pollster::block_on(validation.pop()),
-        ];
-        for error in errors.iter().flatten() {
-            log::error!("surface configuration failed: {error}");
-        }
-        errors.iter().all(Option::is_none) && !self.device_lost.load(Ordering::Acquire)
+        configure_surface_checked(
+            surface,
+            &self.adapter,
+            &self.device,
+            &self.surface_config,
+            &self.device_lost,
+        )
     }
 
     /// Replace a lost native surface, preserving the device, atlas, and cached frame.
@@ -658,6 +716,7 @@ impl RenderState {
         self.shaped_rows.clear();
         self.instance_cache.invalidate();
         self.pane_frame_cached = false;
+        self.headers.invalidate();
         for pane in self.panes.values_mut() {
             pane.invalidate_layout();
         }
@@ -923,6 +982,57 @@ impl RenderState {
         self.queue.present(surface_texture);
         true
     }
+}
+
+fn install_device_lost_callback(device: &wgpu::Device) -> (Arc<AtomicBool>, DeviceLostWaker) {
+    let device_lost = Arc::new(AtomicBool::new(false));
+    let waker: DeviceLostWaker = Arc::new(std::sync::Mutex::new(None));
+    device.set_device_lost_callback({
+        let device_lost = Arc::clone(&device_lost);
+        let waker = Arc::clone(&waker);
+        move |reason, message| {
+            device_lost.store(true, Ordering::Release);
+            log::error!("GPU device lost ({reason:?}): {message}; scheduling device recovery");
+            let callback = waker.lock().unwrap().clone();
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    });
+    (device_lost, waker)
+}
+
+fn configure_surface_checked(
+    surface: &wgpu::Surface<'static>,
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    device_lost: &AtomicBool,
+) -> bool {
+    if device_lost.load(Ordering::Acquire) {
+        return false;
+    }
+    let caps = surface.get_capabilities(adapter);
+    if !surface_config_supported(config, &caps)
+        || config.width > device.limits().max_texture_dimension_2d
+        || config.height > device.limits().max_texture_dimension_2d
+    {
+        log::error!("surface does not support the requested GPU configuration");
+        return false;
+    }
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    surface.configure(device, config);
+    let errors = [
+        pollster::block_on(memory.pop()),
+        pollster::block_on(internal.pop()),
+        pollster::block_on(validation.pop()),
+    ];
+    for error in errors.iter().flatten() {
+        log::error!("surface configuration failed: {error}");
+    }
+    errors.iter().all(Option::is_none) && !device_lost.load(Ordering::Acquire)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

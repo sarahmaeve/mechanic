@@ -1,7 +1,10 @@
 //! Workspace persistence is explicitly configured by normal GUI startup.
 use super::*;
-use crate::session::{SessionSnapshot, SessionStore, WindowSnapshot};
+use crate::session::{
+    LoadoutInfo, LoadoutStore, PaneAppearance, SessionSnapshot, SessionStore, WindowSnapshot,
+};
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
 const SAVE_DELAY: Duration = Duration::from_millis(250);
@@ -9,6 +12,7 @@ const SAVE_DELAY: Duration = Duration::from_millis(250);
 #[derive(Default)]
 pub(super) struct SessionService {
     pub(super) store: Option<SessionStore>,
+    loadouts: Option<LoadoutStore>,
     restore: Option<SessionSnapshot>,
     pending: Option<SessionSnapshot>,
     observed: Option<SessionSnapshot>,
@@ -23,6 +27,12 @@ impl App {
         state_directory: Option<PathBuf>,
         control_directory: Option<PathBuf>,
     ) {
+        if let Some(directory) = state_directory.as_deref() {
+            match LoadoutStore::open(directory) {
+                Ok(store) => self.session_service.loadouts = Some(store),
+                Err(error) => log::warn!("named loadouts unavailable: {error}"),
+            }
+        }
         if self.config.session.restore
             && let Some(directory) = state_directory
         {
@@ -56,6 +66,65 @@ impl App {
         SessionSnapshot::new(
             windows.into_iter().map(|(_, state)| state.workspace_snapshot()).collect(),
         )
+    }
+
+    pub(super) fn list_loadouts(&self) -> io::Result<Vec<LoadoutInfo>> {
+        Ok(self.loadout_store()?.list())
+    }
+
+    pub(super) fn save_loadout(&mut self, name: &str, include_directories: bool) -> io::Result<()> {
+        let workspace = self.workspace_snapshot();
+        self.session_service.loadouts.as_mut().ok_or_else(loadouts_unavailable)?.save(
+            name,
+            workspace,
+            include_directories,
+        )
+    }
+
+    pub(super) fn delete_loadout(&mut self, name: &str) -> io::Result<()> {
+        self.session_service.loadouts.as_mut().ok_or_else(loadouts_unavailable)?.delete(name)
+    }
+
+    /// Existing windows and sessions remain live. A layout always creates fresh
+    /// terminals, and a failed native spawn is reported with its partial result.
+    pub(super) fn open_loadout(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        name: &str,
+        restore_directories: bool,
+    ) -> io::Result<Vec<WindowId>> {
+        let workspace = self.loadout_store()?.load(name, restore_directories)?;
+        if self.windows.len().saturating_add(workspace.windows.len()) > crate::session::MAX_WINDOWS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "opening the loadout would exceed the window limit; existing windows were preserved",
+            ));
+        }
+        let requested = workspace.windows.len();
+        let mut opened = Vec::with_capacity(requested);
+        for window in workspace.windows {
+            let Some(id) = self.spawn_restored_window(event_loop, &window) else {
+                return Err(io::Error::other(format!(
+                    "loadout opened {} of {requested} windows before a native window or shell failed",
+                    opened.len()
+                )));
+            };
+            opened.push(id);
+            let expected_panes = window.panes.pane_ids().len();
+            let actual_panes = self.windows[&id].tree.len();
+            if actual_panes != expected_panes {
+                return Err(io::Error::other(format!(
+                    "loadout opened {} of {requested} windows; the latest window started {actual_panes} of {expected_panes} shells",
+                    opened.len()
+                )));
+            }
+        }
+        Ok(opened)
+    }
+
+    fn loadout_store(&self) -> io::Result<&LoadoutStore> {
+        self.session_service.loadouts.as_ref().ok_or_else(loadouts_unavailable)
     }
 
     pub(super) fn note_session_change(&mut self) {
@@ -130,9 +199,15 @@ impl AppState {
             [position.x, position.y]
         });
         let mut directories = BTreeMap::new();
+        let mut appearances = BTreeMap::new();
         for id in self.tree.pane_ids() {
-            if let Some(directory) = self.pane_state(id).and_then(|pane| pane.directory.as_ref()) {
-                directories.insert(id, directory.clone());
+            if let Some(pane) = self.pane_state(id) {
+                if let Some(directory) = &pane.directory {
+                    directories.insert(id, directory.clone());
+                }
+                if pane.appearance != PaneAppearance::default() {
+                    appearances.insert(id, pane.appearance.clone());
+                }
             }
         }
         WindowSnapshot {
@@ -141,8 +216,13 @@ impl AppState {
             font_size: self.current_font_size,
             panes: self.tree.snapshot(),
             directories,
+            appearances,
         }
     }
+}
+
+fn loadouts_unavailable() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, "named loadout storage is unavailable")
 }
 
 /// Store OSC metadata without filesystem work on the event loop. Availability

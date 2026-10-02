@@ -107,7 +107,7 @@ fn main() {
     drop(smoke);
     match result.lock().unwrap().take() {
         Some(Ok(())) => println!(
-            "native session/control smoke passed: workspace save/restore, fresh PTYs, split ratios/active pane/font/cwd, discovery, list/read, paste and explicit Enter, raw input, pending and retained completion waits, timeout, stale handles, background focus"
+            "native session/control smoke passed: workspace save/restore, fresh PTYs, split ratios/active pane/font/cwd, discovery, list/read, paste and explicit Enter, raw input, completion waits/timeouts, stale handles, background focus/cache invalidation, pane create/split/focus/zoom/dock/detach/close, appearance set/clear, live session/output preservation, loadout save/list/open/delete with directories"
         ),
         result => {
             eprintln!("native session/control smoke failed: {result:?}");

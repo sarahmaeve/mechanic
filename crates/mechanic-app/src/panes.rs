@@ -545,6 +545,46 @@ impl PaneTree {
         candidate.fitting_layout(layout)?.pane(source)
     }
 
+    /// Allocate a local ID for an incoming live pane and insert it at an edge.
+    /// Capacity, ID exhaustion, and the complete resulting geometry are checked
+    /// before committing, so failed docking leaves this tree unchanged.
+    pub fn insert_pane(
+        &mut self,
+        target: PaneId,
+        edge: DropEdge,
+        layout: &Layout,
+    ) -> Option<PaneId> {
+        let (candidate, pane, _) = self.insert_candidate(target, edge, layout)?;
+        *self = candidate;
+        Some(pane)
+    }
+
+    pub fn insert_preview(&self, target: PaneId, edge: DropEdge, layout: &Layout) -> Option<Rect> {
+        self.insert_candidate(target, edge, layout).map(|(_, _, rect)| rect)
+    }
+
+    fn insert_candidate(
+        &self,
+        target: PaneId,
+        edge: DropEdge,
+        layout: &Layout,
+    ) -> Option<(Self, PaneId, Rect)> {
+        if self.len() >= MAX_PANES {
+            return None;
+        }
+        let pane = self.next_pane_id?;
+        let split = self.next_split_id?;
+        let mut candidate = self.clone();
+        if !candidate.root.insert_at(target, pane, split, edge) {
+            return None;
+        }
+        candidate.active = pane;
+        candidate.next_pane_id = pane.checked_add(1);
+        candidate.next_split_id = split.checked_add(1);
+        let rect = candidate.fitting_layout(layout)?.pane(pane)?;
+        Some((candidate, pane, rect))
+    }
+
     fn move_candidate(&self, source: PaneId, target: PaneId, edge: DropEdge) -> Option<Self> {
         let ids = self.pane_ids();
         if source == target || !ids.contains(&source) || !ids.contains(&target) {
@@ -680,6 +720,23 @@ impl PaneTree {
         layout
     }
 
+    /// Zoom changes only the visible layout. The tree, ratios, and pane IDs
+    /// remain intact so returning to the split layout restores exact geometry.
+    pub fn view_layout(
+        &self,
+        bounds: Rect,
+        minimum: Size,
+        divider_px: u32,
+        zoomed: bool,
+    ) -> Layout {
+        let mut layout = self.layout(bounds, minimum, divider_px);
+        if zoomed {
+            layout.panes = vec![PaneRect { id: self.active, rect: layout.bounds }];
+            layout.dividers.clear();
+        }
+        layout
+    }
+
     /// Move a divider to the pointer's physical coordinates. The pointer
     /// represents the divider center; the ratio respects both subtree minima.
     pub fn drag_divider(&mut self, id: SplitId, x: f64, y: f64, layout: &Layout) -> bool {
@@ -712,6 +769,72 @@ mod tests {
     use super::*;
 
     const MINIMUM: Size = Size { width: 10, height: 8 };
+
+    #[test]
+    fn incoming_panes_allocate_local_ids_and_commit_exact_previews() {
+        for edge in [DropEdge::Left, DropEdge::Right, DropEdge::Top, DropEdge::Bottom] {
+            let mut tree = grid();
+            let original = tree.snapshot();
+            let layout = tree.layout(bounds(303, 203), MINIMUM, 3);
+            let preview = tree.insert_preview(1, edge, &layout).unwrap();
+            assert_eq!(tree.snapshot(), original);
+            let incoming = tree.insert_pane(1, edge, &layout).unwrap();
+            assert_eq!(incoming, 4);
+            assert_eq!(tree.active(), incoming);
+            assert_eq!(tree.layout(bounds(303, 203), MINIMUM, 3).pane(incoming), Some(preview));
+            assert_eq!(tree.len(), 5);
+            assert!(tree.snapshot().validate().is_ok());
+            assert_eq!(tree.split_active(Axis::Vertical), Some(5));
+        }
+    }
+
+    #[test]
+    fn rejected_incoming_panes_preserve_tree_focus_and_allocation_counters() {
+        let mut tree = PaneTree::new(40);
+        let too_small = tree.layout(bounds(22, 8), MINIMUM, 3);
+        let original = tree.snapshot();
+        let counters = (tree.next_pane_id, tree.next_split_id);
+        assert_eq!(tree.insert_preview(40, DropEdge::Left, &too_small), None);
+        assert_eq!(tree.insert_pane(40, DropEdge::Left, &too_small), None);
+        let enough = tree.layout(bounds(200, 200), MINIMUM, 3);
+        assert_eq!(tree.insert_pane(99, DropEdge::Left, &enough), None);
+        assert_eq!(tree.snapshot(), original);
+        assert_eq!((tree.next_pane_id, tree.next_split_id), counters);
+        tree.next_pane_id = None;
+        assert_eq!(tree.insert_pane(40, DropEdge::Left, &enough), None);
+        tree.next_pane_id = counters.0;
+        tree.next_split_id = None;
+        assert_eq!(tree.insert_pane(40, DropEdge::Left, &enough), None);
+        tree.next_split_id = counters.1;
+        for _ in 1..MAX_PANES {
+            assert!(tree.split_active(Axis::Vertical).is_some());
+        }
+        let full = tree.snapshot();
+        let counters = (tree.next_pane_id, tree.next_split_id);
+        let layout = tree.layout(bounds(2000, 2000), MINIMUM, 3);
+        assert_eq!(tree.insert_preview(40, DropEdge::Top, &layout), None);
+        assert_eq!(tree.insert_pane(40, DropEdge::Top, &layout), None);
+        assert_eq!(tree.snapshot(), full);
+        assert_eq!((tree.next_pane_id, tree.next_split_id), counters);
+    }
+
+    #[test]
+    fn zoom_shows_active_pane_and_restores_tree_geometry_across_focus_and_resize() {
+        let mut tree = grid();
+        let layout = tree.layout(bounds(303, 203), MINIMUM, 3);
+        assert!(tree.drag_divider(1, 110.0, 30.0, &layout));
+        let snapshot = tree.snapshot();
+        let normal = tree.view_layout(bounds(303, 203), MINIMUM, 3, false);
+        let zoomed = tree.view_layout(bounds(303, 203), MINIMUM, 3, true);
+        assert_eq!(zoomed.panes, [PaneRect { id: tree.active(), rect: bounds(303, 203) }]);
+        assert!(zoomed.dividers.is_empty());
+        assert_eq!(tree.snapshot(), snapshot);
+        tree.focus(1);
+        let zoomed = tree.view_layout(bounds(403, 303), MINIMUM, 3, true);
+        assert_eq!(zoomed.panes, [PaneRect { id: 1, rect: bounds(403, 303) }]);
+        assert_eq!(tree.snapshot().root, snapshot.root);
+        assert_eq!(tree.view_layout(bounds(303, 203), MINIMUM, 3, false).panes, normal.panes);
+    }
 
     fn bounds(width: u32, height: u32) -> Rect {
         Rect { x: 7, y: 11, width, height }

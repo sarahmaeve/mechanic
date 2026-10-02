@@ -54,6 +54,155 @@ pub struct RenderPaneHandle {
     pub highlighted: bool,
 }
 
+/// A title drawn in reserved header bounds. The caller reserves space for any
+/// drag grip; glyphs are clipped to this rectangle and centered vertically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderPaneHeader {
+    pub rect: PaneRect,
+    pub title: String,
+    /// `None` uses the theme foreground.
+    pub color: Option<Rgb>,
+}
+
+struct HeaderLabel {
+    grid: RenderGrid,
+    rows: Vec<Arc<ShapedRow>>,
+}
+
+#[derive(Default)]
+pub(super) struct HeaderState {
+    requested: Vec<RenderPaneHeader>,
+    labels: Vec<HeaderLabel>,
+    color: Option<Rgb>,
+    metrics: Option<(f32, f32)>,
+    generation: Option<u64>,
+    instances: Vec<GpuInstance>,
+    ranges: Vec<(PaneRect, std::ops::Range<u32>)>,
+    buffer: Option<wgpu::Buffer>,
+    capacity: usize,
+    dirty: bool,
+}
+
+impl HeaderState {
+    fn set(&mut self, headers: &[RenderPaneHeader]) {
+        if self.requested != headers {
+            self.requested = headers.to_vec();
+            self.invalidate();
+        }
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.labels.clear();
+        self.dirty = true;
+    }
+
+    fn prepare_layouts(&mut self, text: &mut TextRenderer, config: &FontConfig) {
+        let metrics = text.cell_metrics();
+        let cell_size = (metrics.cell_width, metrics.cell_height);
+        if self.metrics != Some(cell_size) {
+            self.metrics = Some(cell_size);
+            self.invalidate();
+        }
+        if self.labels.len() == self.requested.len() {
+            return;
+        }
+        self.labels = self
+            .requested
+            .iter()
+            .map(|header| {
+                let grid = header_grid(header, self.color.unwrap_or(Rgb::new(173, 255, 255)));
+                let rows = text.shape_grid(&grid, config);
+                HeaderLabel { grid, rows }
+            })
+            .collect();
+    }
+
+    fn update(&mut self, text: &TextRenderer, device: &wgpu::Device, queue: &wgpu::Queue) -> usize {
+        if !self.dirty && self.generation == Some(text.atlas_generation()) {
+            return 0;
+        }
+        let Some(cell_size) = self.metrics else { return 0 };
+        self.instances.clear();
+        self.ranges.clear();
+        for (header, label) in self.requested.iter().zip(&self.labels) {
+            let first = self.instances.len() as u32;
+            if header.rect.width > 0 && header.rect.height > 0 {
+                let (instances, backgrounds) = build_instances_for_rows(
+                    &label.grid,
+                    &label.rows,
+                    text,
+                    cell_size,
+                    false,
+                    0..1,
+                    Vec::new(),
+                );
+                let scale = (header.rect.height as f32 / cell_size.1).min(1.0);
+                let y =
+                    header.rect.y as f32 + (header.rect.height as f32 - cell_size.1 * scale) * 0.5;
+                self.instances.extend(instances.into_iter().skip(backgrounds as usize).map(
+                    |mut instance| {
+                        instance.glyph_offset = [
+                            header.rect.x as f32
+                                + (instance.cell_pos[0] as f32 * cell_size.0
+                                    + instance.glyph_offset[0])
+                                    * scale,
+                            y + (instance.cell_pos[1] as f32 * cell_size.1
+                                + instance.glyph_offset[1])
+                                * scale,
+                        ];
+                        instance.glyph_size =
+                            [instance.glyph_size[0] * scale, instance.glyph_size[1] * scale];
+                        instance.cell_pos = [0, 0];
+                        instance
+                    },
+                ));
+            }
+            self.ranges.push((header.rect, first..self.instances.len() as u32));
+        }
+        if self.instances.len() > self.capacity {
+            self.capacity = self.instances.len().next_power_of_two().max(4);
+            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pane_header_instances"),
+                size: (self.capacity * mem::size_of::<GpuInstance>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let bytes = bytemuck::cast_slice::<GpuInstance, u8>(&self.instances);
+        if !bytes.is_empty() {
+            queue.write_buffer(self.buffer.as_ref().unwrap(), 0, bytes);
+        }
+        self.generation = Some(text.atlas_generation());
+        self.dirty = false;
+        bytes.len()
+    }
+}
+
+fn header_grid(header: &RenderPaneHeader, fallback: Rgb) -> RenderGrid {
+    use swash::text::{Category, Codepoint};
+    // Bound shaping even if an external title producer sends an enormous title.
+    let mut cells: Vec<crate::grid::RenderCell> = Vec::new();
+    for ch in header.title.chars().take(4096).filter(|ch| !ch.is_control()) {
+        if matches!(ch.category(), Category::NonspacingMark | Category::EnclosingMark)
+            && let Some(cell) = cells.last_mut()
+        {
+            cell.zerowidth.push(ch);
+        } else {
+            cells.push(crate::grid::RenderCell {
+                character: ch,
+                fg: header.color.unwrap_or(fallback),
+                ..Default::default()
+            });
+        }
+    }
+    let mut grid = RenderGrid::new(cells.len().max(1), 1);
+    if !cells.is_empty() {
+        grid.cells = cells;
+    }
+    grid.cursor_visible = false;
+    grid
+}
+
 /// One retained buffer for static pane dividers, drag grips and drop outlines.
 #[derive(Default)]
 pub(super) struct DividerState {
@@ -302,7 +451,7 @@ struct BorderKey {
     active: bool,
     visible: bool,
     instance_count: usize,
-    colors: (Rgb, Rgb),
+    color: Rgb,
 }
 
 struct PaneUploadContext<'a> {
@@ -310,6 +459,7 @@ struct PaneUploadContext<'a> {
     focused: bool,
     borders: bool,
     colors: (Rgb, Rgb),
+    outline_colors: &'a std::collections::HashMap<u64, Rgb>,
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
 }
@@ -376,7 +526,18 @@ impl PaneState {
         context: &PaneUploadContext<'_>,
         mut profile: Option<&mut RenderProfile>,
     ) -> usize {
-        let PaneUploadContext { cell_size, focused, borders, colors, device, queue } = *context;
+        let PaneUploadContext {
+            cell_size,
+            focused,
+            borders,
+            colors,
+            outline_colors,
+            device,
+            queue,
+        } = *context;
+        let override_color = outline_colors.get(&pane.id).copied();
+        let borders = borders || override_color.is_some();
+        let color = override_color.unwrap_or(if pane.active { colors.0 } else { colors.1 });
         let focused = focused && pane.active;
         let instances_started = profile.as_ref().map(|_| Instant::now());
         let mut uploads = self.cache.update(
@@ -433,10 +594,10 @@ impl PaneState {
             active: pane.active,
             visible: borders,
             instance_count: count,
-            colors,
+            color,
         };
         if self.border_key != Some(key) {
-            let border = border_instances(pane.rect, if pane.active { colors.0 } else { colors.1 });
+            let border = border_instances(pane.rect, color);
             self.border_count =
                 if borders && pane.rect.width > 0 && pane.rect.height > 0 { 4 } else { 0 };
             if self.border_count > 0 {
@@ -488,6 +649,45 @@ fn border_instances(rect: PaneRect, color: Rgb) -> [GpuInstance; 4] {
 }
 
 impl RenderState {
+    pub(crate) fn copy_pane_settings_from(&mut self, previous: &RenderState) {
+        let waker = previous.device_lost_waker.lock().unwrap().clone();
+        if let Some(waker) = waker {
+            self.set_device_lost_waker(waker);
+        }
+        self.pane_colors = previous.pane_colors;
+        self.pane_outline_colors = previous.pane_outline_colors.clone();
+        self.dividers.colors = previous.dividers.colors;
+        self.dividers.set(&previous.dividers.requested);
+        self.dividers.set_handles(&previous.dividers.handles);
+        self.dividers.set_drop_preview(previous.dividers.drop_preview);
+        self.headers.color = previous.headers.color;
+        self.headers.set(&previous.headers.requested);
+    }
+
+    pub fn set_pane_headers(&mut self, headers: &[RenderPaneHeader]) {
+        if self.headers.requested != headers {
+            self.pane_frame_cached = false;
+        }
+        self.headers.set(headers);
+    }
+
+    pub fn set_pane_header_color(&mut self, color: Rgb) {
+        if self.headers.color != Some(color) {
+            self.headers.color = Some(color);
+            self.headers.invalidate();
+            self.pane_frame_cached = false;
+        }
+    }
+
+    pub fn set_pane_outline_colors(&mut self, colors: &[(u64, Option<Rgb>)]) {
+        let colors: std::collections::HashMap<_, _> =
+            colors.iter().filter_map(|(id, color)| color.map(|color| (*id, color))).collect();
+        if self.pane_outline_colors != colors {
+            self.pane_outline_colors = colors;
+            self.pane_frame_cached = false;
+        }
+    }
+
     pub fn set_pane_dividers(&mut self, dividers: &[RenderDivider]) {
         self.dividers.set(dividers);
     }
@@ -579,11 +779,13 @@ impl RenderState {
             self.prepare_pane_layout(pane.id, pane.grid, text, config);
             self.pane_order.push(pane.id);
         }
-        let rows: Vec<_> = self
+        self.headers.prepare_layouts(text, config);
+        let mut rows: Vec<_> = self
             .pane_order
             .iter()
             .flat_map(|id| self.panes[id].layout.rows.iter().cloned())
             .collect();
+        rows.extend(self.headers.labels.iter().flat_map(|label| label.rows.iter().cloned()));
         let atlas_failed = match text.prepare_frame(&rows, &self.device, &self.queue) {
             Ok(()) => false,
             Err(error) => {
@@ -607,6 +809,7 @@ impl RenderState {
             focused: uniforms.window_focused,
             borders: panes.len() > 1,
             colors: self.pane_colors,
+            outline_colors: &self.pane_outline_colors,
             device: &self.device,
             queue: &self.queue,
         };
@@ -619,6 +822,18 @@ impl RenderState {
             if atlas_failed {
                 state.cache.invalidate();
             }
+        }
+        if atlas_failed {
+            self.headers.dirty = true;
+        }
+        let header_bytes = self.headers.update(text, &self.device, &self.queue);
+        uploaded += header_bytes;
+        if let Some(profile) = profile {
+            profile.upload_bytes += header_bytes;
+            profile.instance_count += self.headers.instances.len();
+        }
+        if atlas_failed {
+            self.headers.dirty = true;
         }
         Some(uploaded)
     }
@@ -672,7 +887,9 @@ impl RenderState {
         if let (Some(profile), Some(started)) = (profile.as_deref_mut(), upload_started) {
             profile.upload_ns += started.elapsed().as_nanos();
             profile.upload_bytes += (self.pane_order.len()
-                + usize::from(!self.dividers.instances.is_empty()))
+                + usize::from(
+                    !self.dividers.instances.is_empty() || !self.headers.instances.is_empty(),
+                ))
                 * mem::size_of::<Globals>();
         }
         let surface_started = profile.as_ref().map(|_| Instant::now());
@@ -720,7 +937,7 @@ impl RenderState {
             let globals = self.pane_globals(pane.rect, uniforms);
             self.queue.write_buffer(&pane.globals_buf, 0, bytemuck::bytes_of(&globals));
         }
-        if !self.dividers.instances.is_empty() {
+        if !self.dividers.instances.is_empty() || !self.headers.instances.is_empty() {
             let globals = self.pane_globals(PaneRect::default(), uniforms);
             self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
         }
@@ -770,6 +987,17 @@ impl RenderState {
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..6, 0..self.dividers.instances.len() as u32);
         }
+        if let Some(buffer) = &self.headers.buffer {
+            pass.set_pipeline(&self.foreground_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            for (rect, range) in &self.headers.ranges {
+                if let Some((x, y, width, height)) = rect.scissor(self.size) {
+                    pass.set_scissor_rect(x, y, width, height);
+                    pass.draw(0..6, range.clone());
+                }
+            }
+        }
     }
 }
 
@@ -780,6 +1008,26 @@ mod gpu_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_title_bounds_controls_and_combining_marks() {
+        let header = RenderPaneHeader {
+            rect: PaneRect::default(),
+            title: "e\u{301}\n\u{0}x".into(),
+            color: Some(Rgb::new(1, 2, 3)),
+        };
+        let grid = header_grid(&header, Rgb::new(9, 8, 7));
+        assert_eq!(grid.cols, 2);
+        assert_eq!(grid.cells[0].character, 'e');
+        assert_eq!(grid.cells[0].zerowidth, "\u{301}");
+        assert!(grid.cells.iter().all(|cell| cell.fg == Rgb::new(1, 2, 3)));
+        assert!(!grid.cursor_visible);
+        let bounded = header_grid(
+            &RenderPaneHeader { title: "x".repeat(10000), ..header },
+            Rgb::new(0, 0, 0),
+        );
+        assert_eq!(bounded.cols, 4096);
+    }
 
     #[test]
     fn pane_scissors_are_clamped_to_window() {

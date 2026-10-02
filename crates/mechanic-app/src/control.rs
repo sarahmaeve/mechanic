@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::panes::Axis;
+use crate::session::{LoadoutInfo, PaneAppearance};
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -29,6 +31,7 @@ pub const MAX_OUTPUT_LINES: usize = 5000;
 pub const MAX_WAIT_MS: u64 = 60_000;
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_REPLY_BYTES: usize = 1024 * 1024;
+pub const MAX_DIRECTORY_BYTES: usize = 4096;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const WAIT_ALLOWANCE: Duration = Duration::from_secs(2);
@@ -58,6 +61,9 @@ impl FromStr for SessionSelector {
             return Err("invalid instance identity in pane handle".to_owned());
         }
         let session_id = session_id.parse().map_err(|_| "invalid session identity".to_owned())?;
+        if session_id == 0 {
+            return Err("session identity must be positive".to_owned());
+        }
         Ok(Self { instance_id: instance_id.to_owned(), session_id })
     }
 }
@@ -70,10 +76,125 @@ pub enum InputMode {
     Raw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoveEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl From<MoveEdge> for crate::panes::DropEdge {
+    fn from(edge: MoveEdge) -> Self {
+        match edge {
+            MoveEdge::Left => Self::Left,
+            MoveEdge::Right => Self::Right,
+            MoveEdge::Top => Self::Top,
+            MoveEdge::Bottom => Self::Bottom,
+        }
+    }
+}
+
+/// Absent fields preserve values; JSON null explicitly clears them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppearancePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "patch_value")]
+    pub title: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "patch_value")]
+    pub text_color: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "patch_value")]
+    pub outline_color: Option<Option<String>>,
+}
+
+fn patch_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+impl AppearancePatch {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.text_color.is_none() && self.outline_color.is_none()
+    }
+    pub fn apply(&self, appearance: &mut PaneAppearance) {
+        if let Some(title) = &self.title {
+            appearance.title = title.clone();
+        }
+        if let Some(color) = &self.text_color {
+            appearance.text_color = color.clone();
+        }
+        if let Some(color) = &self.outline_color {
+            appearance.outline_color = color.clone();
+        }
+    }
+    fn validate(&self) -> Result<(), String> {
+        if self.is_empty() {
+            return Err("appearance update is empty".into());
+        }
+        let mut appearance = PaneAppearance::default();
+        self.apply(&mut appearance);
+        appearance.validate()
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     ListPanes,
+    CreatePane {
+        #[serde(default)]
+        session: Option<SessionSelector>,
+        #[serde(default)]
+        directory: Option<PathBuf>,
+    },
+    SplitPane {
+        session: SessionSelector,
+        axis: Axis,
+        #[serde(default)]
+        directory: Option<PathBuf>,
+    },
+    FocusPane {
+        session: SessionSelector,
+    },
+    MovePane {
+        session: SessionSelector,
+        #[serde(default)]
+        target: Option<SessionSelector>,
+        #[serde(default)]
+        edge: Option<MoveEdge>,
+        #[serde(default)]
+        new_window: bool,
+    },
+    ClosePane {
+        session: SessionSelector,
+    },
+    ZoomPane {
+        session: SessionSelector,
+    },
+    SetPane {
+        session: SessionSelector,
+        appearance: AppearancePatch,
+    },
+    SaveLoadout {
+        name: String,
+        #[serde(default = "default_true")]
+        include_directories: bool,
+    },
+    ListLoadouts,
+    OpenLoadout {
+        name: String,
+        #[serde(default = "default_true")]
+        restore_directories: bool,
+    },
+    DeleteLoadout {
+        name: String,
+    },
     ReadOutput {
         session: SessionSelector,
         max_lines: usize,
@@ -98,10 +219,22 @@ pub enum Operation {
 impl Operation {
     pub fn session(&self) -> Option<&SessionSelector> {
         match self {
-            Self::ReadOutput { session, .. }
+            Self::CreatePane { session, .. } => session.as_ref(),
+            Self::SplitPane { session, .. }
+            | Self::FocusPane { session }
+            | Self::MovePane { session, .. }
+            | Self::ClosePane { session }
+            | Self::ZoomPane { session }
+            | Self::SetPane { session, .. }
+            | Self::ReadOutput { session, .. }
             | Self::SendInput { session, .. }
             | Self::Wait { session, .. } => Some(session),
-            Self::ListPanes | Self::Ping => None,
+            Self::ListPanes
+            | Self::Ping
+            | Self::SaveLoadout { .. }
+            | Self::ListLoadouts
+            | Self::OpenLoadout { .. }
+            | Self::DeleteLoadout { .. } => None,
         }
     }
 
@@ -133,10 +266,42 @@ impl Request {
         }
         if self.instance_id.as_deref().is_some_and(|id| id != instance_id)
             || self.operation.session().is_some_and(|session| session.instance_id != instance_id)
+            || matches!(&self.operation, Operation::MovePane { target: Some(target), .. } if target.instance_id != instance_id)
         {
             return Err((ErrorCode::StaleInstance, "pane belongs to another application instance"));
         }
         match &self.operation {
+            operation if operation.session().is_some_and(|session| session.session_id == 0) => {
+                Err((ErrorCode::InvalidRequest, "session identity must be positive"))
+            }
+            Operation::MovePane { target, edge, new_window, .. }
+                if (*new_window && (target.is_some() || edge.is_some()))
+                    || (!*new_window && (target.is_none() || edge.is_none()))
+                    || target.as_ref().is_some_and(|target| target.session_id == 0) =>
+            {
+                Err((ErrorCode::InvalidRequest, "move requires a target and edge or new_window"))
+            }
+            Operation::CreatePane { directory: Some(directory), .. }
+            | Operation::SplitPane { directory: Some(directory), .. }
+                if !directory.is_absolute()
+                    || directory.as_os_str().as_bytes().len() > MAX_DIRECTORY_BYTES
+                    || directory.as_os_str().as_bytes().contains(&0) =>
+            {
+                Err((
+                    ErrorCode::InvalidRequest,
+                    "directory must be an absolute path within the byte limit",
+                ))
+            }
+            Operation::SetPane { appearance, .. } if appearance.validate().is_err() => {
+                Err((ErrorCode::InvalidRequest, "invalid pane appearance update"))
+            }
+            Operation::SaveLoadout { name, .. }
+            | Operation::OpenLoadout { name, .. }
+            | Operation::DeleteLoadout { name }
+                if crate::session::validate_loadout_name(name).is_err() =>
+            {
+                Err((ErrorCode::InvalidRequest, "invalid loadout name"))
+            }
             Operation::ReadOutput { max_lines, max_bytes, .. }
                 if *max_lines == 0
                     || *max_lines > MAX_OUTPUT_LINES
@@ -162,6 +327,8 @@ pub struct PaneInfo {
     pub window_id: String,
     pub pane_id: u64,
     pub title: String,
+    pub appearance: PaneAppearance,
+    pub zoomed: bool,
     pub cwd: Option<String>,
     pub focused: bool,
     pub active: bool,
@@ -202,6 +369,12 @@ pub enum ErrorCode {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ResponseResult {
     Panes { panes: Vec<PaneInfo> },
+    Pane { pane: PaneInfo },
+    PaneClosed { session: SessionSelector },
+    LoadoutSaved { name: String },
+    Loadouts { loadouts: Vec<LoadoutInfo> },
+    LoadoutOpened { name: String, panes: Vec<PaneInfo> },
+    LoadoutDeleted { name: String },
     Output { session: SessionSelector, text: String, truncated: bool },
     InputSent { session: SessionSelector },
     Completed { completion: Completion },
@@ -1100,6 +1273,100 @@ mod tests {
         assert!(matches!(
             raw(server.socket_path(), &bytes).result,
             ResponseResult::Error { code: ErrorCode::InvalidRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn appearance_patches_distinguish_absent_values_from_clears() {
+        let patch: AppearancePatch =
+            serde_json::from_str(r##"{"title":null,"text_color":"#123ABC"}"##).unwrap();
+        assert_eq!(patch.title, Some(None));
+        assert_eq!(patch.text_color, Some(Some("#123ABC".into())));
+        assert_eq!(patch.outline_color, None);
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            serde_json::json!({"title":null,"text_color":"#123ABC"})
+        );
+        let mut appearance = PaneAppearance {
+            title: Some("old".into()),
+            text_color: None,
+            outline_color: Some("#456DEF".into()),
+        };
+        patch.apply(&mut appearance);
+        assert_eq!(appearance.title, None);
+        assert_eq!(appearance.outline_color.as_deref(), Some("#456DEF"));
+    }
+
+    #[test]
+    fn invalid_workspace_mutations_are_rejected_before_app_dispatch() {
+        let directory = directory();
+        let server = ControlServer::start_in(directory.path().to_owned(), |_| {
+            panic!("invalid mutation dispatched")
+        })
+        .unwrap();
+        let session =
+            SessionSelector { instance_id: server.instance_id().to_owned(), session_id: 1 };
+        let invalid = [
+            Operation::CreatePane { session: None, directory: Some("relative".into()) },
+            Operation::CreatePane {
+                session: None,
+                directory: Some(format!("/{}", "x".repeat(MAX_DIRECTORY_BYTES)).into()),
+            },
+            Operation::MovePane {
+                session: session.clone(),
+                target: None,
+                edge: Some(MoveEdge::Left),
+                new_window: false,
+            },
+            Operation::MovePane {
+                session: session.clone(),
+                target: Some(session.clone()),
+                edge: Some(MoveEdge::Left),
+                new_window: true,
+            },
+            Operation::SetPane { session: session.clone(), appearance: AppearancePatch::default() },
+            Operation::SetPane {
+                session: session.clone(),
+                appearance: AppearancePatch {
+                    title: Some(Some("bad\nlabel".into())),
+                    ..AppearancePatch::default()
+                },
+            },
+            Operation::SetPane {
+                session: session.clone(),
+                appearance: AppearancePatch {
+                    text_color: Some(Some("red".into())),
+                    ..AppearancePatch::default()
+                },
+            },
+            Operation::SaveLoadout { name: " ".into(), include_directories: true },
+        ];
+        for operation in invalid {
+            let response = request(server.socket_path(), &Request::new(None, operation)).unwrap();
+            assert!(
+                matches!(
+                    response.result,
+                    ResponseResult::Error { code: ErrorCode::InvalidRequest, .. }
+                ),
+                "{response:?}"
+            );
+        }
+        let response = request(
+            server.socket_path(),
+            &Request::new(
+                None,
+                Operation::MovePane {
+                    session,
+                    target: Some(SessionSelector { instance_id: "0".repeat(32), session_id: 1 }),
+                    edge: Some(MoveEdge::Right),
+                    new_window: false,
+                },
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            response.result,
+            ResponseResult::Error { code: ErrorCode::StaleInstance, .. }
         ));
     }
 

@@ -171,19 +171,22 @@ impl App {
             state.pane.content_dirty = false;
         }
         let (reply, response) = std::sync::mpsc::sync_channel(1);
-        self.dispatch_control(crate::control::ControlEvent {
-            request: Request::new(
-                Some(instance.clone()),
-                Operation::SendInput {
-                    session: target.clone(),
-                    text: String::new(),
-                    mode: InputMode::Raw,
-                    enter: false,
-                },
-            ),
-            reply,
-            deadline: Instant::now() + Duration::from_secs(5),
-        });
+        self.dispatch_control(
+            events,
+            crate::control::ControlEvent {
+                request: Request::new(
+                    Some(instance.clone()),
+                    Operation::SendInput {
+                        session: target.clone(),
+                        text: String::new(),
+                        mode: InputMode::Raw,
+                        enter: false,
+                    },
+                ),
+                reply,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+        );
         check(
             matches!(
                 response.try_recv().map_err(|error| error.to_string())?.result,
@@ -201,6 +204,25 @@ impl App {
             state.content_dirty && pane.content_dirty,
             "silent control input did not request viewport redraw",
         )?;
+        {
+            let state = self.windows.get_mut(&target_window).unwrap();
+            state.load_pane(target_pane);
+            state.pane.content_dirty = false;
+            state.content_dirty = false;
+            state.load_pane(state.tree.active());
+        }
+        let appearance = crate::session::PaneAppearance {
+            text_color: Some("#123ABC".into()),
+            ..Default::default()
+        };
+        self.set_pane_appearance(target_window, target_pane, appearance)?;
+        let state = &self.windows[&target_window];
+        check(
+            state.tree.active() != target_pane
+                && state.pane_state(target_pane).is_some_and(|pane| pane.content_dirty),
+            "background appearance update did not invalidate target grid",
+        )?;
+        self.set_pane_appearance(target_window, target_pane, Default::default())?;
 
         Ok(SessionControlFixture {
             socket,
@@ -326,7 +348,7 @@ impl SessionControlFixture {
             &Request::new(
                 Some(self.stale.instance_id.clone()),
                 Operation::SendInput {
-                    session: self.stale,
+                    session: self.stale.clone(),
                     text: "STALE_MUST_NOT_WRITE".into(),
                     mode: InputMode::Raw,
                     enter: false,
@@ -358,6 +380,258 @@ impl SessionControlFixture {
             active.len() == self.active.len()
                 && active.iter().all(|pane| self.active.contains(pane)),
             "control operation stole pane focus",
+        )?;
+        self.exercise_workspace_control()?;
+        Ok(())
+    }
+
+    fn exercise_workspace_control(&self) -> Result<(), String> {
+        use crate::control::{self, AppearancePatch, MoveEdge, PaneInfo};
+        let call = |operation| {
+            control::request(
+                &self.socket,
+                &Request::new(Some(self.target.instance_id.clone()), operation),
+            )
+            .map_err(|error| error.to_string())
+        };
+        let pane = |operation| -> Result<PaneInfo, String> {
+            match call(operation)?.result {
+                ResponseResult::Pane { pane } => Ok(pane),
+                result => Err(format!("unexpected pane mutation result: {result:?}")),
+            }
+        };
+        let list = || -> Result<Vec<PaneInfo>, String> {
+            match call(Operation::ListPanes)?.result {
+                ResponseResult::Panes { panes } => Ok(panes),
+                result => Err(format!("unexpected workspace list: {result:?}")),
+            }
+        };
+        let original: Vec<_> = list()?.into_iter().map(|pane| pane.session).collect();
+        check(
+            matches!(
+                call(Operation::CreatePane {
+                    session: None,
+                    directory: Some(self.directory.join("missing")),
+                })?
+                .result,
+                ResponseResult::Error { code: ErrorCode::InvalidRequest, .. }
+            ),
+            "nonexistent explicit directory was accepted",
+        )?;
+        check(list()?.len() == original.len(), "invalid creation changed workspace")?;
+        let created =
+            pane(Operation::CreatePane { session: Some(self.target.clone()), directory: None })?;
+        check(
+            created.cwd.as_deref() == self.directory.to_str(),
+            "creation did not inherit directory",
+        )?;
+        check(!original.contains(&created.session), "creation reused a session handle")?;
+        let split = pane(Operation::SplitPane {
+            session: created.session.clone(),
+            axis: Axis::Vertical,
+            directory: Some(self.directory.clone()),
+        })?;
+        check(
+            split.session != created.session && split.window_id == created.window_id,
+            "split did not create a new session in the selected window",
+        )?;
+        check(
+            pane(Operation::FocusPane { session: created.session.clone() })?.active,
+            "focus did not select the target pane",
+        )?;
+        let styled = pane(Operation::SetPane {
+            session: split.session.clone(),
+            appearance: AppearancePatch {
+                title: Some(Some("Control 日本語".into())),
+                text_color: Some(Some("#aBcDeF".into())),
+                outline_color: Some(Some("#13579b".into())),
+            },
+        })?;
+        check(
+            styled.title == "Control 日本語"
+                && styled.appearance.text_color.as_deref() == Some("#ABCDEF")
+                && styled.appearance.outline_color.as_deref() == Some("#13579B"),
+            "appearance update did not normalize or expose values",
+        )?;
+        let focused = pane(Operation::FocusPane { session: created.session.clone() })?;
+        check(focused.active, "focus did not select the target pane")?;
+        check(
+            pane(Operation::ZoomPane { session: split.session.clone() })?.zoomed,
+            "zoom did not select and enlarge target",
+        )?;
+        check(
+            !pane(Operation::ZoomPane { session: split.session.clone() })?.zoomed,
+            "second zoom did not restore layout",
+        )?;
+        match call(Operation::SendInput {
+            session: split.session.clone(),
+            text: "printf '\\033]133;C\\007CONTROL_MOVE_%s\\n\\033]133;D;0\\007' PERSISTED".into(),
+            mode: InputMode::Paste,
+            enter: true,
+        })?
+        .result
+        {
+            ResponseResult::InputSent { .. } => {}
+            result => return Err(format!("move sentinel input failed: {result:?}")),
+        }
+        check(
+            matches!(
+                call(Operation::Wait {
+                    session: split.session.clone(),
+                    after_command_id: 0,
+                    timeout_ms: 5000
+                })?
+                .result,
+                ResponseResult::Completed { .. }
+            ),
+            "move sentinel did not complete",
+        )?;
+        let moved = pane(Operation::MovePane {
+            session: split.session.clone(),
+            target: Some(self.target.clone()),
+            edge: Some(MoveEdge::Right),
+            new_window: false,
+        })?;
+        check(
+            moved.session == split.session
+                && moved.window_id != split.window_id
+                && moved.appearance == styled.appearance,
+            "dock lost session identity or appearance",
+        )?;
+        let detached = pane(Operation::MovePane {
+            session: split.session.clone(),
+            target: None,
+            edge: None,
+            new_window: true,
+        })?;
+        check(
+            detached.session == split.session && detached.window_id != moved.window_id,
+            "detach did not preserve live session",
+        )?;
+        match call(Operation::ReadOutput {
+            session: split.session.clone(),
+            max_lines: 200,
+            max_bytes: 8192,
+        })?
+        .result
+        {
+            ResponseResult::Output { text, .. } => check(
+                text.contains("CONTROL_MOVE_PERSISTED"),
+                "live pane move lost terminal content",
+            )?,
+            result => return Err(format!("moved output unavailable: {result:?}")),
+        }
+        let name = "native control workspace".to_owned();
+        check(
+            matches!(
+                call(Operation::SaveLoadout { name: name.clone(), include_directories: true })?
+                    .result,
+                ResponseResult::LoadoutSaved { .. }
+            ),
+            "loadout save failed",
+        )?;
+        match call(Operation::ListLoadouts)?.result {
+            ResponseResult::Loadouts { loadouts } => check(
+                loadouts.iter().any(|loadout| {
+                    loadout.name == name
+                        && loadout.include_directories
+                        && loadout.panes == original.len() + 2
+                }),
+                "saved loadout summary is incorrect",
+            )?,
+            result => return Err(format!("loadout list failed: {result:?}")),
+        }
+        let opened =
+            match call(Operation::OpenLoadout { name: name.clone(), restore_directories: true })?
+                .result
+            {
+                ResponseResult::LoadoutOpened { panes, .. } => panes,
+                result => return Err(format!("loadout open failed: {result:?}")),
+            };
+        check(
+            opened.len() == original.len() + 2
+                && opened.iter().all(|pane| {
+                    !original.contains(&pane.session)
+                        && pane.session != created.session
+                        && pane.session != split.session
+                }),
+            "opened loadout reused an old session",
+        )?;
+        check(
+            opened.iter().any(|pane| {
+                pane.appearance == styled.appearance
+                    && pane.cwd.as_deref() == self.directory.to_str()
+            }),
+            "opened loadout lost appearance or directory",
+        )?;
+        check(
+            matches!(
+                call(Operation::SaveLoadout { name: name.clone(), include_directories: false })?
+                    .result,
+                ResponseResult::LoadoutSaved { .. }
+            ),
+            "directory-free save failed",
+        )?;
+        match call(Operation::ListLoadouts)?.result {
+            ResponseResult::Loadouts { loadouts } => check(
+                loadouts.iter().any(|loadout| loadout.name == name && !loadout.include_directories),
+                "directory-free save retained directory flag",
+            )?,
+            result => return Err(format!("loadout list after replacement failed: {result:?}")),
+        }
+        let cleared = pane(Operation::SetPane {
+            session: split.session.clone(),
+            appearance: AppearancePatch {
+                title: Some(None),
+                text_color: None,
+                outline_color: Some(None),
+            },
+        })?;
+        check(
+            cleared.appearance.title.is_none()
+                && cleared.appearance.outline_color.is_none()
+                && cleared.appearance.text_color == styled.appearance.text_color,
+            "appearance clear changed an omitted field",
+        )?;
+        check(
+            matches!(
+                call(Operation::DeleteLoadout { name: name.clone() })?.result,
+                ResponseResult::LoadoutDeleted { .. }
+            ),
+            "loadout delete failed",
+        )?;
+        match call(Operation::ListLoadouts)?.result {
+            ResponseResult::Loadouts { loadouts } => check(
+                !loadouts.iter().any(|loadout| loadout.name == name),
+                "deleted loadout remained listed",
+            )?,
+            result => return Err(format!("loadout list after delete failed: {result:?}")),
+        }
+        for session in opened
+            .into_iter()
+            .map(|pane| pane.session)
+            .chain([created.session, split.session.clone()])
+        {
+            check(
+                matches!(call(Operation::ClosePane { session: session.clone() })?.result, ResponseResult::PaneClosed { session: closed } if closed == session),
+                "pane close failed",
+            )?;
+        }
+        check(
+            list()?.len() == original.len(),
+            "workspace cleanup did not restore original pane count",
+        )?;
+        check(
+            matches!(
+                call(Operation::ReadOutput {
+                    session: split.session,
+                    max_lines: 1,
+                    max_bytes: 64
+                })?
+                .result,
+                ResponseResult::Error { code: ErrorCode::UnknownSession, .. }
+            ),
+            "closed handle still addressed a terminal",
         )?;
         Ok(())
     }
