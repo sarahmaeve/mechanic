@@ -1,38 +1,18 @@
 //! Font configuration for Mechanic.
-//!
-//! Specifies the primary font family, size, and an ordered list of fallback
-//! families used when a glyph is not found in the primary face.
 
 use serde::{Deserialize, Serialize};
 
 /// Font settings used by the renderer when shaping terminal text.
-///
-/// Partial TOML configs are supported via `#[serde(default)]` — any missing
-/// key falls back to the values returned by [`FontConfig::default`].
-///
-/// # Example — user config snippet
-/// ```toml
-/// [font]
-/// family = "JetBrains Mono"
-/// size = 13.0
-/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FontConfig {
-    /// Primary font family name as recognised by the system font resolver.
-    ///
-    /// Defaults to `"Berkeley Mono"`.
+    /// Primary system font family.
     pub family: String,
 
     /// Font size in points.
-    ///
-    /// Defaults to `16.0`.
     pub size: f32,
 
-    /// Ordered list of fallback font families tried when a glyph is absent
-    /// from the primary face.
-    ///
-    /// Defaults to a curated list of widely-available monospace fonts.
+    /// Configured fallback families; currently unused by the renderer.
     pub fallback_families: Vec<String>,
 }
 
@@ -50,8 +30,6 @@ impl Default for FontConfig {
         }
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -90,7 +68,6 @@ mod tests {
         let partial = r#"size = 16.0"#;
         let cfg: FontConfig = toml::from_str(partial).expect("partial deserialize");
         assert!((cfg.size - 16.0).abs() < f32::EPSILON);
-        // Family should still be the default.
         assert_eq!(cfg.family, "Berkeley Mono");
     }
 }

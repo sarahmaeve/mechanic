@@ -20,10 +20,6 @@ fn main() {
         }
     };
 
-    // Typed event loop: `UserEvent::PtyOutput(WindowId)` is how PTY reader
-    // threads (and any other background producer) wake the main thread.
-    // Without this, switching the main loop to `ControlFlow::Wait` would
-    // make the shell appear frozen until the user moves the mouse.
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("failed to build event loop");
@@ -33,28 +29,12 @@ fn main() {
     event_loop.run_app(&mut app).expect("event loop exited with error");
 }
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
-
 /// Parsed command-line options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cli {
-    /// Whether to run the shader-side animations (corner-gradient
-    /// breath / color pulse, electron traces on the logo).  Default
-    /// is `false`: the gradient and logo render as a static corner
-    /// accent, and the focused window costs nothing to hold open.
-    /// `--hot-cpu` flips this to `true` for users who want the full
-    /// light show and don't mind paying the CPU bill.
-    ///
-    /// Window opacity (focused vs. unfocused) is independent of this
-    /// flag — it snaps immediately on focus change and never runs an
-    /// animation, so blur/focus transitions are free regardless.
+    /// Enable continuous shader animation while focused.
     hot_cpu: bool,
-    /// Whether to honour programs' mouse-reporting requests (DECSET
-    /// 1000/1002/1003/1006).  `--no-mouse-tracking` forces this to
-    /// `false`; absent the flag it's `true` and programs like vim,
-    /// tmux, fzf get their mouse events forwarded.  Users who'd
-    /// rather keep drag-select and middle-click-paste working
-    /// unconditionally pass the flag.
+    /// Forward mouse events when requested by the terminal program.
     mouse_tracking: bool,
 }
 
@@ -65,10 +45,6 @@ impl Default for Cli {
 }
 
 /// Parse `mechanic`'s command-line arguments.
-///
-/// Hand-rolled rather than pulling in clap: the flag surface is tiny
-/// and is unlikely to grow quickly.  Unknown flags exit with code 2
-/// (conventional for CLI usage errors).
 fn parse_args<I>(args: I) -> Cli
 where
     I: IntoIterator<Item = String>,
@@ -103,29 +79,18 @@ fn print_help() {
     println!("    mechanic [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    --hot-cpu              Enable the shader light show: corner-gradient");
-    println!("                           breath, color pulse, and electron traces on");
-    println!("                           the logo.  Looks cool, costs a few percent");
-    println!("                           CPU while the window is focused.  Off by");
-    println!("                           default — the gradient still renders, it");
-    println!("                           just doesn't animate.  Window opacity snaps");
-    println!("                           instantly on focus change either way.");
-    println!("    --no-mouse-tracking    Ignore programs' DECSET 1000/1002/1003/1006");
-    println!("                           mouse-reporting requests.  Drag-select and");
-    println!("                           middle-click-paste always work locally, at");
-    println!("                           the cost of vim/tmux/fzf mouse support.");
+    println!("    --hot-cpu              Animate the gradient and logo while focused");
+    println!("                           (off by default; increases CPU usage)");
+    println!("    --no-mouse-tracking    Keep selection and middle-click paste local");
     println!("    -h, --help             Show this help and exit");
     println!("    -V, --version          Show version and exit");
 }
 
-// ── Config path resolution ────────────────────────────────────────────────────
-
 /// Resolve the user's `mechanic.toml` config path using XDG then HOME.
-///
-/// Returns `None` if neither `$XDG_CONFIG_HOME` nor `$HOME` is set
-/// (essentially never on macOS/Linux — warn and fall back to
-/// defaults when that happens).
-fn config_path(xdg: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+fn config_path(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
     if let Some(base) = xdg {
         return Some(std::path::PathBuf::from(base).join("mechanic").join("mechanic.toml"));
     }
@@ -135,32 +100,23 @@ fn config_path(xdg: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>
     None
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::{Cli, config_path, parse_args};
     use std::ffi::OsString;
 
-    // ── Config path resolution ────────────────────────────────────────────────
-
     #[test]
     fn xdg_takes_priority() {
-        let path = config_path(
-            Some(OsString::from("/custom/xdg")),
-            Some(OsString::from("/home/user")),
-        )
-        .unwrap();
+        let path =
+            config_path(Some(OsString::from("/custom/xdg")), Some(OsString::from("/home/user")))
+                .unwrap();
         assert_eq!(path, std::path::PathBuf::from("/custom/xdg/mechanic/mechanic.toml"));
     }
 
     #[test]
     fn home_fallback() {
         let path = config_path(None, Some(OsString::from("/home/user"))).unwrap();
-        assert_eq!(
-            path,
-            std::path::PathBuf::from("/home/user/.config/mechanic/mechanic.toml")
-        );
+        assert_eq!(path, std::path::PathBuf::from("/home/user/.config/mechanic/mechanic.toml"));
     }
 
     #[test]
@@ -168,14 +124,10 @@ mod tests {
         assert!(config_path(None, None).is_none());
     }
 
-    // ── CLI parsing ───────────────────────────────────────────────────────────
-
     #[test]
     fn cli_default_has_hot_cpu_off() {
-        // No arguments: shader animations off (the quiet default).
         let cli = parse_args(Vec::<String>::new());
         assert!(!cli.hot_cpu);
-        // Mouse tracking defaults to on.
         assert!(cli.mouse_tracking);
     }
 
@@ -183,7 +135,6 @@ mod tests {
     fn cli_hot_cpu_enables() {
         let cli = parse_args(vec!["--hot-cpu".to_string()]);
         assert!(cli.hot_cpu);
-        // --hot-cpu alone should NOT touch mouse tracking.
         assert!(cli.mouse_tracking);
     }
 
@@ -191,23 +142,18 @@ mod tests {
     fn cli_no_mouse_tracking_disables() {
         let cli = parse_args(vec!["--no-mouse-tracking".to_string()]);
         assert!(!cli.mouse_tracking);
-        // --no-mouse-tracking alone should NOT touch hot_cpu.
         assert!(!cli.hot_cpu);
     }
 
     #[test]
     fn cli_both_flags_combine() {
-        let cli = parse_args(vec![
-            "--hot-cpu".to_string(),
-            "--no-mouse-tracking".to_string(),
-        ]);
+        let cli = parse_args(vec!["--hot-cpu".to_string(), "--no-mouse-tracking".to_string()]);
         assert!(cli.hot_cpu);
         assert!(!cli.mouse_tracking);
     }
 
     #[test]
     fn cli_default_matches_no_args() {
-        // Default-constructed Cli matches the no-args case.
         assert_eq!(Cli::default(), parse_args(Vec::<String>::new()));
     }
 }

@@ -1,10 +1,6 @@
 //! Terminal state wrapper.
-//!
-//! [`Terminal`] owns an [`alacritty_terminal::Term`] instance together with a
-//! [`PtyHandle`] and an [`EventProxy`].  The main-thread render loop calls
-//! [`Terminal::process_input`] to drain available PTY bytes and update the
-//! terminal grid, then reads grid state through [`Terminal::grid`] and
-//! title state through [`Terminal::title`].
+
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::Grid;
 use alacritty_terminal::Term;
@@ -24,56 +20,27 @@ use crate::error::TerminalError;
 use crate::event::{EventProxy, TerminalEvent};
 use crate::pty::PtyHandle;
 
-// ── ProcessOutcome ────────────────────────────────────────────────────────────
-
 /// Result of one [`Terminal::process_input`] call.
-///
-/// Summarizes the events that occurred while bytes were being drained
-/// from the PTY and fed to the VTE parser.  The caller uses this to
-/// react to things `process_input` shouldn't decide on its own — such
-/// as whether to close the window on shell exit.
 #[derive(Debug, Clone, Default)]
 pub struct ProcessOutcome {
-    /// `Some(status)` if the child shell process exited during this
-    /// call.  `None` means the shell is still alive (or was already
-    /// dead and the exit event was delivered on a previous call).
-    ///
-    /// The outer `Option` is "did the shell exit during this call".
-    /// The inner `Option<ExitStatus>` mirrors the [`TerminalEvent::Exit`]
-    /// payload — `Some(status)` for a real child exit, `None` for the
-    /// library-internal `AlacrittyEvent::Exit` which carries no status.
+    /// Exit observed in this call: `None` means no event, `Some(None)` means unknown status.
+    /// `Some(Some(status))` carries the child status; exit is delivered once.
     pub child_exit: Option<Option<std::process::ExitStatus>>,
 
-    /// `true` if any PTY bytes were drained through the VTE parser
-    /// during this call (i.e. the grid *may* have changed).  Callers
-    /// use this to decide whether to do a full grid-conversion render
-    /// or a cheap animation-only render that re-uses the previous
-    /// frame's instance buffer.
-    ///
-    /// Conservative: set whenever the parser was fed anything, without
-    /// diffing cells — a CSI query that produces a PtyWrite response
-    /// and no visible change still trips the flag.  That's fine; the
-    /// worst case is one wasted full render.
+    /// Parser received PTY bytes; the visible grid may need rebuilding.
     pub grid_maybe_changed: bool,
+    /// Fatal asynchronous transport failure, delivered once.
+    pub io_error: Option<String>,
+    /// A parsing budget was reached; schedule another call even without a PTY wake.
+    /// This is conservative and may be true when the last chunk emptied the queue.
+    pub more_output: bool,
 }
 
-// ── MouseProtocol ─────────────────────────────────────────────────────────────
+const PARSE_TIME_BUDGET: Duration = Duration::from_millis(4);
+const PARSE_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+const PARSE_CHUNK_BUDGET: usize = 64;
 
-/// Snapshot of the DECSET mouse-reporting flags the running program
-/// has enabled.
-///
-/// Programs subscribe to mouse events via DECSET sequences:
-///
-/// | DECSET | Flag           | Semantics                                         |
-/// |--------|----------------|---------------------------------------------------|
-/// | 1000   | `report_click` | Button press & release                            |
-/// | 1002   | `report_drag`  | Press/release + motion while a button is held     |
-/// | 1003   | `report_motion`| All motion (with or without buttons)              |
-/// | 1006   | `sgr`          | Use SGR encoding (`ESC [ < Cb ; Cx ; Cy M|m`)     |
-///
-/// When `sgr` is off and any `report_*` flag is set, the legacy X10
-/// encoding (`ESC [ M Cb Cx Cy` with each value offset by `0x20`) is
-/// expected.  Almost all modern programs set 1006 alongside 1000/1002.
+/// Snapshot of the DECSET mouse-reporting flags the running program has enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MouseProtocol {
     /// DECSET 1000 — press/release events.
@@ -82,72 +49,44 @@ pub struct MouseProtocol {
     pub report_drag: bool,
     /// DECSET 1003 — all motion events.
     pub report_motion: bool,
-    /// DECSET 1006 — SGR encoding.  When false and any `report_*` is
-    /// true, callers should fall back to the legacy X10 encoding.
+    /// DECSET 1006 selects SGR encoding; otherwise use legacy mouse encoding.
     pub sgr: bool,
 }
 
 impl MouseProtocol {
-    /// Returns `true` if any form of mouse reporting is active — i.e.
-    /// the running program wants mouse events forwarded via the PTY.
+    /// Whether any mouse reporting mode is enabled.
     pub fn is_tracking(&self) -> bool {
         self.report_click || self.report_drag || self.report_motion
     }
 }
 
-// ── Bracketed-paste constants ─────────────────────────────────────────────────
-
-/// DECSET 2004 start-of-paste marker, written as a raw byte slice so
-/// [`Terminal::paste`] can splice it into the outgoing buffer without
-/// any UTF-8 trip.
+/// DECSET 2004 paste markers.
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 
-/// DECSET 2004 end-of-paste marker.  Paired with [`BRACKETED_PASTE_START`].
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
-/// Total bytes the start+end markers add to a payload.  Used as a
-/// capacity hint when allocating the outgoing buffer.
 const BRACKETED_PASTE_WRAP_OVERHEAD: usize =
     BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len();
 
-// ── Terminal ──────────────────────────────────────────────────────────────────
-
-/// A running terminal session.
-///
-/// # Threading model
-///
-/// PTY bytes are produced on a background reader thread (inside [`PtyHandle`])
-/// and shipped to the main thread via a [`crossbeam_channel`].
-/// [`Terminal::process_input`] drains that channel and feeds each chunk to the
-/// VTE parser, which in turn calls into `Term` to update the grid.  All grid
-/// access must therefore happen on the same thread that calls
-/// `process_input`.
+/// Terminal parser and grid, fed by output from a background PTY reader.
+/// Process input and access the grid on the same thread.
 pub struct Terminal {
-    /// The `alacritty_terminal` state machine and grid.
     term: Term<EventProxy>,
-    /// PTY handle — owns the background reader thread and write file.
+    /// Writer and output channels; the reader thread owns the PTY.
     pty: PtyHandle,
-    /// Event proxy — receives terminal events from `Term`.
     event_proxy: EventProxy,
-    /// VTE ANSI escape-sequence parser.
     parser: Processor,
-    /// Current terminal title (maintained from [`TerminalEvent`] s).
+    /// Cached OSC title; empty means the application supplies its default.
     title: String,
-    /// Current terminal size.
     size: TerminalSize,
+    pending_exit: Option<Option<std::process::ExitStatus>>,
+    exit_delivered: bool,
+    pending_error: Option<String>,
+    output_finished: bool,
 }
 
 impl Terminal {
     /// Create a new terminal with a PTY of the given size.
-    ///
-    /// This spawns the shell configured in `config`, sets up the PTY with
-    /// `size`, and initialises the `alacritty_terminal` state machine.
-    ///
-    /// `waker` is a thread-safe callback invoked by the PTY reader
-    /// thread whenever new shell output lands in the channel.  The
-    /// application layer typically wires this to a winit event-loop
-    /// proxy so the main loop can sleep at idle and wake promptly on
-    /// PTY output.  Tests pass `Arc::new(|| {})`.
     pub fn new(
         config: &Config,
         size: TerminalSize,
@@ -159,148 +98,143 @@ impl Terminal {
 
         let event_proxy = EventProxy::new();
 
-        // Build a `Term` config, threading the scrollback-lines knob
-        // through from our user-facing `TerminalConfig` into alacritty's
-        // internal config.  Other fields keep alacritty's defaults.
-        let term_config =
-            TermConfig { scrolling_history: config.terminal.scrollback_lines, ..TermConfig::default() };
+        let term_config = TermConfig {
+            scrolling_history: config.terminal.scrollback_lines,
+            ..TermConfig::default()
+        };
 
-        // Create the alacritty_terminal Term.  It needs a `Dimensions`
-        // implementor; we use `alacritty_terminal::event::WindowSize` directly
-        // because it already satisfies `Dimensions` for grid construction.
         let dimensions = TermDimensions { columns: size.columns, screen_lines: size.rows };
         let term = Term::new(term_config, &dimensions, event_proxy.clone());
 
-        // Spawn the PTY.
         let pty = PtyHandle::spawn(config, size, waker)?;
 
-        Ok(Self { term, pty, event_proxy, parser: Processor::new(), title: String::new(), size })
+        Ok(Self {
+            term,
+            pty,
+            event_proxy,
+            parser: Processor::new(),
+            title: String::new(),
+            size,
+            pending_exit: None,
+            exit_delivered: false,
+            pending_error: None,
+            output_finished: false,
+        })
     }
 
-    // ── Input / output ────────────────────────────────────────────────────────
-
-    /// Drain available PTY output, update the terminal grid, and return
-    /// a [`ProcessOutcome`] summarizing noteworthy events that fired.
-    ///
-    /// Should be called from the main thread whenever the render loop
-    /// wakes up.  Processes all bytes currently in the channel, then
-    /// drains [`TerminalEvent`]s produced by the parser:
-    ///
-    /// - Title events update the cached title (exposed via [`Terminal::title`]).
-    /// - `Exit` events populate [`ProcessOutcome::child_exit`] so the
-    ///   caller can decide whether to close or freeze the window.
-    /// - `Bell`, `Wakeup`, and `PtyWrite` are currently ignored (they
-    ///   can be surfaced here when the app needs them — wire into
-    ///   `ProcessOutcome`).
+    /// Drain output, update the grid/title, and send terminal protocol replies.
     pub fn process_input(&mut self) -> ProcessOutcome {
-        let mut outcome = ProcessOutcome::default();
+        self.process_input_with_budget(Instant::now(), PARSE_TIME_BUDGET, PARSE_BYTE_BUDGET)
+    }
 
-        // Drain all pending byte chunks from the reader thread.
-        while let Ok(chunk) = self.pty.rx.try_recv() {
+    // Check budgets between whole queue chunks so VTE state carries incomplete
+    // UTF-8 and escape sequences naturally. Always parse one available chunk.
+    fn process_input_with_budget(
+        &mut self,
+        started: Instant,
+        time_budget: Duration,
+        byte_budget: usize,
+    ) -> ProcessOutcome {
+        let mut outcome = ProcessOutcome::default();
+        // Observe completion BEFORE checking for an empty output queue. An
+        // empty observation made earlier cannot prove final output was parsed.
+        let output_done = self.pty.output_done();
+        // The worker sends its status before publishing output_done. Read the
+        // flag first so completion cannot hide a concurrently arriving status.
+        let pty_exit = self.pty.exit_rx.try_recv().ok();
+        self.output_finished |= output_done || pty_exit.is_some();
+        if !self.exit_delivered
+            && let Some(status) = pty_exit
+        {
+            self.pending_exit = Some(status);
+        }
+        if let Some(error) = self.pty.take_failure() {
+            self.pending_error = Some(error);
+        }
+        self.drain_parser_events();
+        let mut bytes = 0;
+        let mut chunks = 0;
+        let mut empty = false;
+
+        loop {
+            if chunks > 0
+                && (started.elapsed() >= time_budget
+                    || bytes >= byte_budget
+                    || chunks >= PARSE_CHUNK_BUDGET)
+            {
+                outcome.more_output = true;
+                break;
+            }
+            let Ok(chunk) = self.pty.rx.try_recv() else {
+                empty = true;
+                break;
+            };
+            bytes += chunk.len();
+            chunks += 1;
             self.parser.advance(&mut self.term, &chunk);
             outcome.grid_maybe_changed = true;
+            // Include protocol replies and title processing in the time budget.
+            self.drain_parser_events();
+        }
+        if outcome.grid_maybe_changed {
+            self.pty.output_drained();
+        }
+        // output_drained or a protocol reply can itself fail to notify the
+        // worker. Retain that failure before deciding whether to report exit.
+        if let Some(error) = self.pty.take_failure() {
+            self.pending_error = Some(error);
         }
 
-        // Drain terminal events and update our cached title.  Exit
-        // events are returned via `outcome` so the caller decides
-        // close-vs-freeze policy.  Multiple Exit events in one call
-        // collapse to the last one seen — a shell can only exit once.
-        for event in self.event_proxy.drain() {
-            match event {
-                TerminalEvent::TitleChanged(t) => self.title = t,
-                TerminalEvent::TitleReset => self.title.clear(),
-                TerminalEvent::Exit(status) => outcome.child_exit = Some(status),
-                // Bell / Wakeup / PtyWrite — not yet plumbed.  Dropping
-                // them here matches previous behaviour.
-                _ => {}
-            }
-        }
-
-        // Poll the PTY reader's exit channel.  When the child shell
-        // exits, the reader thread sees EOF on the PTY master, reaps
-        // the child with `waitpid`, and pushes the status here.  We
-        // don't run `alacritty_terminal`'s own event loop, so without
-        // this bridge no `ChildExit` event would ever fire and the
-        // window would stay open after the user typed `exit`.
-        //
-        // `try_recv` is non-blocking; a populated event from the event
-        // proxy above (unlikely in practice) takes precedence via the
-        // `is_none` guard so we don't clobber a real `ChildExit`
-        // status with our waitpid-derived one.
-        if outcome.child_exit.is_none() {
-            if let Ok(status) = self.pty.exit_rx.try_recv() {
-                outcome.child_exit = Some(status);
+        if empty {
+            // Only an observed PTY exit or worker completion guarantees that
+            // another producer cannot race this empty queue observation.
+            if self.output_finished {
+                outcome.child_exit = self.pending_exit.take();
+                self.exit_delivered |= outcome.child_exit.is_some();
+                outcome.io_error = self.pending_error.take();
             }
         }
 
         outcome
     }
 
+    fn drain_parser_events(&mut self) {
+        for event in self.event_proxy.drain() {
+            match event {
+                TerminalEvent::TitleChanged(t) => self.title = t,
+                TerminalEvent::TitleReset => self.title.clear(),
+                TerminalEvent::Exit(status) if !self.exit_delivered => {
+                    self.pending_exit.get_or_insert(status);
+                }
+                TerminalEvent::PtyWrite(bytes) => {
+                    // Protocol replies must not move a scrolled viewport.
+                    if let Err(error) = self.pty.write(&bytes) {
+                        log::warn!("could not write terminal reply: {error}");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Feed `data` directly to the VTE parser without writing to the PTY.
-    ///
-    /// Use this when the terminal emulator itself — not the child shell
-    /// — is the source of bytes to display.  Current callers:
-    ///
-    /// - Exit banners ("[shell exited — press any key to close]")
-    /// - Future: inline preedit display for IME composition
-    ///
-    /// The input is subject to the same ANSI/VTE parsing as PTY output,
-    /// so colours (SGR sequences) and cursor-motion escapes work.
     pub fn inject_local(&mut self, data: &[u8]) {
         self.parser.advance(&mut self.term, data);
     }
 
-    /// Send keyboard / paste `data` to the PTY.
-    ///
-    /// Also snaps the display back to the live area — matches xterm /
-    /// iTerm2 / Terminal.app, where any user input into the shell returns
-    /// the viewport to the cursor so the user can see what they're typing.
+    /// Send input and return the scrollback viewport to the live screen.
     pub fn write_to_pty(&mut self, data: &[u8]) -> Result<(), TerminalError> {
         self.term.scroll_display(Scroll::Bottom);
         self.pty.write(data)
     }
 
-    /// Send `text` to the PTY as a paste, with clipboard-injection safety
-    /// filtering.
-    ///
-    /// Filters applied unconditionally:
-    ///
-    /// - Bracketed-paste markers (`\x1b[200~` and `\x1b[201~`) are
-    ///   stripped.  A clipboard payload containing the end marker
-    ///   could otherwise escape the bracketed-paste wrap and smuggle
-    ///   keystrokes into the shell — the canonical paste-injection
-    ///   attack.
-    /// - `\r\n` and lone `\r` are normalized to `\n` so pastes from
-    ///   Windows / classic-Mac applications behave consistently and
-    ///   a stray `\r` cannot act as "press Enter" in a non-bracketed
-    ///   shell.
-    ///
-    /// Additional filtering when the shell has *not* enabled bracketed
-    /// paste:
-    ///
-    /// - Any trailing newline is stripped.  Without bracketed paste
-    ///   the shell reads each byte as a keystroke, so a trailing `\n`
-    ///   would auto-execute the last pasted line before the user can
-    ///   review it.  Embedded newlines are preserved for legitimate
-    ///   multi-line pastes (heredocs, SQL, etc.).
-    ///
-    /// When bracketed paste IS active the filtered payload is wrapped
-    /// in `\x1b[200~ … \x1b[201~` so readline treats it as a single
-    /// edit (one undo step, history-expansion disabled, etc.).
-    ///
-    /// Prefer this over [`Self::write_to_pty`] for any byte stream
-    /// that originated outside the user's physical keyboard — the
-    /// system clipboard, X11-style middle-click primary selection,
-    /// drag-and-drop, or any future shell-integrated paste command.
+    /// Filter clipboard text and wrap it when DECSET 2004 is enabled.
+    /// See [`crate::paste::filter`] for the filtering contract.
     pub fn paste(&mut self, text: &str) -> Result<(), TerminalError> {
         let bracketed = self.bracketed_paste();
         let filtered = crate::paste::filter(text, bracketed);
 
         if bracketed {
-            // Wrap the sanitized payload in DECSET 2004 markers so
-            // readline handles it as one edit.  `filter` has removed
-            // any embedded markers, so the open/close bracket cannot
-            // be escaped from inside.
             let mut payload = Vec::with_capacity(filtered.len() + BRACKETED_PASTE_WRAP_OVERHEAD);
             payload.extend_from_slice(BRACKETED_PASTE_START);
             payload.extend_from_slice(filtered.as_bytes());
@@ -311,8 +245,6 @@ impl Terminal {
         }
     }
 
-    // ── Resize ────────────────────────────────────────────────────────────────
-
     /// Resize both the terminal grid and the PTY to `size`.
     pub fn resize(&mut self, size: TerminalSize) {
         if size == self.size {
@@ -320,41 +252,23 @@ impl Terminal {
         }
         self.size = size;
 
-        // Resize the terminal grid.
         let dimensions = TermDimensions { columns: size.columns, screen_lines: size.rows };
         self.term.resize(dimensions);
 
-        // Resize the PTY (send TIOCSWINSZ).
-        // We do this by writing directly to the PTY file via ioctl; the
-        // alacritty_terminal `OnResize` trait is implemented on `Pty` but we
-        // don't have direct access to it after handing it to the reader
-        // thread.  We replicate the resize via the underlying file descriptor
-        // using libc instead.
         let window_size = size.to_window_size();
         if let Err(e) = resize_pty_fd(&self.pty, window_size) {
             log::warn!("PTY resize ioctl failed: {e}");
         }
     }
 
-    // ── Grid access ───────────────────────────────────────────────────────────
-
-    /// Read-only access to the terminal grid.
-    ///
-    /// The renderer calls this each frame to iterate over cells.
     pub fn grid(&self) -> &Grid<Cell> {
         self.term.grid()
     }
 
-    // ── Title ─────────────────────────────────────────────────────────────────
-
     /// The current terminal title as set by OSC 0/2 sequences.
-    ///
-    /// Returns an empty string if no title has been set.
     pub fn title(&self) -> &str {
         &self.title
     }
-
-    // ── Accessors for terminal mode / cursor ──────────────────────────────────
 
     /// The current terminal size.
     pub fn size(&self) -> TerminalSize {
@@ -362,31 +276,18 @@ impl Terminal {
     }
 
     /// Whether the shell has enabled bracketed-paste mode via `DECSET 2004`.
-    ///
-    /// When true, pastes should be wrapped in `\x1b[200~ ... \x1b[201~` so
-    /// readline sees the whole paste as one logical operation (relevant for
-    /// undo and for shells that disable history expansion on pastes).
     pub fn bracketed_paste(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
-    /// Whether the shell has enabled DECSET 1 (DECCKM) — application
-    /// cursor mode.  When true, cursor / navigation keys must send SS3
-    /// sequences (ESC O *) instead of CSI (ESC [ *).  Set by vim, less,
-    /// tmux, readline's `cursor-keys-mode-application` option.
+    /// DECSET 1 (DECCKM): arrows and Home/End use SS3 rather than CSI.
     pub fn cursor_app_mode(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
     /// Mouse-reporting protocol currently negotiated with the shell.
-    ///
-    /// Read-only snapshot of the relevant DECSET flags.  Callers use
-    /// this to decide whether a mouse event should be forwarded to the
-    /// PTY as an escape sequence (when the running program has asked
-    /// for mouse input — vim, tmux, fzf, less, tig, …) or consumed
-    /// locally for selection / scrollback.
     pub fn mouse_protocol(&self) -> MouseProtocol {
         use alacritty_terminal::term::TermMode;
         let m = self.term.mode();
@@ -398,17 +299,13 @@ impl Terminal {
         }
     }
 
-    /// Number of columns in the grid.
     pub fn columns(&self) -> usize {
         self.term.grid().columns()
     }
 
-    /// Number of visible screen lines.
     pub fn screen_lines(&self) -> usize {
         self.term.grid().screen_lines()
     }
-
-    // ── Scrollback ────────────────────────────────────────────────────────────
 
     /// Scroll the viewport up by `lines` lines (shows older content).
     pub fn scroll_up(&mut self, lines: usize) {
@@ -420,16 +317,12 @@ impl Terminal {
         self.term.scroll_display(Scroll::Delta(-(lines as i32)));
     }
 
-    // ── Cursor shape ──────────────────────────────────────────────────────────
-
     /// The current cursor shape as reported by the terminal state machine.
     pub fn cursor_shape(&self) -> CursorShape {
         self.term.cursor_style().shape
     }
 
-    // ── Selection ─────────────────────────────────────────────────────────────
-
-    /// Start a new character-level text selection at the given grid point.
+    /// Start a character selection in live-grid coordinates; scrollback lines are negative.
     pub fn start_selection(&mut self, point: Point, side: Side) {
         self.term.selection = Some(Selection::new(SelectionType::Simple, point, side));
     }
@@ -441,12 +334,11 @@ impl Terminal {
         }
     }
 
-    /// Clear the current selection.
     pub fn clear_selection(&mut self) {
         self.term.selection = None;
     }
 
-    /// Get the selected text as a `String`, or `None` if there is no (non-empty) selection.
+    /// Selected text, or `None` for an absent or empty selection.
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string()
     }
@@ -456,20 +348,11 @@ impl Terminal {
         self.term.selection.as_ref().and_then(|s| s.to_range(&self.term))
     }
 
-    // ── History ───────────────────────────────────────────────────────────────
-
-    /// Clear the scrollback buffer and the visible screen.
-    ///
-    /// Matches iTerm2's Cmd+K: removes all scrollback history AND sends
-    /// Ctrl+L (form feed) so the shell clears the visible viewport and
-    /// redraws its prompt.  Clearing scrollback alone would be invisible
-    /// to the user since the scrollback isn't rendered.
+    /// Clear scrollback and send Ctrl+L to ask the foreground program to redraw.
     pub fn clear_history(&mut self) {
         self.term.grid_mut().clear_history();
         let _ = self.pty.write(b"\x0c");
     }
-
-    // ── Select all ───────────────────────────────────────────────────────────
 
     /// Create a selection that covers the entire scrollback + visible viewport.
     pub fn select_all(&mut self) {
@@ -482,18 +365,14 @@ impl Terminal {
     }
 }
 
-// ── Re-exports for callers ────────────────────────────────────────────────────
-
-/// Re-export `Column` for constructing grid points.
+/// Zero-based grid column.
 pub use alacritty_terminal::index::Column as GridColumn;
-/// Re-export `Line` for constructing grid points.
+/// Live-screen row; negative values address scrollback.
 pub use alacritty_terminal::index::Line as GridLine;
-/// Re-export `Point` so callers don't need to depend on `alacritty_terminal` directly.
+/// Grid point in live-screen coordinates.
 pub use alacritty_terminal::index::Point as GridPoint;
-/// Re-export `Side` so callers don't need to depend on `alacritty_terminal` directly.
+/// Left or right cell half for selection boundaries.
 pub use alacritty_terminal::index::Side as GridSide;
-
-// ── Dimensions adapter ────────────────────────────────────────────────────────
 
 /// A minimal `Dimensions` implementor used to construct/resize `Term`.
 struct TermDimensions {
@@ -515,22 +394,7 @@ impl alacritty_terminal::grid::Dimensions for TermDimensions {
     }
 }
 
-// ── PTY resize helper ─────────────────────────────────────────────────────────
-
 /// Issue `TIOCSWINSZ` on the PTY master fd.
-///
-/// We replicate the resize logic from `alacritty_terminal::tty::Pty`'s
-/// `OnResize` implementation, because after handing the `Pty` to the reader
-/// thread we only have a cloned `File` (the writer) available.
-/// Build a `libc::winsize` from a `WindowSize`, saturating the pixel fields at
-/// `u16::MAX`.
-///
-/// The pixel fields (`ws_xpixel`, `ws_ypixel`) are informational: only
-/// sixel-like protocols read them.  The products `col × cell_width` and
-/// `row × cell_height` can easily exceed 65535 on 4K+ displays with small
-/// fonts (e.g. 800 cols × 100 px = 80 000).  Silent wrapping would hand pixel-
-/// aware apps a completely wrong value; saturation gives at least a lower bound
-/// that such apps can clamp against.
 fn winsize_from_window_size(window_size: WindowSize) -> libc::winsize {
     let ws_row = window_size.num_lines as libc::c_ushort;
     let ws_col = window_size.num_cols as libc::c_ushort;
@@ -552,16 +416,177 @@ fn resize_pty_fd(pty: &PtyHandle, window_size: WindowSize) -> std::io::Result<()
     if res == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// No-op waker for tests that don't need to coordinate with an
-    /// event loop.  The PTY reader thread will call it when bytes
-    /// arrive; discarding the signal is safe because the test isn't
-    /// observing PTY output via the event loop.
+    fn buffered_terminal() -> (Terminal, crate::pty::TestPtyPeer) {
+        let (pty, peer) = PtyHandle::test_pair(noop_waker());
+        let size = TerminalSize::default();
+        let dimensions = TermDimensions { columns: size.columns, screen_lines: size.rows };
+        let event_proxy = EventProxy::new();
+        let term = Term::new(TermConfig::default(), &dimensions, event_proxy.clone());
+        (
+            Terminal {
+                term,
+                pty,
+                event_proxy,
+                parser: Processor::new(),
+                title: String::new(),
+                size,
+                pending_exit: None,
+                exit_delivered: false,
+                pending_error: None,
+                output_finished: false,
+            },
+            peer,
+        )
+    }
+
+    fn parse_one_chunk(terminal: &mut Terminal) -> ProcessOutcome {
+        terminal.process_input_with_budget(Instant::now(), Duration::ZERO, PARSE_BYTE_BUDGET)
+    }
+
+    #[test]
+    fn buffered_output_continues_and_preserves_split_sequences_before_exit() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let (mut terminal, peer) = buffered_terminal();
+        // The OSC sequence crosses one queue chunk, and the UTF-8 scalar
+        // crosses the next. No producer wakes occur while parsing this buffer.
+        let mut payload = vec![b' '; 64 * 1024 - 2];
+        payload.extend_from_slice(b"\x1b]");
+        payload.extend_from_slice(b"2;final-title\x07");
+        payload.resize(128 * 1024 - 1, b' ');
+        payload.push(0xe2);
+        payload.extend_from_slice(b"\x82\xac\x1b]2;complete\x07\x1b[H\x1b[6n");
+        peer.send(payload);
+        let status = std::process::ExitStatus::from_raw(0);
+        peer.exit(Some(status));
+
+        let first = parse_one_chunk(&mut terminal);
+        assert!(first.grid_maybe_changed && first.more_output);
+        assert!(first.child_exit.is_none());
+        assert_eq!(terminal.title(), "");
+
+        let second = parse_one_chunk(&mut terminal);
+        assert!(second.more_output && second.child_exit.is_none());
+        assert_eq!(terminal.title(), "final-title");
+
+        let third = parse_one_chunk(&mut terminal);
+        assert!(third.more_output && third.child_exit.is_none());
+        assert_eq!(terminal.title(), "complete");
+        assert!(terminal.term.grid().display_iter().any(|cell| cell.cell.c == '€'));
+        assert_eq!(peer.reply(), b"\x1b[1;1R");
+
+        let final_call = parse_one_chunk(&mut terminal);
+        assert_eq!(final_call.child_exit, Some(Some(status)));
+        assert!(!final_call.more_output);
+        assert!(terminal.process_input().child_exit.is_none());
+    }
+
+    #[test]
+    fn failure_waits_for_worker_completion_and_final_output() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(b"\x1b]2;before-failure\x07".to_vec());
+        peer.fail();
+        let first = terminal.process_input();
+        assert_eq!(terminal.title(), "before-failure");
+        assert!(first.io_error.is_none());
+        assert!(!first.more_output);
+        // Model a failure raised on the UI while a worker is still producing.
+        peer.send(b"\x1b]2;final-output\x07".to_vec());
+        peer.finish();
+        let budgeted = parse_one_chunk(&mut terminal);
+        assert!(budgeted.io_error.is_none() && budgeted.more_output);
+        assert_eq!(terminal.title(), "final-output");
+        let done = terminal.process_input();
+        assert_eq!(done.io_error.as_deref(), Some("test transport failure"));
+        assert!(terminal.process_input().io_error.is_none());
+    }
+
+    #[test]
+    fn exit_publication_before_worker_completion_preserves_failure_precedence() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(b"\x1b]2;final-output\x07".to_vec());
+        peer.fail();
+        let status = std::process::ExitStatus::from_raw(0);
+        // This status already guarantees no more enqueues, though the worker
+        // has not yet reached its output_done store and completion wake.
+        peer.publish_exit(Some(status));
+        assert!(!terminal.pty.output_done());
+        let outcome = terminal.process_input();
+        assert_eq!(terminal.title(), "final-output");
+        assert_eq!(outcome.child_exit, Some(Some(status)));
+        assert_eq!(outcome.io_error.as_deref(), Some("test transport failure"));
+        let next = terminal.process_input();
+        assert!(next.child_exit.is_none() && next.io_error.is_none());
+    }
+
+    #[test]
+    fn parser_exit_is_retained_until_final_output_and_delivered_once() {
+        use alacritty_terminal::event::{Event, EventListener as _};
+
+        let (mut terminal, peer) = buffered_terminal();
+        terminal.event_proxy.send_event(Event::Exit);
+        let waiting = terminal.process_input();
+        assert!(waiting.child_exit.is_none() && !waiting.more_output);
+        peer.send(vec![b' '; 128 * 1024]);
+        peer.finish();
+        assert!(parse_one_chunk(&mut terminal).child_exit.is_none());
+        assert!(parse_one_chunk(&mut terminal).child_exit.is_none());
+        assert_eq!(terminal.process_input().child_exit, Some(None));
+        terminal.event_proxy.send_event(Event::Exit);
+        assert!(terminal.process_input().child_exit.is_none());
+    }
+
+    #[test]
+    fn expired_time_budget_still_makes_one_chunk_of_progress() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(vec![b' '; 128 * 1024]);
+        let expired = Instant::now() - Duration::from_secs(1);
+        let first = terminal.process_input_with_budget(expired, PARSE_TIME_BUDGET, 0);
+        assert!(first.grid_maybe_changed && first.more_output);
+        assert_eq!(terminal.pty.rx.try_recv().unwrap().len(), 64 * 1024);
+        assert!(terminal.pty.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn hard_byte_budget_allows_four_mebibytes_and_requests_continuation() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(vec![0; PARSE_BYTE_BUDGET]);
+        let outcome = terminal.process_input_with_budget(
+            Instant::now(),
+            Duration::from_secs(60),
+            PARSE_BYTE_BUDGET,
+        );
+        assert!(outcome.grid_maybe_changed && outcome.more_output);
+        assert!(terminal.pty.rx.try_recv().is_err());
+        assert!(!terminal.process_input().more_output);
+    }
+
+    #[test]
+    fn cursor_query_reply_reaches_child() {
+        let mut config = Config::default();
+        config.shell.program = "/bin/sh".into();
+        let mut terminal = Terminal::new(&config, TerminalSize::default(), noop_waker()).unwrap();
+        // Raw input lets dd consume the six-byte CPR without waiting for a newline.
+        terminal.write_to_pty(b"stty raw -echo; printf '\\033[H\\033[6n'; reply=$(dd bs=1 count=6 2>/dev/null); if [ \"$reply\" = \"$(printf '\\033[1;1R')\" ]; then printf '\\033]2;reply-ok\\007'; fi; exit\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            terminal.process_input();
+            if terminal.title() == "reply-ok" {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        terminal.write_to_pty(b"\x1b[1;1R").ok();
+        panic!("child did not receive the cursor-position reply");
+    }
+
+    /// Ignore output notifications in tests that poll the terminal directly.
     fn noop_waker() -> crate::PtyWaker {
         std::sync::Arc::new(|| {})
     }
@@ -591,14 +616,11 @@ mod tests {
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
-        // Grid should have the requested dimensions.
         assert_eq!(term.columns(), 80);
         assert_eq!(term.screen_lines(), 24);
 
-        // Title starts empty.
         assert!(term.title().is_empty());
 
-        // Process input should not panic even with no PTY output yet.
         term.process_input();
     }
 
@@ -620,7 +642,6 @@ mod tests {
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
-        // Writing bytes to the PTY should not fail.
         term.write_to_pty(b"echo hello\n").expect("PTY write should succeed");
     }
 
@@ -630,17 +651,11 @@ mod tests {
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
-        // Clear on a fresh terminal (no history yet) should be a no-op that
-        // doesn't panic.
         term.clear_history();
     }
 
     #[test]
     fn terminal_paste_plain_text_succeeds() {
-        // Smoke test: happy-path paste doesn't panic and doesn't error.
-        // Filter-level semantics are covered exhaustively by
-        // `paste::tests` — here we just verify the plumbing from
-        // `Terminal::paste` through the filter into the PTY works.
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
@@ -650,15 +665,6 @@ mod tests {
 
     #[test]
     fn terminal_paste_tolerates_injection_attempt() {
-        // Payload contains the bracketed-paste end marker — the filter
-        // must strip it so no shell-injection vector survives.  We
-        // can't easily read the PTY back to assert the exact bytes,
-        // but we can verify the call itself doesn't panic or error
-        // and that the filter module did its job (covered by its own
-        // tests).  This test exists as a regression guard: if someone
-        // ever replaces `paste` with a naive write that skips the
-        // filter, this path still runs but `paste::tests` would have
-        // already failed at compile/test time.
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
@@ -669,10 +675,6 @@ mod tests {
 
     #[test]
     fn terminal_paste_empty_string_succeeds() {
-        // Edge case: user pastes nothing (empty clipboard).  Should
-        // be a no-op-like write that the PTY tolerates.  Wrapped
-        // bracketed-paste markers around an empty payload are still
-        // a valid (if pointless) DECSET 2004 exchange.
         let config = Config::default();
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
@@ -682,18 +684,12 @@ mod tests {
 
     #[test]
     fn process_input_no_input_reports_clean_outcome() {
-        // Freshly-spawned terminal with no shell output yet: the
-        // outcome should report no grid change and no exit.  This
-        // underpins the animation-fast-path — if this fired
-        // spuriously we'd do a full render every frame forever.
         let mut config = Config::default();
         config.shell.program = "/bin/sh".into();
 
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
-        // Immediately, before the shell has produced anything: nothing
-        // to drain.
         let outcome = term.process_input();
         assert!(!outcome.grid_maybe_changed);
         assert!(outcome.child_exit.is_none());
@@ -701,23 +697,14 @@ mod tests {
 
     #[test]
     fn process_input_flags_grid_change_after_shell_output() {
-        // After the shell prints its prompt (or any output), a
-        // subsequent `process_input` call should report
-        // `grid_maybe_changed == true` exactly once — successive
-        // calls with no new output report `false` again.
         let mut config = Config::default();
         config.shell.program = "/bin/sh".into();
 
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
-        // Nudge the shell to produce deterministic output.  `echo hi`
-        // + newline yields at least an echo back and an "hi" line on
-        // most sh implementations.
         term.write_to_pty(b"echo hi\n").expect("write should succeed");
 
-        // Poll until we see the grid change flag trip.  3 s is
-        // generous; /bin/sh responds in milliseconds.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut saw_change = false;
         while std::time::Instant::now() < deadline {
@@ -730,43 +717,23 @@ mod tests {
         }
         assert!(saw_change, "grid_maybe_changed should trip after shell output");
 
-        // Drain any remaining bytes, then assert steady state reports false.
         std::thread::sleep(std::time::Duration::from_millis(50));
         let _ = term.process_input(); // drain leftovers
         let outcome = term.process_input();
-        assert!(
-            !outcome.grid_maybe_changed,
-            "no new bytes → grid_maybe_changed should be false"
-        );
+        assert!(!outcome.grid_maybe_changed, "no new bytes → grid_maybe_changed should be false");
     }
 
     #[test]
     fn process_input_reports_child_exit_after_shell_exits() {
-        // Regression test for the "typing `exit` leaves the window
-        // open" bug: when the child shell exits, the PTY master
-        // observes EOF and the reader thread must reap the child so
-        // the next `process_input` call surfaces a populated
-        // `child_exit` in the outcome.
-        //
-        // Uses `/bin/sh` explicitly rather than `Config::default()`'s
-        // `$SHELL` so the test is deterministic across developer
-        // machines where `$SHELL` may point at zsh/fish/nushell with
-        // different startup-file side effects.
         let mut config = Config::default();
         config.shell.program = "/bin/sh".into();
 
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
-        // Give the shell a moment to start, then ask it to exit.
-        // `exit 0\n` is understood by every POSIX sh.
         std::thread::sleep(std::time::Duration::from_millis(100));
         term.write_to_pty(b"exit 0\n").expect("write should succeed");
 
-        // Poll `process_input` until we see the exit or time out.
-        // 3 seconds is generous — `sh` exits in milliseconds.  The
-        // loop keeps the grid up to date so we don't miss a fast
-        // exit that lands between sleeps.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut observed = None;
         while std::time::Instant::now() < deadline {
@@ -779,7 +746,6 @@ mod tests {
         }
 
         let status = observed.expect("child_exit should be populated after shell exits");
-        // `exit 0` → a real ExitStatus with code 0.
         let status = status.expect("status should carry a real waitpid result, not None");
         assert!(status.success(), "expected success, got {status:?}");
     }
@@ -790,17 +756,12 @@ mod tests {
         let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
         let mut term = Terminal::new(&config, size, noop_waker()).expect("terminal should spawn");
 
-        // Before select_all, no selection text.
         assert!(term.selection_text().is_none());
 
         term.select_all();
 
-        // After select_all, selection_range should exist (even if the grid is
-        // empty — an empty terminal still has an area to select).
         assert!(term.selection_range().is_some());
     }
-
-    // ── winsize_from_window_size ──────────────────────────────────────────────
 
     fn make_ws(num_cols: u16, num_lines: u16, cell_width: u16, cell_height: u16) -> WindowSize {
         WindowSize { num_cols, num_lines, cell_width, cell_height }
@@ -808,7 +769,6 @@ mod tests {
 
     #[test]
     fn winsize_normal_case_exact() {
-        // 80 cols × 8 px wide, 24 rows × 16 px tall → 640 × 384, no overflow.
         let ws = winsize_from_window_size(make_ws(80, 24, 8, 16));
         assert_eq!(ws.ws_col, 80);
         assert_eq!(ws.ws_row, 24);
@@ -818,17 +778,14 @@ mod tests {
 
     #[test]
     fn winsize_saturates_xpixel() {
-        // 800 cols × 100 px = 80 000 > 65 535 → must saturate to u16::MAX.
         let ws = winsize_from_window_size(make_ws(800, 24, 100, 16));
         assert_eq!(ws.ws_xpixel, u16::MAX);
-        // Row count and col count are unaffected.
         assert_eq!(ws.ws_col, 800);
         assert_eq!(ws.ws_row, 24);
     }
 
     #[test]
     fn winsize_saturates_ypixel() {
-        // 24 rows × 3000 px = 72 000 > 65 535 → must saturate to u16::MAX.
         let ws = winsize_from_window_size(make_ws(80, 24, 8, 3000));
         assert_eq!(ws.ws_ypixel, u16::MAX);
         assert_eq!(ws.ws_row, 24);
@@ -836,7 +793,6 @@ mod tests {
 
     #[test]
     fn winsize_zero_size_does_not_panic() {
-        // Shouldn't happen in practice, but must not overflow or panic.
         let ws = winsize_from_window_size(make_ws(0, 0, 0, 0));
         assert_eq!(ws.ws_col, 0);
         assert_eq!(ws.ws_row, 0);

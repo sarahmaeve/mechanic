@@ -1,15 +1,4 @@
-//! `mechanic-config` — configuration, theme, and font settings for the
-//! Mechanic terminal emulator.
-//!
-//! The crate exposes a single top-level [`Config`] struct that owns:
-//!
-//! - [`Theme`] — color palette (Stark Industries aesthetic)
-//! - [`FontConfig`] — font family, size, and fallbacks
-//! - [`ShellConfig`] — which shell program to launch
-//!
-//! Configs are stored as TOML files. Unknown keys are ignored and missing keys
-//! fall back to their [`Default`] implementations, so users only need to
-//! specify what they want to override.
+//! TOML configuration with defaults for missing fields and ignored unknown keys.
 
 pub mod font;
 pub mod terminal;
@@ -22,16 +11,11 @@ pub use theme::{AnsiColors, OpacityConfig, Rgb, SelectionColors, Theme};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-// ── Shell config ──────────────────────────────────────────────────────────────
-
 /// Shell program to launch inside the terminal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
-    /// Absolute path (or name on `$PATH`) of the shell executable.
-    ///
-    /// Defaults to the value of the `SHELL` environment variable, or
-    /// `/bin/zsh` if `SHELL` is not set.
+    /// Shell path or executable name; defaults to `$SHELL`, then `/bin/zsh`.
     pub program: String,
 }
 
@@ -42,22 +26,7 @@ impl Default for ShellConfig {
     }
 }
 
-// ── Top-level Config ──────────────────────────────────────────────────────────
-
 /// Top-level Mechanic configuration.
-///
-/// Load from a TOML file with [`Config::load`], or obtain in-memory defaults
-/// with [`Config::default`].
-///
-/// # Example config file
-/// ```toml
-/// [font]
-/// family = "JetBrains Mono"
-/// size   = 13.0
-///
-/// [theme.opacity]
-/// content_idle_opacity = 0.70
-/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -67,30 +36,18 @@ pub struct Config {
     pub font: FontConfig,
     /// Shell program to launch.
     pub shell: ShellConfig,
-    /// Terminal behaviour — scrollback, close-on-exit policy, etc.
+    /// Scrollback and shell-exit settings.
     pub terminal: TerminalConfig,
 }
 
 impl Config {
-    /// Load configuration from a TOML file at `path`.
-    ///
-    /// Missing-file is the expected path for users who never wrote a
-    /// config — the built-in defaults are the intended UX, and there
-    /// is nothing wrong to report.  That case returns silently.
-    ///
-    /// Any other read failure (permission denied, I/O error) or a
-    /// TOML parse error does warrant a warning: the file exists but
-    /// we couldn't honour it, so the user might be confused by their
-    /// settings silently not taking effect.  Those paths log at
-    /// `warn` level and fall back to the full default configuration
-    /// so the terminal always starts.
+    /// Load TOML, falling back to all defaults on missing files, read errors, or parse errors.
+    /// Missing files log at debug level; other failures warn.
     pub fn load(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         let raw = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // Missing file is an expected, zero-config first run.
-                // Nothing to say — defaults are what the user wanted.
                 log::debug!(
                     "mechanic-config: no config file at '{}' — using defaults",
                     path.display()
@@ -119,8 +76,6 @@ impl Config {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,10 +91,6 @@ mod tests {
 
     #[test]
     fn shell_config_falls_back_to_zsh_when_env_absent() {
-        // Remove SHELL from the environment for this test.
-        // (We can't easily unset it portably inside a unit test without
-        // forking, so we just check the "or else" branch indirectly by
-        // confirming the program is a non-empty string.)
         let sc = ShellConfig::default();
         assert!(!sc.program.is_empty());
     }
@@ -158,7 +109,6 @@ mod tests {
     #[test]
     fn config_load_falls_back_on_missing_file() {
         let cfg = Config::load("/nonexistent/path/mechanic.toml");
-        // Should silently return defaults.
         assert_eq!(cfg.font.family, "Berkeley Mono");
     }
 
@@ -206,7 +156,6 @@ program = "/bin/bash"
     #[test]
     fn ansi_colors_all_distinct_from_background() {
         let theme = Theme::default();
-        // At minimum, foreground should differ from background.
         assert_ne!(theme.foreground, theme.background);
     }
 }

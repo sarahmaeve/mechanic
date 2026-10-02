@@ -1,15 +1,9 @@
-// mechanic-renderer: GPU rendering pipeline for Mechanic.
-//
-// Composes wgpu surface management (`pipeline`), cosmic-text glyph rasterization
-// (`text`), and terminal grid conversion (`grid`) into a single `Renderer` struct.
-
 pub mod background;
 pub mod grid;
 pub mod logo;
 pub mod pipeline;
 pub mod text;
 
-// Re-export the public surface of the renderer.
 pub use grid::{CellFlags, CursorStyle, RenderCell, RenderGrid};
 pub use pipeline::FrameUniforms;
 pub use text::CellMetrics;
@@ -24,16 +18,12 @@ pub struct Renderer {
     state: RenderState,
     text: TextRenderer,
     font_config: FontConfig,
-    /// The window's DPI scale factor, stored so `set_font_size` can
-    /// rebuild the text renderer at the same physical resolution.
+    /// The window's DPI scale factor, stored so `set_font_size` can rebuild the text renderer at the same physical resolution.
     scale_factor: f32,
 }
 
 impl Renderer {
     /// Construct the renderer for the given window.
-    ///
-    /// `size` is the initial surface size in physical pixels.
-    /// `scale_factor` is the window's DPI scale (e.g. 2.0 on Retina Macs).
     pub async fn new<W>(
         window: W,
         size: (u32, u32),
@@ -44,12 +34,8 @@ impl Renderer {
     where
         W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
     {
-        // Phase 1: initialise the wgpu device/queue/surface without building
-        // any pipelines — we need the device to create the TextRenderer first.
         let surface_init = init_surface(window, size).await?;
 
-        // Phase 2: build the TextRenderer (and its atlas texture) using the
-        // device/queue from phase 1.
         let text = TextRenderer::new(
             &surface_init.device,
             &surface_init.queue,
@@ -57,8 +43,6 @@ impl Renderer {
             scale_factor,
         );
 
-        // Phase 3: build the full pipeline using the real atlas view.
-        // No dummy texture needed — the bind group is correct from frame 0.
         let cell_metrics = text.cell_metrics();
         let atlas_gen = text.atlas_generation();
         let state = RenderState::new_with_atlas(
@@ -83,44 +67,20 @@ impl Renderer {
     }
 
     /// Render one frame from the given terminal grid.
-    ///
-    /// `uniforms` bundles the per-frame shader inputs (window alpha,
-    /// text dimming, shader clock, focus gate).  See [`FrameUniforms`]
-    /// for what each field means and when you'd set it.
     pub fn render(&mut self, grid: &RenderGrid, uniforms: FrameUniforms) {
         self.state.render(grid, &mut self.text, &self.font_config, uniforms);
     }
 
-    /// Re-render the previous frame's instance data against a new
-    /// globals uniform.
-    ///
-    /// Fast path for animation-cadence frames where the terminal grid
-    /// has not changed — only the shader time/focus/opacity inputs need
-    /// refreshing.  Skips grid conversion, atlas population, instance
-    /// construction, and instance upload entirely.
-    ///
-    /// Returns `false` if no prior [`Self::render`] call has populated
-    /// the instance buffer (e.g. immediately after construction or a
-    /// resize).  Callers should fall back to [`Self::render`] with a
-    /// freshly-converted grid in that case.
+    /// Draw cached instances with new uniforms; false if no full frame is cached.
     pub fn render_animation(&mut self, uniforms: FrameUniforms) -> bool {
         self.state.render_animation(uniforms)
     }
 
     /// Change the font size and rebuild text rendering state.
-    ///
-    /// The new size is clamped to `[6.0, 72.0]` points.  The `TextRenderer`
-    /// is reconstructed (new atlas, fresh ASCII pre-rasterization at the
-    /// new size) and the pipeline's cell size is updated so the next frame
-    /// uses the new metrics.
-    ///
-    /// Returns the new [`CellMetrics`] so the caller can resize the terminal
-    /// grid to match.
     pub fn set_font_size(&mut self, new_size: f32) -> CellMetrics {
         let clamped = new_size.clamp(6.0, 72.0);
         self.font_config.size = clamped;
 
-        // Rebuild the text renderer: new atlas, re-extracted metrics.
         self.text = TextRenderer::new(
             &self.state.device,
             &self.state.queue,
@@ -128,10 +88,6 @@ impl Renderer {
             self.scale_factor,
         );
 
-        // The new TextRenderer has a fresh atlas texture — unconditionally
-        // rebuild the bind group so the pipeline points at it, and sync the
-        // stored generation so the per-frame check won't trigger again
-        // immediately.
         self.state.update_atlas_bind_group(&self.text.atlas_view);
         self.state.sync_atlas_generation(self.text.atlas_generation());
 
@@ -141,17 +97,9 @@ impl Renderer {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     /// Validate every bundled WGSL shader at test time.
-    ///
-    /// wgpu uses naga internally to validate shaders when creating a
-    /// `ShaderModule`.  If a shader has a type error or other validation
-    /// failure, it won't be caught until runtime — long after `cargo test`
-    /// has declared success.  This test runs the same parse + validate
-    /// pipeline naga uses, so shader bugs fail the test suite immediately.
     #[test]
     fn cell_shader_is_valid_wgsl() {
         let source = include_str!("shaders/cell.wgsl");
@@ -159,8 +107,6 @@ mod tests {
     }
 
     /// Parse `source` as WGSL and run the full validator.
-    ///
-    /// Panics with a readable error if parsing or validation fails.
     fn validate_wgsl(name: &str, source: &str) {
         let module = match naga::front::wgsl::parse_str(source) {
             Ok(m) => m,

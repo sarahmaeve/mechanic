@@ -1,0 +1,162 @@
+{
+  "schema": 1,
+  "workload_version": 1,
+  "mode": "paste",
+  "build_profile": "release",
+  "label": "after",
+  "cols": 120,
+  "rows": 40,
+  "requested_bytes": 1048576,
+  "warmups": 1,
+  "samples": 5,
+  "os": "macos",
+  "arch": "aarch64",
+  "unix_seconds": 1790906872,
+  "term": "xterm-256color",
+  "term_program": "iTerm.app",
+  "term_program_version": "3.6.11",
+  "notes": "Final queued transport: byte-bounded output with tail coalescing, ordered nonblocking writes, capped post-exit drain, asynchronous cleanup.",
+  "measurements": [
+    {
+      "case": "consuming-paste-call",
+      "bytes": 1048576,
+      "operations": 1,
+      "seconds": [
+        0.000355958,
+        0.000269125,
+        0.00028825,
+        0.000251791,
+        0.000325584
+      ]
+    },
+    {
+      "case": "consuming-verified-delivery",
+      "bytes": 1048576,
+      "operations": 1,
+      "seconds": [
+        0.054124,
+        0.051621625,
+        0.054249833,
+        0.051505041,
+        0.054277667
+      ]
+    },
+    {
+      "case": "delayed-reader-paste-call",
+      "bytes": 1048576,
+      "operations": 1,
+      "seconds": [
+        0.000275125,
+        0.000333833,
+        0.000362042,
+        0.000358417,
+        0.000292959
+      ]
+    },
+    {
+      "case": "delayed-reader-verified-delivery",
+      "bytes": 1048576,
+      "operations": 1,
+      "seconds": [
+        0.5845975,
+        0.5877995,
+        0.587740375,
+        0.587877084,
+        0.590109292
+      ]
+    }
+  ],
+  "paste": {
+    "payload_version": 1,
+    "reader_delay_ms": 500,
+    "duplex_bytes": 0,
+    "timeout_seconds": 30,
+    "verification": "exact bracketed payload followed by ordered input probe"
+  },
+  "paste_samples": [
+    {
+      "case": "consuming",
+      "warmup": true,
+      "paste_seconds": 0.000830083,
+      "delivery_seconds": 0.072427875,
+      "outcome": "verified"
+    },
+    {
+      "case": "consuming",
+      "warmup": false,
+      "paste_seconds": 0.000355958,
+      "delivery_seconds": 0.054124,
+      "outcome": "verified"
+    },
+    {
+      "case": "consuming",
+      "warmup": false,
+      "paste_seconds": 0.000269125,
+      "delivery_seconds": 0.051621625,
+      "outcome": "verified"
+    },
+    {
+      "case": "consuming",
+      "warmup": false,
+      "paste_seconds": 0.00028825,
+      "delivery_seconds": 0.054249833,
+      "outcome": "verified"
+    },
+    {
+      "case": "consuming",
+      "warmup": false,
+      "paste_seconds": 0.000251791,
+      "delivery_seconds": 0.051505041,
+      "outcome": "verified"
+    },
+    {
+      "case": "consuming",
+      "warmup": false,
+      "paste_seconds": 0.000325584,
+      "delivery_seconds": 0.054277667,
+      "outcome": "verified"
+    },
+    {
+      "case": "delayed-reader",
+      "warmup": true,
+      "paste_seconds": 0.000317375,
+      "delivery_seconds": 0.582116416,
+      "outcome": "verified"
+    },
+    {
+      "case": "delayed-reader",
+      "warmup": false,
+      "paste_seconds": 0.000275125,
+      "delivery_seconds": 0.5845975,
+      "outcome": "verified"
+    },
+    {
+      "case": "delayed-reader",
+      "warmup": false,
+      "paste_seconds": 0.000333833,
+      "delivery_seconds": 0.5877995,
+      "outcome": "verified"
+    },
+    {
+      "case": "delayed-reader",
+      "warmup": false,
+      "paste_seconds": 0.000362042,
+      "delivery_seconds": 0.587740375,
+      "outcome": "verified"
+    },
+    {
+      "case": "delayed-reader",
+      "warmup": false,
+      "paste_seconds": 0.000358417,
+      "delivery_seconds": 0.587877084,
+      "outcome": "verified"
+    },
+    {
+      "case": "delayed-reader",
+      "warmup": false,
+      "paste_seconds": 0.000292959,
+      "delivery_seconds": 0.590109292,
+      "outcome": "verified"
+    }
+  ]
+}

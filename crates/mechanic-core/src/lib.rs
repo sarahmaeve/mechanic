@@ -1,29 +1,4 @@
 //! `mechanic-core` — terminal emulation and PTY management.
-//!
-//! This crate wraps [`alacritty_terminal`] to provide a high-level interface
-//! for spawning a PTY, feeding its output to the terminal parser, and exposing
-//! the resulting grid to a renderer.
-//!
-//! # Quick-start
-//!
-//! ```no_run
-//! use std::sync::Arc;
-//! use mechanic_config::Config;
-//! use mechanic_core::{Terminal, TerminalSize};
-//!
-//! let config = Config::default();
-//! let size = TerminalSize { columns: 80, rows: 24, cell_width: 8, cell_height: 16 };
-//! // Production code passes a waker that drives its event loop.  This
-//! // example uses a no-op — fine because we don't actually run the
-//! // loop below (`no_run`).
-//! let waker = Arc::new(|| {});
-//! let mut term = Terminal::new(&config, size, waker).expect("failed to start terminal");
-//!
-//! loop {
-//!     term.process_input();
-//!     // pass term.grid() to the renderer …
-//! }
-//! ```
 
 pub mod error;
 pub mod event;
@@ -35,30 +10,10 @@ pub use error::TerminalError;
 pub use event::{EventProxy, TerminalEvent};
 pub use terminal::{GridColumn, GridLine, GridPoint, GridSide, MouseProtocol, Terminal};
 
-// ── PtyWaker ──────────────────────────────────────────────────────────────────
-
-/// Thread-safe hook the PTY reader thread invokes when new bytes land
-/// in the channel.
-///
-/// The application layer uses this to wake a sleeping main event loop
-/// (e.g. `winit::EventLoopProxy::send_event`) so the next frame
-/// renders the just-arrived shell output promptly — without needing
-/// the event loop to poll at display-refresh rate just to check.
-///
-/// Callers that don't need wake-up (e.g. tests) can pass
-/// `Arc::new(|| {})`.
-///
-/// Using `Arc<dyn Fn>` rather than a trait keeps `mechanic-core` free
-/// of any windowing dependency.
+/// Wake the main loop after PTY output, exit, or transport failure.
 pub type PtyWaker = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
-// ── TerminalSize ──────────────────────────────────────────────────────────────
-
 /// The dimensions of a terminal viewport, in character cells and pixels.
-///
-/// `cell_width` and `cell_height` are the size of a single character cell in
-/// pixels.  They are forwarded to the PTY via `TIOCSWINSZ` so that pixel-aware
-/// applications (e.g. image protocols) report the correct terminal size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSize {
     /// Width of the terminal in character columns.
@@ -72,13 +27,11 @@ pub struct TerminalSize {
 }
 
 impl Default for TerminalSize {
-    /// A sensible default: 80×24 with 8×16-pixel cells.
+    /// 80 columns by 24 rows, with 8 by 16 pixel cells.
     fn default() -> Self {
         Self { columns: 80, rows: 24, cell_width: 8, cell_height: 16 }
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

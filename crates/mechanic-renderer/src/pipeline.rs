@@ -1,5 +1,3 @@
-// wgpu render pipeline: surface setup, instance buffer, and per-frame rendering.
-
 use std::mem;
 
 use bytemuck::{Pod, Zeroable};
@@ -14,11 +12,7 @@ use crate::{
 };
 use mechanic_config::theme::Rgb;
 
-// ── GPU instance data ─────────────────────────────────────────────────────────
-
-/// Per-cell data uploaded to the GPU as vertex attributes (step mode: Instance).
-///
-/// Layout must match the `Instance` struct in `cell.wgsl`.
+/// Instanced vertex data. Field offsets must match the shader attributes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct GpuInstance {
@@ -36,7 +30,7 @@ pub struct GpuInstance {
     pub glyph_size: [f32; 2],
     /// 1 → sample atlas; 0 → solid background.
     pub use_atlas: u32,
-    /// Padding to keep 16-byte alignment.
+    /// Reserved vertex attributes; the Rust struct has four-byte alignment.
     pub _pad: [u32; 3],
 }
 
@@ -44,127 +38,40 @@ fn rgb_to_f32(c: Rgb) -> [f32; 4] {
     [f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0, 1.0]
 }
 
-// ── Instance discriminants ────────────────────────────────────────────────────
-//
-// The `use_atlas` field on [`GpuInstance`] selects which fragment-shader
-// branch the instance flows through.  Three values are meaningful; the
-// shader panics (via the default arm / discard) on anything else.
-//
-// Kept in sync with the `if in.use_atlas == N` chain in `cell.wgsl`.
-
-/// Solid-fill background or cursor quad — the fragment outputs
-/// `bg_color` directly (optionally mixed with the gradient in the
-/// background path).  Covers cell backgrounds and bar/underline
-/// cursors.
+/// Solid background/cursor shader branch.
 const SOLID_USE_ATLAS: u32 = 0;
 
-/// Atlas-sampled glyph — the fragment samples the atlas texture at
-/// the instance's UV rect, multiplies coverage by `text_opacity`,
-/// and mixes `fg_color` over `bg_color` accordingly.
+/// Glyph shader branch.
 #[expect(dead_code, reason = "reserved for future callers; paired with the _USE_ATLAS constants")]
 const GLYPH_USE_ATLAS: u32 = 1;
 
-/// Hollow-block cursor outline — the fragment keeps only pixels
-/// within [`HOLLOW_CURSOR_BORDER_PX`] of a cell edge (in local-cell
-/// coordinates) and `discard`s the interior so the cell's glyph
-/// beneath stays readable.  Emitted by the renderer only for
-/// unfocused windows with a Block cursor style.
+/// Hollow block cursor for unfocused windows.
 const HOLLOW_BLOCK_USE_ATLAS: u32 = 2;
 
-/// Thickness of the hollow-block cursor outline, in physical
-/// pixels.  `1.5` reads as a single clean pixel on non-Retina
-/// displays and a crisp 3 px on 2× Retina; fine-tune if it looks
-/// too thin or too thick once running.  Kept in sync with the
-/// WGSL fragment shader's hollow-block branch.
+/// Cursor border in physical pixels; must match cell.wgsl.
 #[expect(dead_code, reason = "used in the shader; recorded here so both sides drift together")]
 const HOLLOW_CURSOR_BORDER_PX: f32 = 1.5;
 
-// ── Per-frame shader inputs ───────────────────────────────────────────────────
-
-/// Per-frame values the caller feeds to `render` / `render_animation`
-/// — bundled into a struct so adding another shader input doesn't push
-/// the render signature past clippy's 7-argument threshold or make
-/// the call site a forest of positional floats.
-///
-/// Everything else the shader needs — viewport size, cell size, atlas
-/// contents — is derived from the renderer's own retained state and
-/// is not part of this struct.
-///
-/// Two distinct focus-derived flags live here:
-///
-/// - [`shader_focused`](Self::shader_focused) gates the shader's
-///   continuous time-based animations (gradient breath, colour
-///   rotation, electron pulses).  It's `true` only when the window
-///   has real keyboard focus *and* `--hot-cpu` is on, because those
-///   animations are unbounded and must stay opt-in.
-/// - [`window_focused`](Self::window_focused) tracks the real OS
-///   focus state, independent of `--hot-cpu`.  Used for the focus-
-///   aware cursor style (solid block when focused, hollow outline
-///   when blurred) and anything else that should follow real focus
-///   even when the shader clock is frozen.
+/// Per-frame shader inputs.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameUniforms {
-    /// Window-level alpha: how much of the desktop bleeds through.
-    /// `1.0` = fully opaque window; `0.0` = fully transparent.
-    /// Applied to every pixel the surface emits.
+    /// Surface opacity, from 0 (transparent) to 1 (opaque).
     pub content_opacity: f32,
-    /// Multiplier on glyph coverage in the text path.  `1.0` = text
-    /// renders at full contrast against its cell background; lower
-    /// values ghost text toward the background so an unfocused
-    /// window reads as idle without touching `content_opacity`.
-    /// Not applied to background cells — only to text.
+    /// Glyph coverage multiplier; does not affect backgrounds.
     pub text_opacity: f32,
-    /// Seconds since the window was created.  Drives the shader's
-    /// time-based animations (corner gradient breath, colour pulse,
-    /// electron traces) when `shader_focused` is true.
+    /// Seconds since window creation.
     pub time: f32,
-    /// Whether the shader's continuous time-based animations should
-    /// advance.  `false` pins the gradient/electrons at `t=0`.
-    /// `true` only when the window has OS focus **and** `--hot-cpu`
-    /// is on — the continuous animations are unbounded, so they
-    /// stay opt-in per `design/CPU-SPEC.md` rule 3.
+    /// Enables continuous animation when focused and --hot-cpu is set.
     pub shader_focused: bool,
-    /// Real OS keyboard focus state, independent of `--hot-cpu`.
-    /// Drives the solid-vs-hollow block cursor selection and other
-    /// signals that should reflect focus even in the quiet default
-    /// mode.  `true` when the window is the key window; `false`
-    /// when another window or app has focus.
+    /// OS keyboard focus, independent of the animation flag.
     pub window_focused: bool,
-    /// Progress through the focus-gain bloom animation, in
-    /// `[0.0, 1.0]`.  `0.0` before the bloom has committed or after
-    /// it has completed; fractional values during the ≈ 250 ms
-    /// animation window.  The shader applies a `sin(progress × π)`
-    /// envelope so the curve eases naturally into and out of peak.
-    /// See [`OpacityConfig::bloom_duration_ms`] for the timing.
-    ///
-    /// [`OpacityConfig::bloom_duration_ms`]: mechanic_config::theme::OpacityConfig::bloom_duration_ms
+    /// Focus bloom progress in [0, 1]; zero when inactive.
     pub bloom_progress: f32,
-    /// Peak scale factor applied to the corner logo's display
-    /// opacity at the midpoint of the bloom curve.  Passed through
-    /// to the shader so the effect can be tuned from
-    /// `mechanic.toml` without a rebuild.  `1.0` disables the
-    /// visible bloom (scheduler still runs the animation but no
-    /// pixel difference appears); `1.4` is the default lift.
-    /// Mirrors [`OpacityConfig::bloom_peak_multiplier`].
-    ///
-    /// [`OpacityConfig::bloom_peak_multiplier`]: mechanic_config::theme::OpacityConfig::bloom_peak_multiplier
+    /// Logo opacity multiplier at the bloom's midpoint.
     pub bloom_peak_multiplier: f32,
 }
 
-// ── Globals uniform ───────────────────────────────────────────────────────────
-
-/// GPU-side mirror of [`FrameUniforms`], laid out to match the
-/// `Globals` struct in `cell.wgsl`.
-///
-/// Layout: 48 bytes, 16-byte aligned.  The first 32 bytes are the
-/// original four-field layout (viewport, cell, time, content_opacity,
-/// shader_focused, text_opacity); the added 16 bytes hold
-/// `bloom_progress` plus three `f32` padding slots to keep the struct
-/// size a multiple of 16.  The padding is intentional headroom — the
-/// next shader input (say, a cursor blink phase, or a carousel tilt
-/// angle for Phase 6) can slot into one of those `_pad` positions
-/// without re-aligning the struct, avoiding a churn commit that
-/// renames every uniform binding.
+/// GPU-side mirror of [`FrameUniforms`], laid out to match the `Globals` struct in `cell.wgsl`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Globals {
@@ -172,29 +79,19 @@ struct Globals {
     cell_size: [f32; 2],
     time: f32,
     content_opacity: f32,
-    /// 1.0 when the shader's continuous animations should advance,
-    /// 0.0 otherwise.  Derived from [`FrameUniforms::shader_focused`]
-    /// — OS focus AND `--hot-cpu`.  Not a raw focus bit.
+    /// Float representation of [`FrameUniforms::shader_focused`].
     shader_focused: f32,
-    /// Glyph-coverage multiplier for the text path.  1.0 for focused
-    /// windows; configurable idle value for blurred windows.  See
-    /// [`FrameUniforms::text_opacity`].
+    /// Glyph-coverage multiplier for the text path.  1.0 for focused windows; configurable idle value for blurred windows.  See [`FrameUniforms::text_opacity`].
     text_opacity: f32,
-    /// Progress through the focus-gain bloom in `[0, 1]`.  See
-    /// [`FrameUniforms::bloom_progress`].
+    /// Progress through the focus-gain bloom in `[0, 1]`.  See [`FrameUniforms::bloom_progress`].
     bloom_progress: f32,
-    /// Peak multiplier applied to logo opacity at bloom midpoint.
-    /// See [`FrameUniforms::bloom_peak_multiplier`].
+    /// Peak multiplier applied to logo opacity at bloom midpoint. See [`FrameUniforms::bloom_peak_multiplier`].
     bloom_peak_multiplier: f32,
-    /// Reserved for future per-frame uniforms.  Kept at end of
-    /// struct so adding a value is a rename, not a reshuffle.
+    /// Padding to match WGSL uniform alignment.
     _pad: [f32; 2],
 }
 
-// ── RenderState ───────────────────────────────────────────────────────────────
-
-/// Intermediate result of `init_surface`: device/queue/surface ready, but no
-/// pipeline or atlas yet.
+/// Intermediate result of `init_surface`: device/queue/surface ready, but no pipeline or atlas yet.
 pub struct SurfaceInit {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -215,8 +112,7 @@ pub struct RenderState {
     instance_buf: wgpu::Buffer,
     instance_capacity: usize,
     sampler: wgpu::Sampler,
-    /// Rasterized corner logo.  Kept here so its texture view stays alive
-    /// for the lifetime of the bind group.
+    /// Rasterized corner logo.  Kept here so its texture view stays alive for the lifetime of the bind group.
     logo: Logo,
     /// Cell dimensions in pixels (from real font metrics).
     pub cell_size: (f32, f32),
@@ -224,33 +120,13 @@ pub struct RenderState {
     pub size: (u32, u32),
     /// Background clear color.
     pub clear_color: wgpu::Color,
-    /// Atlas generation at the time the bind group was last built.
-    /// When this diverges from `TextRenderer::atlas_generation()` the bind
-    /// group is rebuilt to point at the new atlas texture.
+    /// Atlas generation at the time the bind group was last built. When this diverges from `TextRenderer::atlas_generation()` the bind group is rebuilt to point at the new atlas texture.
     last_atlas_generation: u64,
-    /// Count of instances uploaded by the most recent full [`Self::render`]
-    /// call.  Zero before the first full render.
-    ///
-    /// [`Self::render_animation`] uses this to know how many instances
-    /// to draw from the retained `instance_buf` on frames where only
-    /// the time/opacity/focused uniforms changed — the grid itself is
-    /// unchanged, so we skip the ~200 KB instance rebuild+upload and
-    /// just re-issue the same draw against a new globals uniform.
+    /// Count of instances uploaded by the most recent full [`Self::render`] call.  Zero before the first full render.
     last_instance_count: u32,
 }
 
-/// Initialise the wgpu instance, adapter, device, queue, and configured
-/// surface — without building any pipelines or textures.
-///
-/// The returned `SurfaceInit` can be used to construct a `TextRenderer` first
-/// (so its atlas view is available), then passed to
-/// `RenderState::new_with_atlas` along with that atlas view.
-///
-/// # Safety
-///
-/// `window` must remain valid for the entire lifetime of the returned
-/// `SurfaceInit::surface` (the `'static` surface lifetime is achieved by
-/// taking ownership of the window handle via `SurfaceTarget::Window`).
+/// Initialise the wgpu instance, adapter, device, queue, and configured surface — without building any pipelines or textures.
 pub async fn init_surface<W>(
     window: W,
     size: (u32, u32),
@@ -270,6 +146,7 @@ where
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         })
         .await
         .map_err(|e| format!("no adapter found: {e}"))?;
@@ -289,10 +166,7 @@ where
     let surface_format =
         caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
 
-    // Invariant: the fragment shader emits non-premultiplied colors.
-    // PostMultiplied matches that; PreMultiplied would cause double
-    // darkening on drivers that advertise it.  If cell.wgsl is ever
-    // changed to premultiply, flip this preference.
+    // The shader emits straight alpha; the surface must use post-multiplied alpha.
     log::info!("surface alpha modes available: {:?}", caps.alpha_modes);
     let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
         wgpu::CompositeAlphaMode::PostMultiplied
@@ -312,6 +186,7 @@ where
         desired_maximum_frame_latency: 2,
         alpha_mode,
         view_formats: vec![],
+        color_space: wgpu::SurfaceColorSpace::Auto,
     };
     surface.configure(&device, &surface_config);
 
@@ -319,11 +194,7 @@ where
 }
 
 impl RenderState {
-    /// Build the wgpu pipeline and initial bind group using the *real* atlas
-    /// view from `TextRenderer`.
-    ///
-    /// Call `init_surface` first to obtain a `SurfaceInit`, construct a
-    /// `TextRenderer` with the device/queue it provides, then call this.
+    /// Build the pipeline and bind the text renderer's atlas.
     pub fn new_with_atlas(
         SurfaceInit { device, queue, surface, surface_config }: SurfaceInit,
         atlas_view: &wgpu::TextureView,
@@ -334,19 +205,10 @@ impl RenderState {
         let size = (surface_config.width, surface_config.height);
         let surface_format = surface_config.format;
 
-        // ── Shader ───────────────────────────────────────────────────────────
-
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cell_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cell.wgsl").into()),
         });
-
-        // ── Bind group layout ─────────────────────────────────────────────────
-        //
-        // group(0) binding(0) = Globals uniform
-        // group(0) binding(1) = glyph atlas texture
-        // group(0) binding(2) = shared filtering sampler (used by both textures)
-        // group(0) binding(3) = corner logo texture
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cell_bgl"),
@@ -396,10 +258,6 @@ impl RenderState {
             immediate_size: 0,
         });
 
-        // ── Vertex buffer layouts ─────────────────────────────────────────────
-        //
-        // Slot 0: per-instance GpuInstance (step_mode: Instance)
-
         let instance_layout = wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<GpuInstance>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
@@ -421,7 +279,7 @@ impl RenderState {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[instance_layout],
+                buffers: &[Some(instance_layout)],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -429,11 +287,6 @@ impl RenderState {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    // No blending: every pixel is fully written by exactly one
-                    // cell or glyph draw.  Alpha blending would corrupt the
-                    // alpha channel, breaking the PostMultiplied compositor on
-                    // macOS (pixels would end up near-opaque even when the
-                    // shader outputs partial alpha).
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -453,8 +306,6 @@ impl RenderState {
             cache: None,
         });
 
-        // ── Globals uniform buffer ────────────────────────────────────────────
-
         let cell_size = (cell_metrics.cell_width, cell_metrics.cell_height);
         let globals = Globals {
             viewport_size: [size.0 as f32, size.1 as f32],
@@ -464,11 +315,6 @@ impl RenderState {
             shader_focused: 1.0,
             text_opacity: 1.0,
             bloom_progress: 0.0,
-            // Sentinel `1.0` so the initial frame and any post-resize
-            // frame that arrives before `render()` repopulates the
-            // uniform render identically with or without the bloom
-            // field present — `mix(1.0, 1.0, anything) = 1.0`, so
-            // there's no visible effect until the real value lands.
             bloom_peak_multiplier: 1.0,
             _pad: [0.0; 2],
         };
@@ -478,8 +324,6 @@ impl RenderState {
             contents: bytemuck::bytes_of(&globals),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-
-        // ── Sampler ───────────────────────────────────────────────────────────
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
@@ -492,8 +336,6 @@ impl RenderState {
             ..Default::default()
         });
 
-        // ── Initial instance buffer ───────────────────────────────────────────
-
         const INITIAL_CAPACITY: usize = 256;
         let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instance_buf"),
@@ -502,10 +344,8 @@ impl RenderState {
             mapped_at_creation: false,
         });
 
-        // Rasterize the corner logo SVG once at startup.
         let logo = Logo::new(&device, &queue);
 
-        // Bind group uses the real atlas view — no dummy texture needed.
         let bind_group = Self::make_bind_group(
             &device,
             &bind_group_layout,
@@ -535,8 +375,6 @@ impl RenderState {
             last_instance_count: 0,
         })
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn make_bind_group(
         device: &wgpu::Device,
@@ -568,10 +406,6 @@ impl RenderState {
     }
 
     /// Rebuild the bind group to point at the current atlas texture view.
-    ///
-    /// Called after the glyph atlas grows — the atlas texture is replaced
-    /// so the bind group's binding 1 needs to be re-pointed.  The logo
-    /// (binding 3) is stable and re-bound from `self.logo`.
     pub fn update_atlas_bind_group(&mut self, atlas_view: &wgpu::TextureView) {
         self.bind_group = Self::make_bind_group(
             &self.device,
@@ -584,16 +418,9 @@ impl RenderState {
     }
 
     /// Sync the stored atlas generation to `gen`.
-    ///
-    /// Call this after `update_atlas_bind_group` in contexts where the
-    /// TextRenderer is rebuilt entirely (e.g. `set_font_size`), so the
-    /// per-frame generation check in `render` doesn't trigger a redundant
-    /// bind-group rebuild on the very next frame.
     pub fn sync_atlas_generation(&mut self, generation: u64) {
         self.last_atlas_generation = generation;
     }
-
-    // ── Public API ────────────────────────────────────────────────────────────
 
     /// Reconfigure the surface after a window resize.
     pub fn resize(&mut self, new_size: (u32, u32)) {
@@ -605,7 +432,6 @@ impl RenderState {
         self.surface_config.height = new_size.1;
         self.surface.configure(&self.device, &self.surface_config);
 
-        // Update the globals uniform (time/opacity are overwritten each frame).
         let globals = Globals {
             viewport_size: [new_size.0 as f32, new_size.1 as f32],
             cell_size: [self.cell_size.0, self.cell_size.1],
@@ -614,34 +440,17 @@ impl RenderState {
             shader_focused: 1.0,
             text_opacity: 1.0,
             bloom_progress: 0.0,
-            // Sentinel `1.0` so the initial frame and any post-resize
-            // frame that arrives before `render()` repopulates the
-            // uniform render identically with or without the bloom
-            // field present — `mix(1.0, 1.0, anything) = 1.0`, so
-            // there's no visible effect until the real value lands.
             bloom_peak_multiplier: 1.0,
             _pad: [0.0; 2],
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
-        // The retained instance buffer was built against the previous
-        // grid dimensions — redrawing it under a new viewport would
-        // leave cells mispositioned.  Zero the count so
-        // `render_animation` returns false until the next full render
-        // refills the cache at the new size.
         self.last_instance_count = 0;
     }
 
     /// Update the cell size used by the pipeline's globals uniform.
-    ///
-    /// The next `render()` call will write the new cell_size to the GPU.
-    /// Used by `Renderer::set_font_size` after the text renderer is rebuilt
-    /// at a new point size.
     pub fn set_cell_size(&mut self, cell_size: (f32, f32)) {
         self.cell_size = cell_size;
-        // Instance cache is keyed to the old cell size via glyph offsets
-        // / sizes in pixels — invalidate so the next frame rebuilds
-        // against the new metrics.
         self.last_instance_count = 0;
     }
 
@@ -653,8 +462,6 @@ impl RenderState {
         font_config: &mechanic_config::font::FontConfig,
         uniforms: FrameUniforms,
     ) {
-        // ── Update globals uniform ────────────────────────────────────────────
-
         let globals = Globals {
             viewport_size: [self.size.0 as f32, self.size.1 as f32],
             cell_size: [self.cell_size.0, self.cell_size.1],
@@ -668,31 +475,8 @@ impl RenderState {
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
-        // ── Pass 1: populate the atlas with every unique glyph this frame ─────
-        //
-        // Atlas grows (capacity-doubling in TextRenderer::alloc_slot) clear
-        // the atlas_map and invalidate UVs that were computed against the
-        // pre-grow texture layout.  If a grow happens *during* instance
-        // emission, some instances reference old UVs and later instances
-        // reference new UVs — the draw samples both against the (now-new)
-        // texture and the user sees a one-frame flash of garbled glyphs.
-        //
-        // Rasterizing all unique glyphs up front moves every grow to
-        // before instance emission, so the atlas stays stable through the
-        // rest of the frame.  The second-pass rasterize_char calls below
-        // all hit the char_cache fast path — no growth can occur.
-        //
-        // Typical English-grid frames have <200 unique (char, bold, italic)
-        // triples; the HashSet is tiny.
         let unique_glyphs = collect_unique_glyphs(grid);
-        text_renderer.populate_atlas(
-            unique_glyphs,
-            &self.device,
-            &self.queue,
-            font_config,
-        );
-
-        // ── Pass 2: build instance list against the now-stable atlas ──────────
+        text_renderer.populate_atlas(unique_glyphs, &self.device, &self.queue, font_config);
 
         let total_cells = grid.cols * grid.rows;
         let mut instances: Vec<GpuInstance> = Vec::with_capacity(total_cells * 2);
@@ -706,12 +490,10 @@ impl RenderState {
                 let mut fg = cell.fg;
                 let mut bg = cell.bg;
 
-                // Apply inverse flag.
                 if cell.flags.contains(crate::grid::CellFlags::INVERSE) {
                     std::mem::swap(&mut fg, &mut bg);
                 }
 
-                // Background instance (always drawn).
                 instances.push(GpuInstance {
                     cell_pos: [col as u32, row as u32],
                     atlas_uv: [0.0; 4],
@@ -723,9 +505,6 @@ impl RenderState {
                     _pad: [0; 3],
                 });
 
-                // Glyph instance (only when a glyph exists).  After the
-                // pass-1 populate, this call always hits the cache and
-                // cannot trigger an atlas grow.
                 if cell.character != ' ' {
                     let bold = cell.flags.contains(crate::grid::CellFlags::BOLD);
                     let italic = cell.flags.contains(crate::grid::CellFlags::ITALIC);
@@ -753,27 +532,6 @@ impl RenderState {
             }
         }
 
-        // ── Draw cursor ───────────────────────────────────────────────────────
-        //
-        // Three paths, selected by `(cursor_style, window_focused)`:
-        //
-        // 1. Block + focused   → no quad here.  `convert.rs` has already
-        //                        recolored the cell's background to the
-        //                        cursor colour; the glyph remains visible
-        //                        through the solid block for free.
-        // 2. Block + unfocused → emit a full-cell quad with
-        //                        `use_atlas = 2u` ("hollow-block").  The
-        //                        fragment shader keeps only pixels within
-        //                        `HOLLOW_CURSOR_BORDER_PX` of a cell edge
-        //                        and discards the interior, so the cell's
-        //                        original glyph shows through the outline.
-        //                        Standard iTerm2 / Terminal.app convention.
-        // 3. Bar / Underline    → emit a sub-cell quad (2 px strip) in
-        //                        cursor colour.  Focus-state-independent —
-        //                        these cursor styles don't cover the glyph
-        //                        in either state, so there's no readable/
-        //                        unreadable distinction to make.
-
         {
             use crate::grid::CursorStyle;
             use mechanic_config::theme::palette;
@@ -784,21 +542,14 @@ impl RenderState {
                 let cell_w = self.cell_size.0;
                 let cell_h = self.cell_size.1;
 
-                // Pick the quad geometry and shader-path discriminant for
-                // each (style, focus) combination, or `None` for the "no
-                // quad needed" case (focused block, handled in convert.rs).
                 let quad = match (grid.cursor_style, uniforms.window_focused) {
-                    // Hollow block — full-cell quad, shader outlines it.
                     (CursorStyle::Block, false) => {
                         Some(([0.0f32, 0.0f32], [cell_w, cell_h], HOLLOW_BLOCK_USE_ATLAS))
                     }
-                    // Solid block, focused — cell already recoloured, skip.
                     (CursorStyle::Block, true) => None,
-                    // Bar — 2 px strip at the left edge.
                     (CursorStyle::Bar, _) => {
                         Some(([0.0f32, 0.0f32], [2.0f32, cell_h], SOLID_USE_ATLAS))
                     }
-                    // Underline — 2 px strip at the bottom edge.
                     (CursorStyle::Underline, _) => {
                         Some(([0.0f32, cell_h - 2.0f32], [cell_w, 2.0f32], SOLID_USE_ATLAS))
                     }
@@ -819,22 +570,15 @@ impl RenderState {
             }
         }
 
-        // ── Rebuild bind group only when the atlas texture was recreated ─────
-        //
-        // atlas_generation increments each time alloc_slot grows the texture.
-        // Checking here avoids the per-frame bind-group rebuild cost.
         let current_gen = text_renderer.atlas_generation();
         if current_gen != self.last_atlas_generation {
             self.update_atlas_bind_group(&text_renderer.atlas_view);
             self.last_atlas_generation = current_gen;
         }
 
-        // ── Upload instances ──────────────────────────────────────────────────
-
         let instance_bytes = bytemuck::cast_slice::<GpuInstance, u8>(&instances);
 
         if instances.len() > self.instance_capacity {
-            // Grow the buffer.
             let new_cap = instances.len().next_power_of_two();
             self.instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("instance_buf"),
@@ -846,8 +590,6 @@ impl RenderState {
         }
 
         self.queue.write_buffer(&self.instance_buf, 0, instance_bytes);
-
-        // ── Render pass ───────────────────────────────────────────────────────
 
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
@@ -865,10 +607,6 @@ impl RenderState {
             label: Some("frame_encoder"),
         });
 
-        // Non-premultiplied clear color for the macOS PostMultiplied compositor.
-        // Every cell fully writes its pixels (blend: None), so this clear only
-        // shows through if the grid doesn't cover the entire surface (edge
-        // pixels from fractional cell sizing).
         let clear_color = wgpu::Color {
             r: self.clear_color.r,
             g: self.clear_color.g,
@@ -897,46 +635,21 @@ impl RenderState {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.instance_buf.slice(..));
-            // 6 vertices per quad (2 triangles), `instances.len()` instances.
             pass.draw(0..6, 0..instances.len() as u32);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        surface_texture.present();
+        self.queue.present(surface_texture);
 
-        // Record the instance count so a subsequent `render_animation`
-        // frame knows how many instances to re-draw from the retained
-        // `instance_buf`.  Updated after submit so a failed surface
-        // acquisition above doesn't leave us with a bogus count.
         self.last_instance_count = instances.len() as u32;
     }
 
-    /// Fast-path frame: re-issue the previous full render's draw with
-    /// a fresh globals uniform.
-    ///
-    /// Used for frames driven purely by animation cadence — the corner
-    /// gradient pulse and electron traces in the shader are functions
-    /// of the `time` and `focused` uniforms only.  The per-cell
-    /// instance data (foreground/background colors, glyph UVs, cursor
-    /// position) doesn't change frame-to-frame when the user is idle
-    /// and the shell is quiet, so rebuilding ~4000 `GpuInstance`s and
-    /// re-uploading ~200 KB per frame is pure waste.
-    ///
-    /// Returns `false` if no prior full render has populated the
-    /// instance buffer — in that case the caller must fall back to
-    /// [`Self::render`] with a freshly-converted grid.  Returns `true`
-    /// on success (a frame was submitted and presented).
-    ///
-    /// Atlas and bind group are left untouched.  This path never
-    /// triggers an atlas grow because it rasterises no glyphs.
+    /// Draw cached instances with new uniforms; false if no full frame is cached.
     pub fn render_animation(&mut self, uniforms: FrameUniforms) -> bool {
         if self.last_instance_count == 0 {
-            // Nothing cached yet — first frame of the window's life, or
-            // after a resize that hasn't been followed by a full render.
             return false;
         }
 
-        // Update only the globals uniform.
         let globals = Globals {
             viewport_size: [self.size.0 as f32, self.size.1 as f32],
             cell_size: [self.cell_size.0, self.cell_size.1],
@@ -998,23 +711,13 @@ impl RenderState {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        surface_texture.present();
+        self.queue.present(surface_texture);
         true
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Collect the set of unique `(char, bold, italic)` glyph keys that
-/// need to be rendered for `grid` this frame.
-///
-/// Pure function over the grid — no GPU interaction — so the atlas-
-/// pre-population logic can be exercised without a wgpu device.
-/// Space cells are skipped because the renderer draws no glyph for
-/// them (the cell's background quad is sufficient).
-fn collect_unique_glyphs(
-    grid: &RenderGrid,
-) -> std::collections::HashSet<(char, bool, bool)> {
+/// Collect the set of unique `(char, bold, italic)` glyph keys that need to be rendered for `grid` this frame.
+fn collect_unique_glyphs(grid: &RenderGrid) -> std::collections::HashSet<(char, bool, bool)> {
     let mut unique = std::collections::HashSet::with_capacity(128);
     for cell in &grid.cells {
         if cell.character != ' ' {
@@ -1025,8 +728,6 @@ fn collect_unique_glyphs(
     }
     unique
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1049,8 +750,6 @@ mod tests {
 
     #[test]
     fn unique_glyphs_empty_grid() {
-        // A blank grid (all default-constructed cells are spaces) has
-        // no glyphs to rasterize.  The fix must not submit empty work.
         let grid = RenderGrid::new(10, 5);
         assert!(collect_unique_glyphs(&grid).is_empty());
     }
@@ -1060,16 +759,17 @@ mod tests {
         let grid = make_grid_with_cells(
             3,
             1,
-            vec![cell(' ', CellFlags::empty()), cell(' ', CellFlags::empty()), cell(' ', CellFlags::empty())],
+            vec![
+                cell(' ', CellFlags::empty()),
+                cell(' ', CellFlags::empty()),
+                cell(' ', CellFlags::empty()),
+            ],
         );
         assert!(collect_unique_glyphs(&grid).is_empty());
     }
 
     #[test]
     fn unique_glyphs_dedups_repeated_chars() {
-        // Many cells showing "h" at the same style should yield one
-        // entry — this is why we use a HashSet.  A filled-screen of a
-        // single character stays cheap to pre-rasterize.
         let cells = vec![cell('h', CellFlags::empty()); 20];
         let grid = make_grid_with_cells(5, 4, cells);
         let u = collect_unique_glyphs(&grid);
@@ -1079,9 +779,6 @@ mod tests {
 
     #[test]
     fn unique_glyphs_distinguishes_style_variants() {
-        // Same character, different (bold, italic) combinations are
-        // distinct atlas entries because they rasterize to different
-        // bitmaps.  Atlas population must cover each combo.
         let grid = make_grid_with_cells(
             4,
             1,
@@ -1102,8 +799,6 @@ mod tests {
 
     #[test]
     fn unique_glyphs_mixed_chars_and_spaces() {
-        // Realistic scattered mix: the returned set contains exactly
-        // the non-space chars, each counted once.
         let grid = make_grid_with_cells(
             6,
             1,
@@ -1125,18 +820,10 @@ mod tests {
 
     #[test]
     fn unique_glyphs_underlined_does_not_split_from_plain() {
-        // Underline is a rendering flag, not a glyph-rasterization
-        // flag — the same glyph bitmap is used, the underline is
-        // drawn as a separate quad in the shader.  So an underlined
-        // 'a' and a plain 'a' are the same atlas key.  (Only BOLD
-        // and ITALIC affect the bitmap the atlas stores.)
         let grid = make_grid_with_cells(
             2,
             1,
-            vec![
-                cell('a', CellFlags::empty()),
-                cell('a', CellFlags::UNDERLINE),
-            ],
+            vec![cell('a', CellFlags::empty()), cell('a', CellFlags::UNDERLINE)],
         );
         let u = collect_unique_glyphs(&grid);
         assert_eq!(u.len(), 1);

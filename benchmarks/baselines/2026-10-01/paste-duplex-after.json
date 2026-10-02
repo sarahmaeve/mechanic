@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "workload_version": 1,
+  "mode": "paste",
+  "build_profile": "release",
+  "label": "after",
+  "cols": 120,
+  "rows": 40,
+  "requested_bytes": 1048576,
+  "warmups": 1,
+  "samples": 1,
+  "os": "macos",
+  "arch": "aarch64",
+  "unix_seconds": 1790906876,
+  "term": "xterm-256color",
+  "term_program": "iTerm.app",
+  "term_program_version": "3.6.11",
+  "notes": "Final queued transport; same duplex workload and timeout as baseline.",
+  "measurements": [
+    {
+      "case": "duplex-paste-call",
+      "bytes": 1048576,
+      "operations": 1,
+      "seconds": [
+        0.000336166
+      ]
+    },
+    {
+      "case": "duplex-verified-delivery",
+      "bytes": 1048576,
+      "operations": 1,
+      "seconds": [
+        0.645780583
+      ]
+    }
+  ],
+  "paste": {
+    "payload_version": 1,
+    "reader_delay_ms": 500,
+    "duplex_bytes": 8388608,
+    "timeout_seconds": 3,
+    "verification": "exact bracketed payload followed by ordered input probe"
+  },
+  "paste_samples": [
+    {
+      "case": "duplex",
+      "warmup": true,
+      "paste_seconds": 0.0003395,
+      "delivery_seconds": 0.645141417,
+      "outcome": "verified"
+    },
+    {
+      "case": "duplex",
+      "warmup": false,
+      "paste_seconds": 0.000336166,
+      "delivery_seconds": 0.645780583,
+      "outcome": "verified"
+    }
+  ]
+}

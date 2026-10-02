@@ -1,11 +1,6 @@
 //! Color palette and theme definitions for Mechanic.
-//!
-//! The default theme is inspired by the Stark Industries aesthetic: a deep black
-//! background with electric cyan/blue primary colors and amber/orange accents.
 
 use serde::{Deserialize, Serialize};
-
-// ── Primitive color type ──────────────────────────────────────────────────────
 
 /// A 24-bit RGB color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,7 +11,6 @@ pub struct Rgb {
 }
 
 impl Rgb {
-    /// Construct from individual channel values.
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
@@ -27,86 +21,48 @@ impl Rgb {
     }
 }
 
-// ── Stark palette constants ───────────────────────────────────────────────────
-
-/// Named constants for the Stark-Industries-inspired color palette.
+/// Default theme palette.
 pub mod palette {
     use super::Rgb;
 
-    /// Electric cyan — primary foreground / brand accent (`#52E8FF`).
     pub const ELECTRIC: Rgb = Rgb::from_hex(0x52E8FF);
-    /// Celeste — bright highlight variant of electric (`#ADFFFF`).
     pub const CELESTE: Rgb = Rgb::from_hex(0xADFFFF);
-    /// Azure blue — mid-tone accent (`#007FFF`).
     pub const AZURE: Rgb = Rgb::from_hex(0x007FFF);
-    /// Deep blue — dark accent / dim color (`#0015FF`).
     pub const BLUE: Rgb = Rgb::from_hex(0x0015FF);
 
-    /// Pure black background (`#000000`).
     pub const BLACK: Rgb = Rgb::from_hex(0x000000);
-    /// Near-black for subtle depth (`#0A0A0A`).
     pub const NEAR_BLACK: Rgb = Rgb::from_hex(0x0A0A0A);
-    /// Dim cyan — used for "bright black" / dark-grey slots (`#1A3A40`).
     pub const DIM_CYAN: Rgb = Rgb::from_hex(0x1A3A40);
 
-    /// Amber — folder / highlight warm accent (`#FFB300`).
     pub const AMBER: Rgb = Rgb::from_hex(0xFFB300);
-    /// Gold — brighter warm highlight (`#FFD700`).
     pub const GOLD: Rgb = Rgb::from_hex(0xFFD700);
 
-    /// Alert orange-red — warnings / errors (`#FF4500`).
     pub const ALERT: Rgb = Rgb::from_hex(0xFF4500);
-    /// Muted red — ANSI red slot (`#CC2200`).
     pub const RED: Rgb = Rgb::from_hex(0xCC2200);
 
-    /// Soft white — used for ANSI white / bright foreground (`#E0F8FF`).
     pub const SOFT_WHITE: Rgb = Rgb::from_hex(0xE0F8FF);
 }
 
-// ── ANSI 16-color mapping ─────────────────────────────────────────────────────
-
-/// Mapping for the 16 standard ANSI terminal colors, mapped to Stark palette
-/// equivalents.
-///
-/// Indices follow the traditional terminal convention:
-/// 0–7 normal, 8–15 bright.
+/// Sixteen ANSI colors, with theme-specific defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AnsiColors {
-    // Normal (0-7)
-    /// ANSI 0 — black
     pub black: Rgb,
-    /// ANSI 1 — red
     pub red: Rgb,
-    /// ANSI 2 — green (rendered as electric cyan in the Stark palette)
     pub green: Rgb,
-    /// ANSI 3 — yellow (rendered as amber)
     pub yellow: Rgb,
-    /// ANSI 4 — blue (azure)
     pub blue: Rgb,
-    /// ANSI 5 — magenta (deep blue, closest Stark analog)
     pub magenta: Rgb,
-    /// ANSI 6 — cyan (electric)
     pub cyan: Rgb,
-    /// ANSI 7 — white (soft white)
     pub white: Rgb,
 
-    // Bright (8-15)
-    /// ANSI 8 — bright black / dark grey
     pub bright_black: Rgb,
-    /// ANSI 9 — bright red (alert orange-red)
     pub bright_red: Rgb,
-    /// ANSI 10 — bright green (celeste)
     pub bright_green: Rgb,
-    /// ANSI 11 — bright yellow (gold)
     pub bright_yellow: Rgb,
-    /// ANSI 12 — bright blue (electric)
     pub bright_blue: Rgb,
-    /// ANSI 13 — bright magenta (azure)
     pub bright_magenta: Rgb,
-    /// ANSI 14 — bright cyan (celeste)
     pub bright_cyan: Rgb,
-    /// ANSI 15 — bright white (pure white)
     pub bright_white: Rgb,
 }
 
@@ -114,7 +70,6 @@ impl Default for AnsiColors {
     fn default() -> Self {
         use palette::*;
         Self {
-            // Normal
             black: BLACK,
             red: RED,
             green: ELECTRIC,
@@ -123,7 +78,6 @@ impl Default for AnsiColors {
             magenta: BLUE,
             cyan: ELECTRIC,
             white: SOFT_WHITE,
-            // Bright
             bright_black: DIM_CYAN,
             bright_red: ALERT,
             bright_green: CELESTE,
@@ -135,8 +89,6 @@ impl Default for AnsiColors {
         }
     }
 }
-
-// ── Selection ─────────────────────────────────────────────────────────────────
 
 /// Colors used for text selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,40 +102,11 @@ pub struct SelectionColors {
 
 impl Default for SelectionColors {
     fn default() -> Self {
-        Self {
-            // Electric cyan background with black text — bright and readable,
-            // same hue family as the foreground so it stays on-palette.
-            background: palette::ELECTRIC,
-            foreground: Some(palette::BLACK),
-        }
+        Self { background: palette::ELECTRIC, foreground: Some(palette::BLACK) }
     }
 }
 
-// ── Window opacity ────────────────────────────────────────────────────────────
-
 /// Opacity settings for the terminal window.
-///
-/// Flat opacity values — one pair for the overall window content area
-/// (desktop bleed-through), one value for in-window text when the
-/// window is unfocused (dims the glyphs toward their cell background
-/// so an idle window reads as "not where the work is happening").  On
-/// focus change, all opacity values snap immediately; there is no fade
-/// interpolation.  This keeps the event loop asleep when the user's
-/// attention is elsewhere (no per-frame redraws burning CPU on a
-/// countdown to transparency).
-///
-/// A *single* exception to the "no animation" rule: when a window
-/// gains keyboard focus and the user holds it for at least
-/// [`bloom_dwell_ms`](OpacityConfig::bloom_dwell_ms), the corner
-/// logo brightens briefly via a [`bloom_duration_ms`](OpacityConfig::bloom_duration_ms)
-/// sin-envelope curve peaking at
-/// [`bloom_peak_multiplier`](OpacityConfig::bloom_peak_multiplier).
-/// The dwell filters transient focus (e.g. rapid Cmd+` cycling), so
-/// only the settled-on window blooms.  The animation is bounded —
-/// once it ends, the event loop returns to its usual idle state.
-///
-/// All opacity values are in the range `[0.0, 1.0]`.  Bloom durations
-/// are in milliseconds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OpacityConfig {
@@ -193,52 +116,14 @@ pub struct OpacityConfig {
     pub content_active_opacity: f32,
     /// Opacity of the content area when the window is in the background.
     pub content_idle_opacity: f32,
-    /// Multiplier applied to glyph coverage when the window is
-    /// unfocused.  1.0 means unfocused text reads the same as
-    /// focused text (full contrast against its cell background); 0.0
-    /// makes text invisible in an unfocused window.  Values around
-    /// 0.5 produce a ghosted, "this is where I'm not looking" feel
-    /// without sacrificing legibility if you glance at the window.
-    /// Focused text is always rendered at full strength (implicit
-    /// 1.0); only the idle side is configurable because a lower-
-    /// than-1.0 active value is rarely what anyone wants.
+    /// Unfocused glyph coverage: 0 hides text, 1 preserves full contrast.
+    /// Focused text always uses full coverage.
     pub text_idle_opacity: f32,
-    /// Total duration of the focus-gain bloom animation, in
-    /// milliseconds.  The bloom follows a `sin(progress * π)` curve
-    /// from 0 → peak → 0 over this window, so a larger value gives
-    /// a slower, more lingering brightening.  250 ms sits comfortably
-    /// in the "deliberate animation" perception band (≥ 100 ms to
-    /// avoid reading as a one-frame flash; < 500 ms to avoid reading
-    /// as sluggish).
+    /// Duration of the focus-gain bloom in milliseconds.
     pub bloom_duration_ms: u32,
-    /// How long a newly-focused window must hold focus before the
-    /// bloom commits, in milliseconds.  Rapid Cmd+` cycling produces
-    /// back-to-back focus changes on each intermediate window; the
-    /// dwell gates the bloom so only the window the user *settles*
-    /// on blooms, not every window they briefly touch.
-    ///
-    /// Invariant: must be less than or equal to
-    /// `FOCUS_REDRAW_BURST_FRAMES × FRAME_INTERVAL` (165 ms at the
-    /// current 5-frame, 33 ms cadence).  The burst already keeps the
-    /// event loop awake for that window, so the bloom commit check
-    /// piggybacks on frames the loop pays for anyway.  If the dwell
-    /// exceeds the burst, the loop sleeps before the check fires and
-    /// the bloom never starts.  The invariant is unit-tested.
+    /// Focus dwell in milliseconds before bloom begins, to avoid animating brief focus changes.
     pub bloom_dwell_ms: u32,
-    /// Peak scale factor applied to the corner logo's display
-    /// opacity at the midpoint of the bloom curve.  `1.0` disables
-    /// the visible effect (the bloom would still run as a scheduler
-    /// event but produce no visible change).  `2.25` is the default:
-    /// lifts the logo to 225% of its steady-state `0.40` base =
-    /// `0.90` peak opacity — clearly visible against the terminal
-    /// background without saturating.
-    ///
-    /// Safe upper bound is `1 / logo_opacity_base = 2.5` at the
-    /// current `0.40` base; past that the shader's `a = logo.a *
-    /// logo_opacity` expression can exceed 1.0 and the `(1 - a)`
-    /// term in the over-composite goes negative, producing visual
-    /// artefacts.  Keep to `<= 2.5` unless the logo base is also
-    /// lowered.
+    /// Peak logo-opacity multiplier during bloom; 1 leaves brightness unchanged.
     pub bloom_peak_multiplier: f32,
 }
 
@@ -251,29 +136,12 @@ impl Default for OpacityConfig {
             text_idle_opacity: 0.55,
             bloom_duration_ms: 250,
             bloom_dwell_ms: 120,
-            // 2.25 was selected empirically after 1.4 proved too
-            // subtle on a logo that's already rendered at 0.40
-            // opacity (ambient accent, not primary content).  The
-            // 40% lift from 1.4 peaked at logo_opacity = 0.56 —
-            // readable only if you were looking directly at the
-            // corner and knew what to expect.  2.25 peaks at 0.90,
-            // unambiguous without saturating.
             bloom_peak_multiplier: 2.25,
         }
     }
 }
 
-// ── Top-level Theme ───────────────────────────────────────────────────────────
-
 /// Complete theme configuration.
-///
-/// Deserializing a partial TOML snippet will fill missing keys from `Default`.
-/// Example — override only the font size in a user config:
-///
-/// ```toml
-/// [theme.opacity]
-/// content_idle_opacity = 0.70
-/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Theme {
@@ -283,15 +151,12 @@ pub struct Theme {
     pub background: Rgb,
     /// Cursor color (the block, bar, or underline itself).
     pub cursor: Rgb,
-    /// Color of the character displayed *under* a block cursor.  A solid
-    /// block cursor in `cursor` would otherwise hide the glyph — this gives
-    /// it a contrasting color so the character stays readable.
+    /// Text color inside a focused block cursor.
     pub cursor_text: Rgb,
-    /// The 16 standard ANSI colors mapped to Stark palette equivalents.
     pub ansi: AnsiColors,
     /// Text-selection colors.
     pub selection: SelectionColors,
-    /// Window/pane opacity settings.
+    /// Window opacity and focus animation.
     pub opacity: OpacityConfig,
 }
 
@@ -301,8 +166,6 @@ impl Default for Theme {
             foreground: palette::ELECTRIC,
             background: palette::BLACK,
             cursor: palette::CELESTE,
-            // Black under the celeste cursor block — highest contrast,
-            // clearest read at a glance.
             cursor_text: palette::BLACK,
             ansi: AnsiColors::default(),
             selection: SelectionColors::default(),
@@ -310,8 +173,6 @@ impl Default for Theme {
         }
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -358,18 +219,6 @@ mod tests {
 
     #[test]
     fn bloom_dwell_fits_within_focus_redraw_burst() {
-        // The bloom commit check runs opportunistically on frames
-        // that the focus-redraw burst is already paying for
-        // (FOCUS_REDRAW_BURST_FRAMES = 5 × FRAME_INTERVAL = 33 ms →
-        // 165 ms of guaranteed frames after a focus event).  If the
-        // default dwell ever exceeds that window, the commit check
-        // never fires because the loop sleeps before the dwell
-        // elapses — silent "bloom never plays" regression.
-        //
-        // Constants duplicated here to avoid adding a dependency
-        // from mechanic-config back to mechanic-app.  If the app's
-        // burst parameters change, this number needs to change too
-        // — and the test failure surfaces the coupling explicitly.
         const FOCUS_REDRAW_BURST_MS: u32 = 5 * 33;
         let op = OpacityConfig::default();
         assert!(
@@ -394,7 +243,6 @@ mod tests {
 
     #[test]
     fn partial_toml_fills_defaults() {
-        // Only override the cursor color; everything else should come from Default.
         let partial = r#"
             [cursor]
             r = 255
@@ -403,7 +251,6 @@ mod tests {
         "#;
         let theme: Theme = toml::from_str(partial).expect("partial deserialize");
         assert_eq!(theme.cursor, Rgb::new(255, 0, 0));
-        // Background should still be the default black.
         assert_eq!(theme.background, palette::BLACK);
     }
 }

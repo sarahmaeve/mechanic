@@ -1,7 +1,4 @@
-//! Corner logo — rasterizes the bundled SVG once at startup and uploads it
-//! to a wgpu texture.  The shader samples this texture in the lower-right
-//! corner of the background pass to draw the arc-reactor / IC mark over
-//! the animated gradient.
+//! Rasterize the bundled corner logo and upload it once at startup.
 
 use resvg::tiny_skia::{Pixmap, Transform};
 use resvg::usvg;
@@ -10,10 +7,6 @@ use resvg::usvg;
 const LOGO_SVG: &str = include_str!("../assets/logo.svg");
 
 /// Texture resolution for the rasterized logo, in pixels.
-///
-/// 256 px matches the SVG's viewBox and is plenty of detail — the logo
-/// renders at roughly 140–180 px on a Retina display, so the GPU sampler
-/// downscales slightly.  Larger textures would just burn GPU memory.
 pub const LOGO_SIZE: u32 = 256;
 
 /// The rasterized logo, living on the GPU as a texture.
@@ -36,8 +29,6 @@ impl Logo {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // RGBA8 premultiplied-alpha.  tiny-skia outputs premultiplied
-            // pixels natively, so the shader can composite directly.
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
@@ -64,13 +55,7 @@ impl Logo {
     }
 }
 
-/// Parse `LOGO_SVG` and rasterize it into an RGBA byte buffer at
-/// `LOGO_SIZE × LOGO_SIZE`.  The SVG's viewBox is mapped uniformly
-/// onto the square output.
-///
-/// Panics if the bundled SVG is unparseable — this is a compile-time
-/// constant authored by us, so a parse failure is a build-breaking bug
-/// we want surfaced loudly.
+/// Parse `LOGO_SVG` and rasterize it into an RGBA byte buffer at `LOGO_SIZE × LOGO_SIZE`.  The SVG's viewBox is mapped uniformly onto the square output.
 fn rasterize_svg() -> Vec<u8> {
     let opts = usvg::Options::default();
     let tree =
@@ -79,9 +64,6 @@ fn rasterize_svg() -> Vec<u8> {
     let mut pixmap =
         Pixmap::new(LOGO_SIZE, LOGO_SIZE).expect("LOGO_SIZE must be a valid Pixmap dimension");
 
-    // Scale the SVG's viewBox uniformly onto the texture.  The bundled
-    // SVG is already 256×256 so this is typically the identity transform,
-    // but the scale handles hypothetical future resizing.
     let svg_size = tree.size();
     let scale_x = LOGO_SIZE as f32 / svg_size.width();
     let scale_y = LOGO_SIZE as f32 / svg_size.height();

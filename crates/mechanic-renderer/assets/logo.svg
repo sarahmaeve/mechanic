@@ -1,31 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  Mechanic corner logo — busier integrated-circuit style, asymmetric
-  toward the lower-right to match its intended position inside the
-  bottom-right corner gradient of the window.
-
-  Composition (density increases toward lower-right):
-    • Upper-left:  sparse — single trace meandering through a capacitor
-    • Upper-right: small secondary IC (IC1) with resistor R1 nearby
-    • Lower-left:  resistor R2 and capacitor C1 on feeder traces
-    • Lower-right: main IC (IC2) with pins on all four sides, connection
-                   pads along the right edge, ground symbol, status LED
-
-  Routing uses Manhattan-style 90° bends (real PCB traces) rather than
-  diagonals, which reads more like a circuit schematic and leaves the
-  diagonal feel for the animated electron pulses in the shader pass.
-
-  Colors match mechanic-config/src/theme.rs:
-    electric = #52E8FF   (main outlines, traces)
-    celeste  = #ADFFFF   (highlights, pads, R/C bodies)
-    azure    = #007FFF   (chip internals, secondary detail)
-    amber    = #FFB300   (via dots, warm accents)
-    alert    = #FF4500   (single status LED)
--->
+<!-- Corner logo. Colors match mechanic-config/src/theme.rs. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"
      fill="none" stroke-linecap="round" stroke-linejoin="round">
 
-  <!-- ── Upper-left: sparse meandering trace ─────────────────────────── -->
+  <!-- Upper-left trace -->
 
   <!-- Solitary origin pad in the far corner -->
   <circle cx="22" cy="28" r="3" fill="#ADFFFF"/>
@@ -45,7 +23,7 @@
   <circle cx="142" cy="56" r="3" fill="none" stroke="#FFB300" stroke-width="1.5"/>
   <circle cx="142" cy="56" r="1.5" fill="#FFB300"/>
 
-  <!-- ── Upper-right: secondary IC (IC1) and resistor R1 ─────────────── -->
+  <!-- IC1 and R1 -->
 
   <!-- Resistor R1 at top edge -->
   <rect x="186" y="28" width="40" height="12"
@@ -102,7 +80,7 @@
   <!-- Trace from IC1 bottom-right pin down to main IC top -->
   <path d="M 186 118 L 186 155" stroke="#52E8FF" stroke-width="2"/>
 
-  <!-- ── Lower-left: resistor R2 and capacitor C1 on feeder traces ──── -->
+  <!-- R2 and C1 -->
 
   <!-- Resistor R2 (vertical) -->
   <rect x="38" y="134" width="12" height="36"
@@ -126,7 +104,7 @@
   <!-- Amber via at feeder-to-IC junction -->
   <circle cx="140" cy="196" r="3" fill="#FFB300"/>
 
-  <!-- ── Lower-right: main IC cluster ────────────────────────────────── -->
+  <!-- Main IC -->
 
   <!-- Main IC body -->
   <rect x="150" y="155" width="72" height="62"
@@ -199,7 +177,7 @@
     <rect x="193" y="138" width="6" height="5"/>
   </g>
 
-  <!-- ── Connecting traces across the board ──────────────────────────── -->
+  <!-- Connecting traces -->
 
   <!-- Long trace from top-right pad of IC1 over to the top-right pin of IC2 -->
   <path d="M 216 78 L 228 78 L 228 120 L 210 120 L 210 130"

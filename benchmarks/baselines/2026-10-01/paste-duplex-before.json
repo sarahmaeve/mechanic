@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "workload_version": 1,
+  "mode": "paste",
+  "build_profile": "release",
+  "label": "before",
+  "cols": 120,
+  "rows": 40,
+  "requested_bytes": 1048576,
+  "warmups": 1,
+  "samples": 1,
+  "os": "macos",
+  "arch": "aarch64",
+  "unix_seconds": 1790905087,
+  "term": "xterm-256color",
+  "term_program": "iTerm.app",
+  "term_program_version": "3.6.11",
+  "notes": "",
+  "measurements": [
+    {
+      "case": "duplex-paste-call",
+      "bytes": 1048576,
+      "operations": 1,
+      "seconds": [
+        3.603819583
+      ]
+    },
+    {
+      "case": "duplex-verified-delivery",
+      "bytes": 1048576,
+      "operations": 1,
+      "seconds": []
+    }
+  ],
+  "paste": {
+    "payload_version": 1,
+    "reader_delay_ms": 500,
+    "duplex_bytes": 8388608,
+    "timeout_seconds": 3,
+    "verification": "exact bracketed payload followed by ordered input probe"
+  },
+  "paste_samples": [
+    {
+      "case": "duplex",
+      "warmup": true,
+      "paste_seconds": 3.603650875,
+      "delivery_seconds": null,
+      "outcome": "PTY I/O error: Input/output error (os error 5)"
+    },
+    {
+      "case": "duplex",
+      "warmup": false,
+      "paste_seconds": 3.603819583,
+      "delivery_seconds": null,
+      "outcome": "PTY I/O error: Input/output error (os error 5)"
+    }
+  ]
+}

@@ -1,12 +1,7 @@
-// Text rendering: glyph rasterization via cosmic-text / swash and a GPU glyph
-// atlas that caches the results.
-
 use std::collections::HashMap;
 
 use cosmic_text::{Attrs, Buffer, CacheKey, FontSystem, Metrics, Shaping, SwashCache};
 use mechanic_config::font::FontConfig;
-
-// ── Atlas constants ───────────────────────────────────────────────────────────
 
 /// Number of slots per row in the atlas.
 const ATLAS_COLS: u32 = 16;
@@ -14,45 +9,31 @@ const ATLAS_COLS: u32 = 16;
 const ATLAS_INITIAL_ROWS: u32 = 8;
 
 /// Compute the atlas slot size from the cell dimensions.
-///
-/// Slot must fit the tallest/widest glyph plus italic overhang and
-/// descender margin. 1.5× the max cell dimension is a comfortable
-/// headroom; next_power_of_two for texture-friendly alignment;
-/// floor at 32 so tiny fonts still have a reasonable slot.
 pub fn compute_slot_size(cell_width: f32, cell_height: f32) -> u32 {
     let max_dim = cell_width.max(cell_height);
     let padded = (max_dim * 1.5).ceil() as u32;
     padded.next_power_of_two().max(32)
 }
 
-// ── Public types ──────────────────────────────────────────────────────────────
-
-/// Real font metrics extracted from cosmic-text after shaping.
-///
-/// These replace the rough `font_size * 0.6 / 1.3` estimates used previously.
+/// Shaped font metrics in physical pixels.
 #[derive(Debug, Clone, Copy)]
 pub struct CellMetrics {
-    /// Advance width of a monospace cell in physical pixels (from the space
-    /// glyph's `x_advance`).
+    /// Advance width of a monospace cell in physical pixels (from the space glyph's `x_advance`).
     pub cell_width: f32,
     /// Line height in physical pixels (from `Metrics::line_height`).
     pub cell_height: f32,
-    /// Distance from the top of the cell to the baseline in physical pixels
-    /// (from `LayoutRun::max_ascent`).
+    /// Distance from cell top to baseline, in physical pixels.
     pub ascent: f32,
 }
 
 /// Location and metrics of a rasterized glyph in the GPU atlas.
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphInfo {
-    /// UV rectangle in the atlas texture covering *only* the glyph bitmap:
-    /// `(u_min, v_min, u_max, v_max)`.
+    /// UV rectangle in the atlas texture covering *only* the glyph bitmap: `(u_min, v_min, u_max, v_max)`.
     pub atlas_uv: [f32; 4],
-    /// Horizontal offset in pixels from the cell left edge to the glyph's
-    /// left edge (bearing X).
+    /// Horizontal offset in pixels from the cell left edge to the glyph's left edge (bearing X).
     pub offset_x: f32,
-    /// Vertical offset in pixels from the cell top to the glyph's top edge
-    /// (`ascent - placement.top`).
+    /// Vertical offset in pixels from the cell top to the glyph's top edge (`ascent - placement.top`).
     pub offset_y: f32,
     /// Width of the rasterized bitmap in pixels.
     pub glyph_width: f32,
@@ -60,10 +41,7 @@ pub struct GlyphInfo {
     pub glyph_height: f32,
 }
 
-// ── TextRenderer ──────────────────────────────────────────────────────────────
-
-/// Key for the fast-path glyph cache, avoiding cosmic-text shaping on every
-/// frame for characters we have already rasterized.
+/// Character and style key for cached glyphs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CharStyleKey {
     ch: char,
@@ -82,21 +60,14 @@ pub struct TextRenderer {
     /// Map from cosmic-text `CacheKey` to cached `GlyphInfo`.
     atlas_map: HashMap<CacheKey, GlyphInfo>,
     /// Fast-path cache: `(char, bold, italic)` → `GlyphInfo`.
-    ///
-    /// This lets us skip cosmic-text shaping entirely for characters that
-    /// have already been rasterized.  The shaping step (Buffer + shape) is
-    /// the most expensive part of the per-character path.
     char_cache: HashMap<CharStyleKey, Option<GlyphInfo>>,
     /// Next free slot index.
     atlas_next_slot: u32,
     /// Total number of slots currently allocated.
     atlas_capacity_slots: u32,
-    /// Width and height of each glyph slot in the atlas (pixels).
-    /// Computed from cell metrics so large fonts aren't cropped.
+    /// Glyph slot width and height in pixels.
     slot_size: u32,
-    /// Monotonically increasing counter; incremented whenever the atlas
-    /// texture is recreated (i.e., when it grows).  Consumers can compare
-    /// against a stored value to know when to rebuild bind groups.
+    /// Incremented on texture replacement; invalidates cached bind groups and UVs.
     atlas_generation: u64,
     /// Font metrics (size, line height).
     metrics: Metrics,
@@ -117,10 +88,6 @@ impl TextRenderer {
     }
 
     /// Construct a new `TextRenderer`, loading fonts from `config`.
-    ///
-    /// `scale_factor` is the window's DPI scale (e.g. 2.0 on Retina Macs).
-    /// Glyph rasterization uses `font_size * scale_factor` so glyphs are
-    /// sharp at the display's native resolution.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -129,24 +96,15 @@ impl TextRenderer {
     ) -> Self {
         let mut font_system = FontSystem::new();
 
-        // Font size in physical pixels — scale the point size by the display
-        // factor so glyphs are rendered at native resolution.
         let px_size = config.size * scale_factor;
         let line_height = px_size * 1.3; // initial estimate; overridden by real metrics below
         let metrics = Metrics::new(px_size, line_height);
 
-        // ── Extract real cell metrics ─────────────────────────────────────────
-        //
-        // Shape a space character to get the monospace advance width and the
-        // true line metrics (ascent, line_height).
         let cell_metrics = {
             let mut cell_width = px_size * 0.6; // fallback
             let mut cell_height = line_height; // fallback
             let mut ascent = px_size * 0.8; // fallback
 
-            // Shape a single space in a nested scope so the cosmic-text
-            // buffer/borrow release their mutable lease on font_system
-            // before we query fontdb for the resolved face name below.
             let resolved_font_id: Option<cosmic_text::fontdb::ID> = {
                 let mut buffer = Buffer::new(&mut font_system, metrics);
                 let mut borrow = buffer.borrow_with(&mut font_system);
@@ -166,9 +124,6 @@ impl TextRenderer {
                 found_id
             };
 
-            // Log which font cosmic-text actually resolved — the requested
-            // family may not be installed, in which case it silently falls
-            // back to another face.  Users see this at RUST_LOG=info.
             if let Some(id) = resolved_font_id {
                 match font_system.db().face(id) {
                     Some(face) => {
@@ -196,10 +151,6 @@ impl TextRenderer {
             CellMetrics { cell_width, cell_height, ascent }
         };
 
-        // Slot must fit the tallest/widest glyph plus italic overhang and
-        // descender margin. 1.5× the max cell dimension is a comfortable
-        // headroom; next_power_of_two for texture-friendly alignment;
-        // floor at 32 so tiny fonts still have a reasonable slot.
         let slot_size = compute_slot_size(cell_metrics.cell_width, cell_metrics.cell_height);
 
         let swash_cache = SwashCache::new();
@@ -223,7 +174,6 @@ impl TextRenderer {
             cell_metrics,
         };
 
-        // Pre-rasterize the printable ASCII range on startup.
         renderer.rasterize_ascii_range(device, queue, config);
 
         renderer
@@ -235,17 +185,15 @@ impl TextRenderer {
     }
 
     /// Return the current atlas generation counter.
-    ///
-    /// This is incremented each time the atlas texture is recreated (grows).
-    /// Consumers can compare against a stored value to know when to rebuild
-    /// bind groups.
     pub fn atlas_generation(&self) -> u64 {
         self.atlas_generation
     }
 
-    // ── Atlas texture management ──────────────────────────────────────────────
-
-    fn create_atlas_texture(device: &wgpu::Device, slot_size: u32, capacity_slots: u32) -> wgpu::Texture {
+    fn create_atlas_texture(
+        device: &wgpu::Device,
+        slot_size: u32,
+        capacity_slots: u32,
+    ) -> wgpu::Texture {
         let width = Self::atlas_width(slot_size);
         let height = Self::atlas_height(slot_size, capacity_slots);
         device.create_texture(&wgpu::TextureDescriptor {
@@ -261,11 +209,8 @@ impl TextRenderer {
     }
 
     /// Allocate a new atlas slot, growing the texture if necessary.
-    ///
-    /// Returns the slot index.
     fn alloc_slot(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> u32 {
         if self.atlas_next_slot >= self.atlas_capacity_slots {
-            // Double the capacity.
             let new_capacity = self.atlas_capacity_slots * 2;
             let new_texture = Self::create_atlas_texture(device, self.slot_size, new_capacity);
             let new_view = new_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -279,9 +224,6 @@ impl TextRenderer {
                 new_capacity / ATLAS_COLS,
                 self.atlas_generation
             );
-            // Re-upload all cached glyphs to the new texture.
-            // In a real renderer you might keep a CPU-side copy; for now
-            // we simply clear both caches and let glyphs be re-rasterized lazily.
             self.atlas_map.clear();
             self.char_cache.clear();
             self.atlas_next_slot = 0;
@@ -298,9 +240,14 @@ impl TextRenderer {
         (slot % ATLAS_COLS, slot / ATLAS_COLS)
     }
 
-    /// UV rectangle for a given slot covering only the actual glyph bitmap
-    /// (not the full slot).
-    fn glyph_uv(slot: u32, glyph_w: u32, glyph_h: u32, slot_size: u32, capacity_slots: u32) -> [f32; 4] {
+    /// UV rectangle for a given slot covering only the actual glyph bitmap (not the full slot).
+    fn glyph_uv(
+        slot: u32,
+        glyph_w: u32,
+        glyph_h: u32,
+        slot_size: u32,
+        capacity_slots: u32,
+    ) -> [f32; 4] {
         let (col, row) = Self::slot_to_grid(slot);
         let atlas_w = Self::atlas_width(slot_size) as f32;
         let atlas_h = Self::atlas_height(slot_size, capacity_slots) as f32;
@@ -311,30 +258,7 @@ impl TextRenderer {
         [x0, y0, x1, y1]
     }
 
-    // ── Rasterization ─────────────────────────────────────────────────────────
-
-    /// Pre-rasterize a set of glyphs into the atlas.
-    ///
-    /// Use this before a pipeline's instance-building pass to stabilize
-    /// the atlas: subsequent [`Self::rasterize_char`] calls for the same
-    /// `(char, bold, italic)` triples will all hit the fast-path cache,
-    /// so no atlas grow can happen during instance emission.
-    ///
-    /// # Why this exists
-    ///
-    /// Atlas growth (capacity-doubling inside [`Self::alloc_slot`])
-    /// clears `atlas_map` and invalidates any UVs already computed for
-    /// the glyphs that were in the old texture.  If a grow fires
-    /// mid-render-pass, some instances in the draw buffer reference
-    /// coordinates from the old texture while later instances reference
-    /// the new one — and both get sampled against the same bound atlas
-    /// view.  Result: a one-frame flash of garbled glyphs the moment
-    /// the atlas exceeds capacity (commonly when the user first types a
-    /// CJK character, emoji, or unusual symbol).
-    ///
-    /// Pre-populating the atlas with every unique glyph the frame needs
-    /// moves all grow events to before instance emission, so the atlas
-    /// stays put for the rest of the frame.
+    /// Pre-rasterize glyphs. Growth clears earlier entries; this pass is not atomic.
     pub fn populate_atlas<I>(
         &mut self,
         glyphs: I,
@@ -345,9 +269,6 @@ impl TextRenderer {
         I: IntoIterator<Item = (char, bool, bool)>,
     {
         for (ch, bold, italic) in glyphs {
-            // Return value ignored — we just want the atlas entry
-            // populated.  The pipeline's second pass will call
-            // rasterize_char again and consume the cached GlyphInfo.
             self.rasterize_char(ch, bold, italic, device, queue, config);
         }
     }
@@ -365,10 +286,7 @@ impl TextRenderer {
         }
     }
 
-    /// Rasterize `ch` with the given style flags and upload it to the atlas.
-    ///
-    /// Returns `None` for whitespace or characters with no glyph (e.g. control
-    /// characters).
+    /// Rasterize and upload a character; None for whitespace or missing glyphs.
     pub fn rasterize_char(
         &mut self,
         ch: char,
@@ -378,22 +296,15 @@ impl TextRenderer {
         queue: &wgpu::Queue,
         config: &FontConfig,
     ) -> Option<GlyphInfo> {
-        // Whitespace has no glyph to draw.
         if ch == ' ' || ch == '\t' || ch == '\n' {
             return None;
         }
 
-        // ── Fast-path: return cached result without shaping ──────────────
         let style_key = CharStyleKey { ch, bold, italic };
         if let Some(cached) = self.char_cache.get(&style_key) {
             return *cached;
         }
 
-        // Build a one-character buffer to let cosmic-text shape it and give us
-        // the CacheKey.
-        //
-        // The buffer and borrow are scoped so they release `self.font_system`
-        // before we need `self` again below.
         let cache_key = {
             let mut buffer = Buffer::new(&mut self.font_system, self.metrics);
             let mut borrow = buffer.borrow_with(&mut self.font_system);
@@ -410,26 +321,21 @@ impl TextRenderer {
             borrow.set_text(&text, &attrs, Shaping::Advanced, None);
             borrow.shape_until_scroll(false);
 
-            // Find the glyph in the shaped layout.
-            // `LayoutGlyph` does not directly expose a CacheKey; we call
-            // `.physical()` to get a `PhysicalGlyph` which carries one.
+            // physical() provides the raster cache key.
             borrow.layout_runs().find_map(|run| {
                 run.glyphs.iter().next().map(|glyph| glyph.physical((0.0, 0.0), 1.0).cache_key)
             })
         };
         let Some(cache_key) = cache_key else {
-            // No glyph found for this character — cache the miss.
             self.char_cache.insert(style_key, None);
             return None;
         };
 
-        // Return cached result if already rasterized.
         if let Some(&info) = self.atlas_map.get(&cache_key) {
             self.char_cache.insert(style_key, Some(info));
             return Some(info);
         }
 
-        // Rasterize via swash.
         let image = self.swash_cache.get_image_uncached(&mut self.font_system, cache_key)?;
 
         let glyph_w = image.placement.width;
@@ -439,13 +345,9 @@ impl TextRenderer {
             return None;
         }
 
-        // Compute glyph placement within the cell.
-        // offset_x = bearing X (pixels from cell left to glyph left edge).
-        // offset_y = ascent - placement.top (pixels from cell top to glyph top).
         let offset_x = image.placement.left as f32;
         let offset_y = self.cell_metrics.ascent - image.placement.top as f32;
 
-        // Allocate an atlas slot.
         let slot = self.alloc_slot(device, queue);
         let slot_size = self.slot_size;
 
@@ -453,8 +355,6 @@ impl TextRenderer {
         let dst_x = col * slot_size;
         let dst_y = row * slot_size;
 
-        // Upload the glyph bitmap.  The data from swash for a Mask glyph is
-        // one byte per pixel (alpha).
         let upload_w = glyph_w.min(slot_size);
         let upload_h = glyph_h.min(slot_size);
 
@@ -488,28 +388,22 @@ impl TextRenderer {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::compute_slot_size;
 
     #[test]
     fn slot_size_basic() {
-        // A typical 8×16 cell (narrow/tall monospace): slot must be at least 16.
         assert!(compute_slot_size(8.0, 16.0) >= 16);
     }
 
     #[test]
     fn slot_size_floor_at_32() {
-        // Even for a small cell, the slot size must be at least 32.
         assert!(compute_slot_size(8.0, 16.0) >= 32);
     }
 
     #[test]
     fn slot_size_large_font_fits() {
-        // 72pt at 2× = 100px cell_height → slot must accommodate 1.5×.
-        // compute_slot_size(50.0, 100.0): max=100, padded=150 → next_pow2=256.
         assert!(compute_slot_size(50.0, 100.0) >= 150);
     }
 

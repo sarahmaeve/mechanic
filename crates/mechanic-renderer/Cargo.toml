@@ -14,12 +14,9 @@ bytemuck = { version = "1", features = ["derive"] }
 bitflags = "2"
 raw-window-handle = "0.6"
 
-# SVG rasterization for the corner logo.  Defaults pulled in text and
-# image support we don't need for a pure-shape mark; disable them to
-# keep the dep graph small.
-resvg = { version = "0.47", default-features = false }
+# The logo needs only SVG shapes.
+resvg = { version = "0.48", default-features = false }
 
 [dev-dependencies]
-# wgpu 29 does not re-export naga in its public API (no `wgpu::naga` path),
-# so we depend on it directly for the WGSL shader validation test in lib.rs.
-naga = { version = "29", features = ["wgsl-in"] }
+# Shader validation.
+naga = { version = "30", features = ["wgsl-in"] }

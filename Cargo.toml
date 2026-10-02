@@ -5,36 +5,37 @@ members = [
     "crates/mechanic-core",
     "crates/mechanic-renderer",
     "crates/mechanic-config",
+    "crates/mechanic-bench",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.87"
+rust-version = "1.99"
 
 [workspace.dependencies]
 # Terminal emulation
 alacritty_terminal = "0.26"
 
 # GPU rendering
-wgpu = "29"
+wgpu = "30"
 
 # Windowing
 winit = "0.30"
 
 # Text shaping and layout
-cosmic-text = "0.18"
+cosmic-text = "0.19"
 
 # Serialization / configuration
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 
 # Concurrency
 crossbeam-channel = "0.5"
 
 # Async executor (used to drive wgpu init on the main thread)
-pollster = "0.4"
+pollster = "1"
 
 # Logging
 log = "0.4"

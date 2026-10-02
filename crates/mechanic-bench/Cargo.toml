@@ -1,5 +1,5 @@
 [package]
-name = "mechanic-core"
+name = "mechanic-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,11 +7,12 @@ rust-version.workspace = true
 
 [dependencies]
 alacritty_terminal.workspace = true
-crossbeam-channel.workspace = true
-libc.workspace = true
-log.workspace = true
+mechanic-core.workspace = true
 mechanic-config.workspace = true
-polling = "3"
+libc.workspace = true
+serde.workspace = true
+serde_json = "1"
+signal-hook = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
