@@ -23,7 +23,7 @@ use instance_cache::InstanceCache;
 
 #[path = "panes.rs"]
 mod panes;
-pub use panes::{PaneRect, RenderPane};
+pub use panes::{PaneRect, RenderDivider, RenderPane, RenderPaneHandle};
 
 /// Instanced vertex data. Field offsets must match the shader attributes.
 #[repr(C)]
@@ -237,6 +237,7 @@ pub struct RenderState {
     pane_order: Vec<u64>,
     pane_frame_cached: bool,
     pane_colors: (Rgb, Rgb),
+    dividers: panes::DividerState,
 }
 
 /// Initialise the wgpu instance, adapter, device, queue, and configured surface — without building any pipelines or textures.
@@ -474,6 +475,7 @@ impl RenderState {
             pane_order: Vec::new(),
             pane_frame_cached: false,
             pane_colors: (Rgb::new(173, 255, 255), Rgb::new(26, 58, 64)),
+            dividers: panes::DividerState::default(),
         })
     }
 

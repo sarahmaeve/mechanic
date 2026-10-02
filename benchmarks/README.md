@@ -381,29 +381,37 @@ the screen or send text to a shell.
 
 ```sh
 cargo test --release --locked -p mechanic-app panes::tests::layout_hit_test_benchmark -- --ignored --exact --nocapture --test-threads=1
+cargo test --release --locked -p mechanic-app panes::tests::move_preview_commit_benchmark -- --ignored --exact --nocapture --test-threads=1
 MECHANIC_PANE_BENCH_CSV=/tmp/mechanic-panes.csv cargo test --release --locked -p mechanic-renderer multi_pane_update_benchmark -- --ignored --nocapture --test-threads=1
 ```
 
 The layout test measures 16 panes and 16 hit tests over five batches of 20,000
-iterations. The Metal preparation test holds 4,800 cells constant across one,
+iterations. The move test measures preview validation and tree mutation for
+16 panes over five batches of 10,000 operations; rendering, PTY resizing, and
+window creation are excluded. The Metal preparation test holds 4,800 cells constant across one,
 two and four panes, changing one cell in one or every pane. It checks idle-pane
 cache reuse and records preparation time and vertex upload bytes. Discard the
 first 20 of 120 iterations per case as warmup. GPU synchronization and window
 presentation are outside these preparation timings. Run without other builds
 or benchmarks; the GPU test has a 60-second total bound.
 
-The hidden native app smoke opens isolated local shell sessions:
+The hidden native app smoke checks open isolated local shell sessions:
 
 ```sh
 cargo rustc -p mechanic-app --example panes_native_smoke --locked -- --cfg test
 ./target/debug/examples/panes_native_smoke
+cargo rustc -p mechanic-app --example pane_move_native_smoke --locked -- --cfg test
+./target/debug/examples/pane_move_native_smoke
 ```
 
-It exercises inherited directories, splits, hover scrolling, selection/search
-isolation, divider dragging, font resizing, IME cancellation/reactivation,
+The first exercises inherited directories, splits, hover scrolling, selection/search
+isolation, divider dragging, pane rearrangement, font resizing, IME cancellation/reactivation,
 restart sessions, stale callbacks and closing panes. It also checks native
 notification content/delegate construction without requesting permission or
-delivering alerts. It does not capture the screen. The shell fixture uses
+delivering alerts. The second verifies that detachment preserves the running
+shell, scrollback, selection, Find query, and control handle, including PTY
+output and command completion after closing the source window.
+Neither captures the screen. The shell fixture uses
 `/bin/sh` with integration disabled and never loads user zsh startup files.
 
 ## Hyperlinks

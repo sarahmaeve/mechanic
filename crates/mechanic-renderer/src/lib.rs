@@ -6,7 +6,7 @@ pub mod text;
 
 pub use grid::{CellFlags, CursorStyle, RenderCell, RenderGrid};
 pub use pipeline::FrameUniforms;
-pub use pipeline::{PaneRect, RenderPane};
+pub use pipeline::{PaneRect, RenderDivider, RenderPane, RenderPaneHandle};
 pub use text::CellMetrics;
 
 use mechanic_config::{font::FontConfig, theme::Theme};
@@ -81,6 +81,7 @@ impl Renderer {
             theme.logo,
         )?;
         state.set_pane_colors(theme.cursor, theme.ansi.bright_black);
+        state.set_divider_colors(theme.foreground, theme.background, theme.cursor);
 
         Ok(Self { state, text, font_config, scale_factor })
     }
@@ -103,6 +104,21 @@ impl Renderer {
     /// Render all panes with one window surface acquisition, submission and presentation.
     pub fn render_panes(&mut self, panes: &[RenderPane<'_>], uniforms: FrameUniforms) -> bool {
         self.state.render_panes(panes, &mut self.text, &self.font_config, uniforms)
+    }
+
+    /// Update visible divider bounds and hover/drag state. An empty slice clears them.
+    pub fn set_pane_dividers(&mut self, dividers: &[RenderDivider]) {
+        self.state.set_pane_dividers(dividers);
+    }
+
+    /// Update pane drag grips within their reserved header bounds.
+    pub fn set_pane_handles(&mut self, handles: &[RenderPaneHandle]) {
+        self.state.set_pane_handles(handles);
+    }
+
+    /// Show the proposed pane bounds during a drag, or clear the preview.
+    pub fn set_pane_drop_preview(&mut self, preview: Option<PaneRect>) {
+        self.state.set_pane_drop_preview(preview);
     }
 
     /// Draw cached instances with new uniforms; true only after presentation.

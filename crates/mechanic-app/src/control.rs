@@ -270,10 +270,11 @@ impl Drop for ConnectionGuard {
     }
 }
 
-/// Owns an accept thread and at most eight connection workers. Drop wakes the
-/// blocking accept and pending reply waits, closes streams, and joins workers.
+/// Owns an accept thread and at most eight connection workers. Drop wakes its
+/// private socket pair and pending reply waits, closes streams, and joins workers.
 pub struct ControlServer {
     socket_path: PathBuf,
+    wake: UnixStream,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
     socket_identity: (u64, u64),
@@ -296,12 +297,22 @@ impl ControlServer {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, "socket already exists"));
             }
         }
+        let (wake, accept_wake) = UnixStream::pair()?;
         let listener = UnixListener::bind(&socket_path)?;
-        if let Err(error) = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)) {
-            let _ = fs::remove_file(&socket_path);
-            return Err(error);
-        }
-        let metadata = fs::symlink_metadata(&socket_path)?;
+        let setup = (|| {
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+            // Readiness is multiplexed with the private wake socket. A spurious
+            // listener readiness notification must never block a subsequent accept.
+            listener.set_nonblocking(true)?;
+            fs::symlink_metadata(&socket_path)
+        })();
+        let metadata = match setup {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let _ = fs::remove_file(&socket_path);
+                return Err(error);
+            }
+        };
         let socket_identity = (metadata.dev(), metadata.ino());
         let shared = Arc::new(Shared {
             stopping: AtomicBool::new(false),
@@ -311,10 +322,12 @@ impl ControlServer {
         });
         let accept_shared = shared.clone();
         let thread = thread::Builder::new().name("mechanic-control".to_owned()).spawn(move || {
-            accept_loop(listener, accept_shared, Arc::new(dispatch));
+            accept_loop(listener, accept_wake, accept_shared, Arc::new(dispatch));
         });
         match thread {
-            Ok(thread) => Ok(Self { socket_path, shared, thread: Some(thread), socket_identity }),
+            Ok(thread) => {
+                Ok(Self { socket_path, wake, shared, thread: Some(thread), socket_identity })
+            }
             Err(error) => {
                 let _ = fs::remove_file(&socket_path);
                 Err(error)
@@ -349,8 +362,9 @@ impl Drop for ControlServer {
                 let _ = connection.stream.shutdown(std::net::Shutdown::Both);
             }
         }
-        // Accept is blocking: one local connection is the only idle wake needed.
-        let _ = connect_with_deadline(&self.socket_path, Instant::now() + WRITE_TIMEOUT);
+        // The peer sees EOF even if the public socket or directory was unlinked.
+        // This descriptor is private, so waking cannot depend on filesystem state.
+        let _ = self.wake.shutdown(std::net::Shutdown::Both);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -363,12 +377,12 @@ impl Drop for ControlServer {
     }
 }
 
-fn accept_loop<F>(listener: UnixListener, shared: Arc<Shared>, dispatch: Arc<F>)
+fn accept_loop<F>(listener: UnixListener, wake: UnixStream, shared: Arc<Shared>, dispatch: Arc<F>)
 where
     F: Fn(ControlEvent) -> Result<(), ()> + Send + Sync + 'static,
 {
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
-    while let Ok((mut stream, _)) = listener.accept() {
+    while let Ok(Some(mut stream)) = accept_until_woken(&listener, &wake) {
         if shared.stopping.load(Ordering::Acquire) {
             break;
         }
@@ -421,6 +435,51 @@ where
     }
     for worker in workers {
         let _ = worker.join();
+    }
+}
+
+/// Block until a connection or shutdown, with no idle timeout or periodic wake.
+fn accept_until_woken(
+    listener: &UnixListener,
+    wake: &UnixStream,
+) -> io::Result<Option<UnixStream>> {
+    loop {
+        let mut descriptors = [
+            libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        ];
+        // SAFETY: descriptors contains two live descriptors and writable pollfd
+        // storage. A negative timeout blocks until a descriptor event or signal.
+        let status =
+            unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as libc::nfds_t, -1) };
+        if status < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if descriptors[1].revents != 0 {
+            return Ok(None);
+        }
+        if descriptors[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "control listener closed"));
+        }
+        if descriptors[0].revents & libc::POLLIN != 0 {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // macOS can inherit the listener's nonblocking flag.
+                    stream.set_nonblocking(false)?;
+                    return Ok(Some(stream));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -966,6 +1025,41 @@ mod tests {
         let socket = server.socket_path().to_owned();
         drop(server);
         assert!(!socket.exists());
+    }
+
+    fn assert_shutdown_after_endpoint_removal(remove_directory: bool) {
+        let directory = directory();
+        let server = server(directory.path());
+        // Exercise the listener before removal so this tests its idle wait too.
+        let response = request(server.socket_path(), &Request::new(None, Operation::Ping)).unwrap();
+        assert!(matches!(response.result, ResponseResult::Pong));
+        let cleanup_wake = server.wake.try_clone().unwrap();
+        if remove_directory {
+            fs::remove_dir_all(directory.path()).unwrap();
+        } else {
+            fs::remove_file(server.socket_path()).unwrap();
+        }
+        let (finished, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            drop(server);
+            let _ = finished.send(());
+        });
+        let completed = completion.recv_timeout(REQUEST_TIMEOUT).is_ok();
+        // Always wake and join before asserting: a missing wake in Drop must not
+        // leave a regression test's server thread alive after a timeout failure.
+        let _ = cleanup_wake.shutdown(std::net::Shutdown::Both);
+        worker.join().unwrap();
+        assert!(completed, "control shutdown blocked after its endpoint was removed");
+    }
+
+    #[test]
+    fn shutdown_survives_socket_unlink() {
+        assert_shutdown_after_endpoint_removal(false);
+    }
+
+    #[test]
+    fn shutdown_survives_runtime_directory_removal() {
+        assert_shutdown_after_endpoint_removal(true);
     }
 
     #[test]

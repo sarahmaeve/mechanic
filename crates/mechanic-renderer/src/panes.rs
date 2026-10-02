@@ -38,6 +38,176 @@ pub struct RenderPane<'a> {
     pub active: bool,
 }
 
+/// A visible resize divider occupying its complete gap between terminal panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderDivider {
+    pub rect: PaneRect,
+    /// True while the pointer hovers over or drags this divider.
+    pub highlighted: bool,
+}
+
+/// A pane's reserved drag-header bounds, in physical window pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderPaneHandle {
+    pub rect: PaneRect,
+    /// True while the pointer hovers over or drags this pane handle.
+    pub highlighted: bool,
+}
+
+/// One retained buffer for static pane dividers, drag grips and drop outlines.
+#[derive(Default)]
+pub(super) struct DividerState {
+    requested: Vec<RenderDivider>,
+    handles: Vec<RenderPaneHandle>,
+    drop_preview: Option<PaneRect>,
+    instances: Vec<GpuInstance>,
+    instance_buf: Option<wgpu::Buffer>,
+    capacity: usize,
+    colors: Option<(Rgb, Rgb)>,
+    dirty: bool,
+}
+
+impl DividerState {
+    fn set(&mut self, dividers: &[RenderDivider]) {
+        if self.requested == dividers {
+            return;
+        }
+        self.requested.clear();
+        self.requested.extend_from_slice(dividers);
+        self.dirty = true;
+    }
+
+    fn set_handles(&mut self, handles: &[RenderPaneHandle]) {
+        if self.handles == handles {
+            return;
+        }
+        self.handles.clear();
+        self.handles.extend_from_slice(handles);
+        self.dirty = true;
+    }
+
+    fn set_drop_preview(&mut self, preview: Option<PaneRect>) {
+        if self.drop_preview != preview {
+            self.drop_preview = preview;
+            self.dirty = true;
+        }
+    }
+
+    fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mut profile: Option<&mut RenderProfile>,
+    ) -> usize {
+        if !self.dirty {
+            if let Some(profile) = profile {
+                profile.instance_count += self.instances.len();
+            }
+            return 0;
+        }
+        let instances_started = profile.as_ref().map(|_| Instant::now());
+        let (idle, active) = self.colors.unwrap_or((Rgb::new(29, 81, 89), Rgb::new(173, 255, 255)));
+        self.instances.clear();
+        self.instances.extend(
+            self.requested
+                .iter()
+                .filter(|divider| divider.rect.width > 0 && divider.rect.height > 0)
+                .map(|divider| GpuInstance {
+                    bg_color: rgb_to_f32(if divider.highlighted { active } else { idle }),
+                    glyph_offset: [divider.rect.x as f32, divider.rect.y as f32],
+                    glyph_size: [divider.rect.width as f32, divider.rect.height as f32],
+                    use_atlas: CURSOR_USE_ATLAS,
+                    ..GpuInstance::zeroed()
+                }),
+        );
+        for handle in &self.handles {
+            if handle.rect.width > 0 && handle.rect.height > 0 {
+                self.instances.extend(handle_instances(
+                    *handle,
+                    if handle.highlighted { active } else { idle },
+                ));
+            }
+        }
+        if let Some(rect) = self.drop_preview
+            && rect.width > 0
+            && rect.height > 0
+        {
+            // The app reserves an 18-logical-pixel header; its physical height
+            // gives the preview the same scale as the grip without a new uniform.
+            let scale = self.handles.first().map_or(1.0, |handle| handle.rect.height as f32 / 18.0);
+            self.instances.extend(drop_preview_instances(rect, active, scale));
+        }
+        if let (Some(profile), Some(started)) = (profile.as_deref_mut(), instances_started) {
+            profile.instances_ns += started.elapsed().as_nanos();
+            profile.instance_count += self.instances.len();
+        }
+        let upload_started = profile.as_ref().map(|_| Instant::now());
+        let count = self.instances.len();
+        if count > self.capacity {
+            self.capacity = count.next_power_of_two().max(4);
+            self.instance_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pane_decoration_instances"),
+                size: (self.capacity * mem::size_of::<GpuInstance>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let bytes = bytemuck::cast_slice::<GpuInstance, u8>(&self.instances);
+        if !bytes.is_empty() {
+            queue.write_buffer(self.instance_buf.as_ref().unwrap(), 0, bytes);
+        }
+        self.dirty = false;
+        if let (Some(profile), Some(started)) = (profile, upload_started) {
+            profile.upload_ns += started.elapsed().as_nanos();
+            profile.upload_bytes += bytes.len();
+        }
+        bytes.len()
+    }
+}
+
+fn handle_instances(handle: RenderPaneHandle, color: Rgb) -> [GpuInstance; 3] {
+    let width = handle.rect.width as f32;
+    let height = handle.rect.height as f32;
+    let bar_width = (height * 0.5).min(width);
+    let bar_height = (height / 18.0).round().max(1.0).min(height / 6.0);
+    let x = handle.rect.x as f32 + (width - bar_width) * 0.5;
+    let y = handle.rect.y as f32 + (height - bar_height * 6.0) * 0.5;
+    std::array::from_fn(|index| GpuInstance {
+        bg_color: rgb_to_f32(color),
+        glyph_offset: [x, y + index as f32 * bar_height * 2.5],
+        glyph_size: [bar_width, bar_height],
+        use_atlas: CURSOR_USE_ATLAS,
+        ..GpuInstance::zeroed()
+    })
+}
+
+fn drop_preview_instances(rect: PaneRect, color: Rgb, scale: f32) -> [GpuInstance; 4] {
+    let width = rect.width as f32;
+    let height = rect.height as f32;
+    let thickness = (scale * 2.0).round().max(2.0).min(width * 0.5).min(height * 0.5);
+    let x = rect.x as f32;
+    let y = rect.y as f32;
+    let base = GpuInstance {
+        bg_color: rgb_to_f32(color),
+        use_atlas: CURSOR_USE_ATLAS,
+        ..GpuInstance::zeroed()
+    };
+    [
+        GpuInstance { glyph_offset: [x, y], glyph_size: [width, thickness], ..base },
+        GpuInstance {
+            glyph_offset: [x, y + height - thickness],
+            glyph_size: [width, thickness],
+            ..base
+        },
+        GpuInstance { glyph_offset: [x, y], glyph_size: [thickness, height], ..base },
+        GpuInstance {
+            glyph_offset: [x + width - thickness, y],
+            glyph_size: [thickness, height],
+            ..base
+        },
+    ]
+}
+
 /// Retain the actual shaped rows even if the shared text cache evicts them.
 /// Appearance and cursor updates do not change this key.
 #[derive(Default)]
@@ -318,6 +488,31 @@ fn border_instances(rect: PaneRect, color: Rgb) -> [GpuInstance; 4] {
 }
 
 impl RenderState {
+    pub fn set_pane_dividers(&mut self, dividers: &[RenderDivider]) {
+        self.dividers.set(dividers);
+    }
+
+    pub fn set_pane_handles(&mut self, handles: &[RenderPaneHandle]) {
+        self.dividers.set_handles(handles);
+    }
+
+    pub fn set_pane_drop_preview(&mut self, preview: Option<PaneRect>) {
+        self.dividers.set_drop_preview(preview);
+    }
+
+    pub fn set_divider_colors(&mut self, foreground: Rgb, background: Rgb, active: Rgb) {
+        let muted = |fg: u8, bg: u8| ((u16::from(fg) * 35 + u16::from(bg) * 65) / 100) as u8;
+        let idle = Rgb::new(
+            muted(foreground.r, background.r),
+            muted(foreground.g, background.g),
+            muted(foreground.b, background.b),
+        );
+        if self.dividers.colors != Some((idle, active)) {
+            self.dividers.colors = Some((idle, active));
+            self.dividers.dirty = true;
+        }
+    }
+
     pub fn set_pane_colors(&mut self, active: Rgb, inactive: Rgb) {
         self.pane_colors = (active, inactive);
     }
@@ -471,11 +666,14 @@ impl RenderState {
         if self.device_lost.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
+        self.dividers.update(&self.device, &self.queue, profile.as_deref_mut());
         let upload_started = profile.as_ref().map(|_| Instant::now());
         self.write_pane_uniforms(uniforms);
         if let (Some(profile), Some(started)) = (profile.as_deref_mut(), upload_started) {
             profile.upload_ns += started.elapsed().as_nanos();
-            profile.upload_bytes += self.pane_order.len() * mem::size_of::<Globals>();
+            profile.upload_bytes += (self.pane_order.len()
+                + usize::from(!self.dividers.instances.is_empty()))
+                * mem::size_of::<Globals>();
         }
         let surface_started = profile.as_ref().map(|_| Instant::now());
         let surface = self.acquire_surface_texture();
@@ -522,6 +720,10 @@ impl RenderState {
             let globals = self.pane_globals(pane.rect, uniforms);
             self.queue.write_buffer(&pane.globals_buf, 0, bytemuck::bytes_of(&globals));
         }
+        if !self.dividers.instances.is_empty() {
+            let globals = self.pane_globals(PaneRect::default(), uniforms);
+            self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+        }
     }
 
     fn draw_panes(
@@ -558,6 +760,15 @@ impl RenderState {
             pass.draw(0..6, 0..pane.cache.background_count);
             pass.set_pipeline(&self.foreground_pipeline);
             pass.draw(0..6, pane.cache.background_count..pane.instance_count + pane.border_count);
+        }
+        if let Some(buffer) = &self.dividers.instance_buf
+            && !self.dividers.instances.is_empty()
+        {
+            pass.set_scissor_rect(0, 0, self.size.0, self.size.1);
+            pass.set_pipeline(&self.foreground_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(0..6, 0..self.dividers.instances.len() as u32);
         }
     }
 }
@@ -596,5 +807,48 @@ mod tests {
         grid.wrapped[0] = false;
         grid.bidi_prefix = "عربي".into();
         assert!(!key.matches(&grid));
+    }
+
+    #[test]
+    fn unchanged_divider_input_preserves_geometry_cache() {
+        let mut state = DividerState::default();
+        let divider = RenderDivider {
+            rect: PaneRect { x: 20, y: 0, width: 12, height: 40 },
+            highlighted: false,
+        };
+        state.set(&[divider]);
+        assert!(state.dirty);
+        state.dirty = false;
+        state.set(&[divider]);
+        assert!(!state.dirty);
+        state.set(&[RenderDivider { highlighted: true, ..divider }]);
+        assert!(state.dirty);
+        state.dirty = false;
+        state.set(&[]);
+        assert!(state.dirty);
+        assert!(state.requested.is_empty());
+    }
+
+    #[test]
+    fn grip_and_preview_inputs_only_dirty_changed_decorations() {
+        let mut state = DividerState::default();
+        let handle = RenderPaneHandle {
+            rect: PaneRect { width: 100, height: 36, ..Default::default() },
+            highlighted: false,
+        };
+        state.set_handles(&[handle]);
+        assert!(state.dirty);
+        state.dirty = false;
+        state.set_handles(&[handle]);
+        state.set_drop_preview(None);
+        assert!(!state.dirty);
+        let preview = PaneRect { x: 10, y: 20, width: 40, height: 50 };
+        state.set_drop_preview(Some(preview));
+        assert!(state.dirty);
+        state.dirty = false;
+        state.set_drop_preview(Some(preview));
+        assert!(!state.dirty);
+        state.set_handles(&[RenderPaneHandle { highlighted: true, ..handle }]);
+        assert!(state.dirty);
     }
 }

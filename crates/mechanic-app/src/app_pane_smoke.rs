@@ -199,7 +199,8 @@ impl App {
             check(hit.start.column.0 == 0, "Find changed another pane's query")?;
         }
 
-        let right = self.windows[&window].layout.pane(second).ok_or("right rectangle missing")?;
+        let right =
+            self.windows[&window].pane_content_rect(second).ok_or("right rectangle missing")?;
         self.smoke_pointer(events, window, f64::from(right.x) + 10.0, f64::from(right.y) + 10.0);
         self.window_event(
             events,
@@ -252,6 +253,24 @@ impl App {
         let x = f64::from(divider.rect.x) + f64::from(divider.rect.width) / 2.0;
         let y = f64::from(divider.rect.y) + 10.0;
         self.smoke_pointer(events, window, x, y);
+        check(
+            self.windows[&window].pointer_cursor == Some(CursorIcon::ColResize)
+                && self.windows[&window].divider_hover == Some(divider.id),
+            "vertical divider has no resize cursor or hover highlight",
+        )?;
+        check(
+            divider.rect.width
+                == (6.0 * self.windows[&window].window.scale_factor()).round() as u32,
+            "divider hit area does not scale with display density",
+        )?;
+        check(self.windows[&window].content_dirty, "divider hover did not request a frame")?;
+        // Hidden surfaces can skip presentation; test the hover transition directly.
+        self.windows.get_mut(&window).unwrap().content_dirty = false;
+        self.smoke_pointer(events, window, x + 1.0, y);
+        check(
+            !self.windows[&window].content_dirty,
+            "unchanged divider hover triggered another frame",
+        )?;
         self.smoke_button(events, window, true);
         self.smoke_pointer(events, window, x + 40.0, y);
         self.smoke_button(events, window, false);
@@ -259,15 +278,93 @@ impl App {
             self.windows[&window].layout.pane(first).unwrap().width != old_first.width,
             "divider drag did not resize panes",
         )?;
+        let divider = self.windows[&window]
+            .layout
+            .dividers
+            .iter()
+            .find(|divider| divider.axis == Axis::Horizontal)
+            .copied()
+            .ok_or("horizontal divider absent")?;
+        let old_second = self.windows[&window].layout.pane(second).unwrap();
+        let x = f64::from(divider.rect.x) + 10.0;
+        let y = f64::from(divider.rect.y) + f64::from(divider.rect.height) / 2.0;
+        self.smoke_pointer(events, window, x, y);
+        check(
+            self.windows[&window].pointer_cursor == Some(CursorIcon::RowResize),
+            "horizontal divider has no resize cursor",
+        )?;
+        self.smoke_button(events, window, true);
+        self.smoke_pointer(events, window, x, y + 30.0);
+        self.smoke_button(events, window, false);
+        check(
+            self.windows[&window].layout.pane(second).unwrap().height != old_second.height,
+            "horizontal divider drag did not resize panes",
+        )?;
+        check(self.windows[&window].tree.active() == first, "divider drag stole pane focus")?;
+        let divider = self.windows[&window].layout.dividers[0];
+        let x = f64::from(divider.rect.x) + f64::from(divider.rect.width) / 2.0;
+        let y = f64::from(divider.rect.y + self.windows[&window].pane_header_height()) + 30.0;
+        self.smoke_pointer(events, window, x, y);
+        self.smoke_button(events, window, true);
+        self.smoke_pointer(events, window, 1.0, y);
+        self.smoke_button(events, window, false);
+        {
+            let state = self.windows.get_mut(&window).unwrap();
+            check(
+                state.divider_hover.is_none() && state.pointer_cursor == Some(CursorIcon::Text),
+                "clamped divider release kept the resize cursor",
+            )?;
+            check(
+                state.pane_state(first).unwrap().mouse_position
+                    == (1.0, y - f64::from(state.pane_content_rect(first).unwrap().y)),
+                "clamped drag release used stale pane-local pointer coordinates",
+            )?;
+            state.tree.drag_divider(divider.id, x, y, &state.layout);
+            state.resize_panes();
+        }
+        self.smoke_pointer(events, window, x + 40.0, y);
+        {
+            let state = self.windows.get_mut(&window).unwrap();
+            check(state.divider_hover.is_none(), "stationary-pointer fixture starts on divider")?;
+            state.tree.drag_divider(divider.id, x + 40.0, y, &state.layout);
+            state.resize_panes();
+            check(
+                state.divider_hover == Some(divider.id)
+                    && state.pointer_cursor == Some(CursorIcon::ColResize),
+                "layout change did not refresh a stationary pointer over a divider",
+            )?;
+        }
+        self.window_event(events, window, WindowEvent::CursorLeft { device_id: DeviceId::dummy() });
+        {
+            let state = self.windows.get_mut(&window).unwrap();
+            state.resize_panes();
+            check(
+                state.divider_hover.is_none(),
+                "layout change highlighted divider after pointer left",
+            )?;
+        }
+        let first_rect = self.windows[&window].pane_content_rect(first).unwrap();
+        self.smoke_pointer(
+            events,
+            window,
+            f64::from(first_rect.x) + 10.0,
+            f64::from(first_rect.y) + 10.0,
+        );
+        check(
+            self.windows[&window].divider_hover.is_none()
+                && self.windows[&window].pointer_cursor == Some(CursorIcon::Text),
+            "leaving divider retained highlight or resize cursor",
+        )?;
 
         {
             let state = self.windows.get_mut(&window).unwrap();
             App::apply_font_size(state, 17.0);
             for item in state.layout.panes.clone() {
                 state.load_pane(item.id);
+                let content = state.pane_content_rect(item.id).unwrap();
                 let expected = App::terminal_size_from_metrics(
-                    item.rect.width,
-                    item.rect.height,
+                    content.width,
+                    content.height,
                     &state.cell_metrics,
                 );
                 check(

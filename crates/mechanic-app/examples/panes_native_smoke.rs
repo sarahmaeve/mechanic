@@ -47,7 +47,11 @@ fn main() {
                 return;
             }
             self.app.resumed(events);
-            self.result = Some(self.app.smoke_exercise_panes(events, &self.directory));
+            self.result = Some(
+                self.app
+                    .smoke_exercise_panes(events, &self.directory)
+                    .and_then(|_| self.app.smoke_exercise_pane_drags(events)),
+            );
             events.exit();
         }
         fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
@@ -88,7 +92,7 @@ fn main() {
     events.run_app(&mut smoke).unwrap();
     match smoke.result {
         Some(Ok(())) => println!(
-            "native pane smoke passed: independent PTYs, inherited cwd, splits, pointer routing, selection/search isolation, divider drag, font resize, render preparation, close/collapse and stale wake"
+            "native pane smoke passed: independent PTYs, inherited cwd, splits, pointer routing, selection/search isolation, divider drag, pane rearrangement and detach gestures, font resize, render preparation, close/collapse and stale wake"
         ),
         result => {
             eprintln!("native pane smoke failed: {result:?}");

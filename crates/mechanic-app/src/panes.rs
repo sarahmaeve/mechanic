@@ -17,6 +17,27 @@ pub enum Axis {
     Horizontal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl DropEdge {
+    fn axis(self) -> Axis {
+        match self {
+            Self::Left | Self::Right => Axis::Vertical,
+            Self::Top | Self::Bottom => Axis::Horizontal,
+        }
+    }
+
+    fn new_pane_first(self) -> bool {
+        matches!(self, Self::Left | Self::Top)
+    }
+}
+
 /// Only geometry and focus are persisted; terminal contents are never captured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +193,7 @@ pub struct Layout {
     pub dividers: Vec<DividerRect>,
     minimum: Size,
     divider_px: u32,
+    bounds: Rect,
 }
 
 impl Layout {
@@ -194,9 +216,28 @@ impl Layout {
                     .map(|pane| Hit::Pane(pane.id))
             })
     }
+
+    /// Pick the closest edge in normalized pane coordinates. Divider and
+    /// out-of-window hits are never pane drop destinations.
+    pub fn drop_target(&self, x: f64, y: f64) -> Option<(PaneId, DropEdge)> {
+        let Hit::Pane(id) = self.hit_test(x, y)? else {
+            return None;
+        };
+        let rect = self.pane(id)?;
+        let horizontal = (x - f64::from(rect.x)) / f64::from(rect.width);
+        let vertical = (y - f64::from(rect.y)) / f64::from(rect.height);
+        let distances = [
+            (horizontal, DropEdge::Left),
+            (1.0 - horizontal, DropEdge::Right),
+            (vertical, DropEdge::Top),
+            (1.0 - vertical, DropEdge::Bottom),
+        ];
+        let (_, edge) = distances.into_iter().min_by(|a, b| a.0.total_cmp(&b.0))?;
+        Some((id, edge))
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Node {
     Leaf(PaneId),
     Split { id: SplitId, axis: Axis, ratio: f64, first: Box<Node>, second: Box<Node> },
@@ -221,21 +262,35 @@ impl Node {
     }
 
     fn split(&mut self, target: PaneId, new: PaneId, split_id: SplitId, axis: Axis) -> bool {
+        let edge = match axis {
+            Axis::Vertical => DropEdge::Right,
+            Axis::Horizontal => DropEdge::Bottom,
+        };
+        self.insert_at(target, new, split_id, edge)
+    }
+
+    fn insert_at(
+        &mut self,
+        target: PaneId,
+        new: PaneId,
+        split_id: SplitId,
+        edge: DropEdge,
+    ) -> bool {
         match self {
             Self::Leaf(id) if *id == target => {
                 *self = Self::Split {
                     id: split_id,
-                    axis,
+                    axis: edge.axis(),
                     ratio: 0.5,
-                    first: Box::new(Self::Leaf(target)),
-                    second: Box::new(Self::Leaf(new)),
+                    first: Box::new(Self::Leaf(if edge.new_pane_first() { new } else { target })),
+                    second: Box::new(Self::Leaf(if edge.new_pane_first() { target } else { new })),
                 };
                 true
             }
             Self::Leaf(_) => false,
             Self::Split { first, second, .. } => {
-                first.split(target, new, split_id, axis)
-                    || second.split(target, new, split_id, axis)
+                first.insert_at(target, new, split_id, edge)
+                    || second.insert_at(target, new, split_id, edge)
             }
         }
     }
@@ -355,7 +410,20 @@ fn constrained_extent(available: u32, ratio: f64, first_min: u32, second_min: u3
     }
 }
 
-#[derive(Debug)]
+fn rect_can_split(rect: Rect, axis: Axis, minimum: Size, divider_px: u32) -> bool {
+    match axis {
+        Axis::Vertical => {
+            u64::from(rect.width) >= 2 * u64::from(minimum.width.max(1)) + u64::from(divider_px)
+                && rect.height >= minimum.height.max(1)
+        }
+        Axis::Horizontal => {
+            u64::from(rect.height) >= 2 * u64::from(minimum.height.max(1)) + u64::from(divider_px)
+                && rect.width >= minimum.width.max(1)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PaneTree {
     root: Node,
     active: PaneId,
@@ -450,19 +518,58 @@ impl PaneTree {
             return false;
         }
         let Some(rect) = layout.pane(self.active) else { return false };
-        let minimum = layout.minimum;
-        match axis {
-            Axis::Vertical => {
-                u64::from(rect.width)
-                    >= 2 * u64::from(minimum.width.max(1)) + u64::from(layout.divider_px)
-                    && rect.height >= minimum.height.max(1)
-            }
-            Axis::Horizontal => {
-                u64::from(rect.height)
-                    >= 2 * u64::from(minimum.height.max(1)) + u64::from(layout.divider_px)
-                    && rect.width >= minimum.width.max(1)
-            }
+        rect_can_split(rect, axis, layout.minimum, layout.divider_px)
+    }
+
+    /// Remove the source leaf, collapse its parent, then split the target at
+    /// the requested edge. Pane IDs, focus, and unrelated split ratios survive.
+    /// Require a valid `move_preview` first to enforce physical cell minima.
+    pub fn move_pane(&mut self, source: PaneId, target: PaneId, edge: DropEdge) -> bool {
+        let Some(candidate) = self.move_candidate(source, target, edge) else {
+            return false;
+        };
+        *self = candidate;
+        true
+    }
+
+    /// Exact receiving rectangle after the source parent collapses. Return
+    /// no preview when any pane in the result would fall below the cell minima.
+    pub fn move_preview(
+        &self,
+        source: PaneId,
+        target: PaneId,
+        edge: DropEdge,
+        layout: &Layout,
+    ) -> Option<Rect> {
+        let candidate = self.move_candidate(source, target, edge)?;
+        candidate.fitting_layout(layout)?.pane(source)
+    }
+
+    fn move_candidate(&self, source: PaneId, target: PaneId, edge: DropEdge) -> Option<Self> {
+        let ids = self.pane_ids();
+        if source == target || !ids.contains(&source) || !ids.contains(&target) {
+            return None;
         }
+        let split_id = self.next_split_id?;
+        let mut candidate = self.clone();
+        candidate.root = candidate.root.remove(source)?;
+        if !candidate.root.insert_at(target, source, split_id, edge) {
+            return None;
+        }
+        candidate.next_split_id = split_id.checked_add(1);
+        Some(candidate)
+    }
+
+    fn fitting_layout(&self, layout: &Layout) -> Option<Layout> {
+        let candidate = self.layout(layout.bounds, layout.minimum, layout.divider_px);
+        candidate
+            .panes
+            .iter()
+            .all(|pane| {
+                pane.rect.width >= layout.minimum.width.max(1)
+                    && pane.rect.height >= layout.minimum.height.max(1)
+            })
+            .then_some(candidate)
     }
 
     /// Remove a leaf and collapse its parent into the surviving sibling.
@@ -567,6 +674,7 @@ impl PaneTree {
             dividers: Vec::with_capacity(count.saturating_sub(1)),
             minimum,
             divider_px,
+            bounds,
         };
         self.root.layout(bounds, &mut layout);
         layout
@@ -616,6 +724,177 @@ mod tests {
         tree.focus(0);
         tree.split_active(Axis::Horizontal);
         tree
+    }
+
+    #[test]
+    fn moving_three_columns_creates_one_large_pane_and_two_stacked_panes() {
+        let mut tree = PaneTree::new(0);
+        let middle = tree.split_active(Axis::Vertical).unwrap();
+        let right = tree.split_active(Axis::Vertical).unwrap();
+        let before = tree.layout(bounds(203, 163), MINIMUM, 3);
+        let preview = tree.move_preview(right, middle, DropEdge::Bottom, &before).unwrap();
+        assert!(tree.move_pane(right, middle, DropEdge::Bottom));
+        assert_eq!(tree.pane_ids(), [0, middle, right]);
+        assert_eq!(tree.active(), right);
+        let after = tree.layout(bounds(203, 163), MINIMUM, 3);
+        assert_eq!(after.pane(right), Some(preview));
+        let large = after.pane(0).unwrap();
+        let top = after.pane(middle).unwrap();
+        let bottom = after.pane(right).unwrap();
+        assert_eq!(large.height, 163);
+        assert_eq!(top.x, bottom.x);
+        assert_eq!(top.width, bottom.width);
+        assert_eq!(top.y + top.height + 3, bottom.y);
+        assert_eq!(top.height + bottom.height + 3, large.height);
+    }
+
+    #[test]
+    fn nested_move_permutations_preserve_pane_ids_focus_and_preview_geometry() {
+        let original = grid();
+        let ids = original.pane_ids();
+        for &source in &ids {
+            for &target in &ids {
+                if source == target {
+                    continue;
+                }
+                for edge in [DropEdge::Left, DropEdge::Right, DropEdge::Top, DropEdge::Bottom] {
+                    for &focused in &ids {
+                        let mut tree = original.clone();
+                        tree.focus(focused);
+                        let before = tree.layout(bounds(401, 301), MINIMUM, 3);
+                        let preview = tree.move_preview(source, target, edge, &before).unwrap();
+                        assert!(tree.move_pane(source, target, edge));
+                        assert_eq!(tree.active(), focused);
+                        let mut actual_ids = tree.pane_ids();
+                        actual_ids.sort_unstable();
+                        let mut expected_ids = ids.clone();
+                        expected_ids.sort_unstable();
+                        assert_eq!(actual_ids, expected_ids);
+                        assert!(tree.snapshot().validate().is_ok());
+                        let layout = tree.layout(bounds(401, 301), MINIMUM, 3);
+                        assert_eq!(layout.pane(source), Some(preview));
+                        let moved = layout.pane(source).unwrap();
+                        let target = layout.pane(target).unwrap();
+                        match edge {
+                            DropEdge::Left => assert_eq!(moved.x + moved.width + 3, target.x),
+                            DropEdge::Right => assert_eq!(target.x + target.width + 3, moved.x),
+                            DropEdge::Top => assert_eq!(moved.y + moved.height + 3, target.y),
+                            DropEdge::Bottom => assert_eq!(target.y + target.height + 3, moved.y),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moving_preserves_unaffected_branch_structure_and_ancestor_ratios() {
+        let mut tree = grid();
+        tree.root.set_ratio(1, 0.3);
+        tree.root.set_ratio(2, 0.7);
+        tree.root.set_ratio(3, 0.6);
+        tree.focus(2);
+        let before = tree.snapshot();
+        assert!(tree.move_pane(0, 3, DropEdge::Top));
+        let after = tree.snapshot();
+        match (before.root, after.root) {
+            (
+                PaneNodeSnapshot::Split { id: old_id, ratio: old_ratio, second: old_right, .. },
+                PaneNodeSnapshot::Split { id, ratio, second: right, .. },
+            ) => {
+                assert_eq!(id, old_id);
+                assert_eq!(ratio, old_ratio);
+                assert_eq!(right, old_right);
+            }
+            _ => panic!("outer split must survive the branch-local move"),
+        }
+        assert_eq!(tree.active(), 2);
+    }
+
+    #[test]
+    fn drop_hit_edges_are_normalized_and_dividers_are_not_destinations() {
+        let mut tree = PaneTree::new(0);
+        let other = tree.split_active(Axis::Vertical).unwrap();
+        let layout = tree.layout(bounds(203, 83), MINIMUM, 3);
+        let rect = layout.pane(other).unwrap();
+        let cx = f64::from(rect.x) + f64::from(rect.width) / 2.0;
+        let cy = f64::from(rect.y) + f64::from(rect.height) / 2.0;
+        for (x, y, edge) in [
+            (f64::from(rect.x) + 1.0, cy, DropEdge::Left),
+            (f64::from(rect.x + rect.width) - 1.0, cy, DropEdge::Right),
+            (cx, f64::from(rect.y) + 1.0, DropEdge::Top),
+            (cx, f64::from(rect.y + rect.height) - 1.0, DropEdge::Bottom),
+        ] {
+            assert_eq!(layout.drop_target(x, y), Some((other, edge)));
+        }
+        let divider = layout.dividers[0].rect;
+        assert_eq!(layout.drop_target(f64::from(divider.x), cy), None);
+        for (x, y) in [(f64::NAN, cy), (cx, f64::INFINITY), (6.0, cy), (cx, 94.0)] {
+            assert_eq!(layout.drop_target(x, y), None);
+        }
+    }
+
+    #[test]
+    fn move_minima_use_the_final_collapsed_geometry_and_reject_unusable_shapes() {
+        let mut tree = PaneTree::new(0);
+        let other = tree.split_active(Axis::Vertical).unwrap();
+        let layout = tree.layout(bounds(23, 19), MINIMUM, 3);
+        assert!(!rect_can_split(layout.pane(other).unwrap(), Axis::Vertical, MINIMUM, 3));
+        assert_eq!(tree.move_preview(0, other, DropEdge::Left, &layout), layout.pane(0));
+        let tiny = tree.layout(bounds(23, 8), MINIMUM, 3);
+        let before = tree.snapshot();
+        assert!(tree.move_preview(0, other, DropEdge::Top, &tiny).is_none());
+        assert_eq!(tree.snapshot(), before);
+    }
+
+    #[test]
+    fn invalid_and_exhausted_moves_leave_tree_and_counters_intact() {
+        let mut tree = grid();
+        let original = tree.snapshot();
+        let original_pane_counter = tree.next_pane_id;
+        let original_split_counter = tree.next_split_id;
+        for (source, target) in [(0, 0), (99, 0), (0, 99)] {
+            assert!(!tree.move_pane(source, target, DropEdge::Top));
+            assert_eq!(tree.snapshot(), original);
+            assert_eq!(tree.next_pane_id, original_pane_counter);
+            assert_eq!(tree.next_split_id, original_split_counter);
+        }
+        tree.next_split_id = None;
+        assert!(!tree.move_pane(0, 1, DropEdge::Left));
+        assert_eq!(tree.snapshot(), original);
+        assert_eq!(tree.next_split_id, None);
+        tree.next_split_id = original_split_counter;
+        tree.next_pane_id = None;
+        // Rearrangement consumes no pane ID, so existing panes remain movable.
+        assert!(tree.move_pane(0, 1, DropEdge::Left));
+        assert_eq!(tree.next_pane_id, None);
+    }
+
+    #[test]
+    fn moves_allocate_unique_splits_without_consuming_pane_ids_even_at_the_limit() {
+        let mut tree = grid();
+        assert!(tree.move_pane(0, 2, DropEdge::Left));
+        assert_eq!(tree.next_pane_id, Some(4));
+        assert_eq!(tree.next_split_id, Some(5));
+        tree.focus(0);
+        let inserted = tree.split_active(Axis::Vertical).unwrap();
+        assert_eq!(inserted, 4);
+        assert_eq!(tree.next_split_id, Some(6));
+        assert!(tree.close(inserted));
+        assert!(tree.move_pane(0, 1, DropEdge::Top));
+        assert_eq!(tree.next_pane_id, Some(5));
+        assert_eq!(tree.next_split_id, Some(7));
+        assert!(tree.snapshot().validate().is_ok());
+        for _ in tree.len()..MAX_PANES {
+            assert!(tree.split_active(Axis::Vertical).is_some());
+        }
+        let full = tree.snapshot();
+        let counters = (tree.next_pane_id, tree.next_split_id);
+        assert_eq!(tree.split_active(Axis::Vertical), None);
+        assert_eq!(tree.snapshot(), full);
+        assert_eq!((tree.next_pane_id, tree.next_split_id), counters);
+        assert!(tree.move_pane(0, 1, DropEdge::Bottom));
+        assert_eq!(tree.len(), MAX_PANES);
     }
 
     #[test]
@@ -937,6 +1216,65 @@ mod tests {
         }
         assert_eq!(tree.pane_ids(), [0]);
         assert_eq!(tree.layout(bounds(200, 200), MINIMUM, 3).pane(0), Some(bounds(200, 200)));
+    }
+
+    /// Candidate generation, minimum-size validation, and transactional commit
+    /// for a balanced 16-pane layout. Alternating sibling edges keeps the same
+    /// balanced geometry; all correctness checks stay outside the timed loop.
+    #[test]
+    #[ignore = "opt-in release benchmark; run panes::tests::move_preview_commit_benchmark --release --ignored --nocapture"]
+    fn move_preview_commit_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        assert!(!black_box(cfg!(debug_assertions)), "use --release for the pane benchmark");
+        let mut fixture = PaneTree::new(0);
+        for axis in [Axis::Vertical, Axis::Horizontal, Axis::Vertical, Axis::Horizontal] {
+            for id in fixture.pane_ids() {
+                fixture.focus(id);
+                assert!(fixture.split_active(axis).is_some());
+            }
+        }
+        fixture.focus(0);
+        assert_eq!(fixture.len(), MAX_PANES);
+        let ids = fixture.pane_ids();
+        let layout = fixture.layout(bounds(1920, 1080), MINIMUM, 3);
+        assert!(
+            layout
+                .panes
+                .iter()
+                .all(|pane| pane.rect.width >= MINIMUM.width && pane.rect.height >= MINIMUM.height)
+        );
+        let mut samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let mut tree = fixture.clone();
+            let mut commits = 0;
+            let start = Instant::now();
+            for index in 0..10_000 {
+                let pair = (index / 2) % (MAX_PANES / 2);
+                let target = ids[2 * pair];
+                let source = ids[2 * pair + 1];
+                let edge = if index % 2 == 0 { DropEdge::Top } else { DropEdge::Bottom };
+                let preview =
+                    black_box(&tree).move_preview(source, target, edge, black_box(&layout));
+                let committed =
+                    preview.is_some() && black_box(&mut tree).move_pane(source, target, edge);
+                commits += usize::from(black_box(committed));
+                black_box(preview);
+            }
+            let elapsed = start.elapsed();
+            assert_eq!(commits, 10_000);
+            assert_eq!(tree.pane_ids(), ids);
+            assert_eq!(tree.active(), fixture.active());
+            assert!(tree.snapshot().validate().is_ok());
+            assert_eq!(tree.layout(bounds(1920, 1080), MINIMUM, 3).panes, layout.panes);
+            samples.push(elapsed.as_nanos() / 10_000);
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "pane move benchmark: {MAX_PANES} balanced panes, candidate preview + commit; median {} ns/operation ({}..{}), 5 samples of 10,000",
+            samples[2], samples[0], samples[4]
+        );
     }
 
     /// Explicit opt-in only. Run with an optimized test binary and an otherwise

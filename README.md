@@ -86,11 +86,19 @@ Return to refresh. Search does not continually rescan streaming output.
 
 Cmd+N opens a window. Cmd+D splits side by side; Cmd+Shift+D stacks panes.
 Click a pane to focus it, use Cmd+[/] to cycle, or Cmd+Option+arrow to move focus
-by direction. Drag a divider to resize. Cmd+W closes the active pane (or its
+by direction. Drag the visible divider to resize; it brightens and shows a resize
+cursor on hover. Cmd+W closes the active pane (or its
 window when it is the last pane); Cmd+Shift+W closes the window. Up to 16 panes
 share one renderer per window, with independent shells, scrollback, selections
 and Find queries. Scrolling targets the hovered pane; keyboard input targets
 the focused pane. Font-size changes apply to all panes in the window.
+
+Drag the small grip above a pane onto another pane's left, right, top, or bottom
+edge in the same window to rearrange them. The outline previews the resulting
+pane bounds. Release outside the window to detach the pane into its own window;
+its running shell, scrollback, and local-control session handle survive the move.
+Escape cancels a drag. Text below the grip retains normal selection and TUI mouse
+behavior.
 
 Mechanic saves window sizes/positions, pane layouts, active panes, font sizes,
 and reported local directories. Relaunching starts fresh configured shells;

@@ -5,6 +5,23 @@ transfer that previously deadlocked. Output batching also improves most tested
 GUI workloads. These are initial observations from one machine, not stable
 cross-terminal rankings.
 
+## Pane rearrangement and detachment — 2026-10-02
+
+A balanced 16-pane preview-and-move benchmark measured **2.27 µs per operation**
+(five batches of 10,000; range 2.06–3.08 µs). It includes candidate geometry
+validation and tree mutation; rendering, PTY reflow, and window creation are
+excluded. Identical divider/grip/preview state uploads zero geometry bytes.
+Hover and preview changes retain the terminal shaping and geometry caches.
+
+All 543 workspace tests passed, plus native gesture/live-detach checks and
+Metal divider/grip/preview checks. Tests verify the large-left/two-stacked-right
+layout, preview agreement, mouse capture, cancellation, live shell/history
+preservation, and stable control handles/completion waiters after the source
+window closes. Clippy, formatting, and the release build pass.
+
+Both GUI idle CPU samples lost focus during measurement and are excluded;
+no CPU change is claimed. [Raw results and reproduction](baselines/2026-10-02/pane-drag/README.md).
+
 ## Session restoration and local control — 2026-10-02
 
 Restoration writes layout/directory snapshots through a coalescing worker.

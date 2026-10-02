@@ -1,0 +1,67 @@
+{
+  "schema_version": 3,
+  "status": "inconclusive",
+  "error": "focus changed during sampling; keep the launched window's focus stable and rerun",
+  "app_binary": "/Users/sarah.murphy/git/mechanic/target/release/mechanic",
+  "app_binary_bytes": 15064256,
+  "app_binary_modified_unix_seconds": 1790973964,
+  "label": "pane-drag-final",
+  "benchmark_version": "0.1.0",
+  "benchmark_debug_assertions": false,
+  "mode": "idle",
+  "settle_seconds": 3,
+  "requested_sample_seconds": 8,
+  "pid": 10818,
+  "cpu_start": {
+    "user_mach_ticks": 2500980,
+    "system_mach_ticks": 1655728,
+    "user_ns": 104207500,
+    "system_ns": 68988666
+  },
+  "cpu_end": {
+    "user_mach_ticks": 3820329,
+    "system_mach_ticks": 2338657,
+    "user_ns": 159180375,
+    "system_ns": 97444041
+  },
+  "cpu_timebase": {
+    "numerator": 125,
+    "denominator": 3
+  },
+  "cpu_delta_mach_ticks": 2002278,
+  "cpu_delta_ns": 83428250,
+  "elapsed_seconds": 8.00021025,
+  "cpu_percent_one_core": 1.0428257182365925,
+  "focused_at_start": true,
+  "focus_events_during_sample": [
+    false
+  ],
+  "render_profile_enabled": false,
+  "render_frames": [],
+  "render_profile_scope": "Raw complete full-content frames during sampling. Stage timings measure host CPU/wall work only; upload_ns measures host writes/resizing, atlas_changed denotes atlas generation/bind-group change, and presented indicates host present issued. No GPU completion timing. Calculate stage distributions from these records.",
+  "settings": {
+    "actual_terminal_columns": null,
+    "actual_terminal_rows": null,
+    "actual_window_dimensions": "not measured; keep window unchanged",
+    "animation": "off",
+    "app_build_revision": "not inferred; use --label to identify the build",
+    "arabic_paragraph_original_fixture": null,
+    "atlas_fixture": null,
+    "fixture_cursor": null,
+    "font_family": "Menlo",
+    "font_size_points": 14,
+    "logo": "triangle",
+    "logo_size_physical_pixels": 180,
+    "opacity": 1.0,
+    "pty_peer": "controlled Rust peer",
+    "requested_default_window_logical_height": 768,
+    "requested_default_window_logical_width": 1024,
+    "session_and_control_enabled": true,
+    "unicode_samples": null,
+    "workload": "idle",
+    "workload_alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    "workload_update_interval_ms": null
+  },
+  "scope": "App process user + system CPU only; 100% is one CPU core. Excludes PTY peer, WindowServer, GPU usage and energy. Compare identical hardware, display, window size and app build profile.",
+  "app_stderr": "[2026-10-02T20:46:42Z INFO  mechanic::app] spawned window WindowId(49502093952) (total: 1)\n[2026-10-02T20:46:42Z DEBUG mechanic::app] window WindowId(49502093952) focused: false\n[2026-10-02T20:46:42Z DEBUG mechanic::app] window WindowId(49502093952) focused: true\n[2026-10-02T20:46:48Z DEBUG mechanic::app] window WindowId(49502093952) focused: false\n"
+}

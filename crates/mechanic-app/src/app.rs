@@ -8,7 +8,9 @@ use mechanic_config::Config;
 use mechanic_core::{
     GridColumn, GridLine, GridPoint, GridSide, MouseProtocol, PtyWaker, Terminal, TerminalSize,
 };
-use mechanic_renderer::{CellMetrics, FrameUniforms, RenderGrid, RenderPane, Renderer};
+use mechanic_renderer::{
+    CellMetrics, FrameUniforms, RenderDivider, RenderGrid, RenderPane, RenderPaneHandle, Renderer,
+};
 
 use crate::notifications::{CompletionNotification, CompletionScope, NotificationPolicy};
 use crate::notifications_platform::NativeNotifications;
@@ -25,6 +27,10 @@ use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 #[path = "app_control.rs"]
 mod app_control;
+#[path = "app_pane_drag.rs"]
+mod app_pane_drag;
+#[path = "app_pane_move.rs"]
+mod app_pane_move;
 #[path = "app_session.rs"]
 mod app_session;
 
@@ -115,8 +121,11 @@ struct AppState {
     tree: PaneTree,
     layout: Layout,
     divider_drag: Option<u64>,
+    divider_hover: Option<u64>,
+    pane_drag_visual: app_pane_drag::PaneDragVisual,
     captured_pane: Option<PaneId>,
     pointer_position: (f64, f64),
+    pointer_inside: bool,
     pointer_cursor: Option<CursorIcon>,
     hovered_preview: Option<String>,
     modifiers: ModifiersState,
@@ -194,7 +203,8 @@ impl AppState {
     fn minimum_pane_size(&self) -> Size {
         Size {
             width: (self.cell_metrics.cell_width * 8.0).ceil().max(1.0) as u32,
-            height: (self.cell_metrics.cell_height * 3.0).ceil().max(1.0) as u32,
+            height: (self.cell_metrics.cell_height * 3.0).ceil().max(1.0) as u32
+                + self.pane_header_height(),
         }
     }
 
@@ -203,23 +213,25 @@ impl AppState {
         self.layout = self.tree.layout(
             Rect { x: 0, y: 0, width: size.width, height: size.height },
             self.minimum_pane_size(),
-            4,
+            (6.0 * self.window.scale_factor()).round().max(1.0) as u32,
         );
         let active = self.tree.active();
         for item in self.layout.panes.clone() {
             self.load_pane(item.id);
+            let content = self.pane_content_rect(item.id).unwrap();
             self.pane.link_press.cancel();
             self.pane.scroll_accumulator.reset();
             self.pane.last_mouse_report = None;
             self.pane.terminal.resize(App::terminal_size_from_metrics(
-                item.rect.width,
-                item.rect.height,
+                content.width,
+                content.height,
                 &self.cell_metrics,
             ));
             self.invalidate_search();
             self.mark_content_dirty();
         }
         self.load_pane(active);
+        self.refresh_pointer_hover();
     }
 
     fn invalidate_search(&mut self) {
@@ -299,7 +311,74 @@ impl AppState {
         crate::hyperlinks::at(&self.pane.terminal, logical_col, row)
     }
 
+    fn set_divider_hover(&mut self, divider: Option<u64>) {
+        if self.divider_hover != divider {
+            self.divider_hover = divider;
+            self.content_dirty = true;
+            self.request_redraw();
+        }
+    }
+
+    fn refresh_pointer_hover(&mut self) {
+        if self.refresh_pane_handle_hover() {
+            return;
+        }
+        let hit = self
+            .pointer_inside
+            .then(|| {
+                self.captured_pane.map(Hit::Pane).or_else(|| {
+                    self.layout.hit_test(self.pointer_position.0, self.pointer_position.1)
+                })
+            })
+            .flatten();
+        self.set_divider_hover(match hit {
+            Some(Hit::Divider(id)) => Some(id),
+            _ => None,
+        });
+        if let Some(Hit::Pane(id)) = hit {
+            let loaded = self.loaded_pane;
+            self.load_pane(id);
+            if let Some(rect) = self.pane_content_rect(id) {
+                self.pane.mouse_position = pane_local_position(rect, self.pointer_position);
+                self.pane.pointer_inside = true;
+            }
+            self.refresh_link_hover();
+            self.load_pane(loaded);
+        } else if self.divider_hover.is_some() || self.divider_drag.is_some() {
+            self.refresh_link_hover();
+        } else {
+            if self.hovered_preview.take().is_some() {
+                let _ = crate::link_platform::set_hover(&self.window, None);
+            }
+            if self.pointer_cursor != Some(CursorIcon::Text) {
+                self.window.set_cursor(CursorIcon::Text);
+                self.pointer_cursor = Some(CursorIcon::Text);
+            }
+        }
+    }
+
     fn refresh_link_hover(&mut self) {
+        if self.refresh_pane_handle_cursor() {
+            return;
+        }
+        if let Some(divider) = self
+            .divider_drag
+            .or(self.divider_hover)
+            .and_then(|id| self.layout.dividers.iter().find(|divider| divider.id == id))
+        {
+            let icon = match divider.axis {
+                Axis::Vertical => CursorIcon::ColResize,
+                Axis::Horizontal => CursorIcon::RowResize,
+            };
+            if self.pointer_cursor != Some(icon) {
+                self.window.set_cursor(icon);
+                self.pointer_cursor = Some(icon);
+            }
+            if self.hovered_preview.take().is_some() {
+                let _ = crate::link_platform::set_hover(&self.window, None);
+            }
+            return;
+        }
         let target = self.link_under_pointer();
         let unchanged = match (&self.pane.hovered_link, &target) {
             (Some(current), Some(target)) => current.matches(target),
@@ -347,12 +426,15 @@ pub struct App {
     /// Allows forwarding mouse events when the terminal program requests them.
     mouse_tracking: bool,
     pending_parsers: ParseQueue<(WindowId, PaneId, u64)>,
+    session_routes: HashMap<u64, app_pane_move::SessionRoute>,
     notification_policy: NotificationPolicy,
     native_notifications: NativeNotifications,
     /// Never reuse a PTY identity even when the platform reuses a WindowId.
     next_session: u64,
     session_service: app_session::SessionService,
     control_service: app_control::ControlService,
+    pane_drag: Option<app_pane_drag::PaneDrag>,
+    pane_header_buttons: Vec<MouseButton>,
     #[cfg(test)]
     pub(crate) hidden_windows: bool,
 }
@@ -378,11 +460,14 @@ impl App {
             animations,
             mouse_tracking,
             pending_parsers: ParseQueue::new(),
+            session_routes: HashMap::new(),
             notification_policy,
             native_notifications,
             next_session: 1,
             session_service: app_session::SessionService::default(),
             control_service: app_control::ControlService::default(),
+            pane_drag: None,
+            pane_header_buttons: Vec::new(),
             #[cfg(test)]
             hidden_windows: false,
         }
@@ -420,6 +505,7 @@ impl App {
                     state.other_panes[&pane].session
                 };
                 self.pending_parsers.remove(&(id, pane, session));
+                self.session_routes.remove(&session);
                 self.control_service.retire(session, crate::control::ErrorCode::Closed);
             }
         }
@@ -620,34 +706,10 @@ impl App {
             attrs = attrs.with_position(PhysicalPosition::new(offset, offset));
         }
 
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
-                log::error!("failed to create window: {e}");
-                return None;
-            }
-        };
-
+        let resources = self.create_window_resources(event_loop, attrs, font_size)?;
+        let window = &resources.window;
         let size = window.inner_size();
-        let scale_factor = window.scale_factor() as f32;
-
-        let mut font = self.config.font.clone();
-        font.size = font_size;
-        let renderer = match pollster::block_on(Renderer::new(
-            window.clone(),
-            (size.width, size.height),
-            scale_factor,
-            &self.config.theme,
-            font,
-        )) {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("failed to create renderer: {e}");
-                return None;
-            }
-        };
-
-        let cell_metrics = renderer.cell_metrics();
+        let cell_metrics = resources.renderer.cell_metrics();
         let terminal_size =
             Self::terminal_size_from_metrics(size.width, size.height, &cell_metrics);
 
@@ -709,13 +771,40 @@ impl App {
             }
         }
 
+        let mut state = self.state_for_window(resources, pane_id, pane, tree, other_panes);
+        state.resize_panes();
+        state.request_redraw();
+        for pane_id in state.tree.pane_ids() {
+            let session = state.pane_state(pane_id)?.session;
+            self.session_routes
+                .insert(session, app_pane_move::SessionRoute::new(window_id, pane_id));
+            self.pending_parsers.enqueue((window_id, pane_id, session));
+        }
+        self.windows.insert(window_id, state);
+        self.note_session_change();
+
+        log::info!("spawned window {window_id:?} (total: {})", self.windows.len());
+        Some(window_id)
+    }
+
+    fn state_for_window(
+        &self,
+        resources: app_pane_move::WindowResources,
+        pane_id: PaneId,
+        pane: PaneState,
+        tree: PaneTree,
+        other_panes: HashMap<PaneId, PaneState>,
+    ) -> AppState {
+        let app_pane_move::WindowResources { window, renderer, font_size } = resources;
+        let size = window.inner_size();
+        let cell_metrics = renderer.cell_metrics();
         let clipboard =
             arboard::Clipboard::new().map_err(|e| log::warn!("clipboard unavailable: {e}")).ok();
 
         window.set_ime_allowed(true);
 
         let now = std::time::Instant::now();
-        let mut state = AppState {
+        AppState {
             window: window.clone(),
             window_title: "Mechanic".into(),
             renderer,
@@ -729,8 +818,11 @@ impl App {
                 4,
             ),
             divider_drag: None,
+            divider_hover: None,
+            pane_drag_visual: Default::default(),
             captured_pane: None,
             pointer_position: (0.0, 0.0),
+            pointer_inside: false,
             pane,
             pointer_cursor: None,
             hovered_preview: None,
@@ -745,19 +837,7 @@ impl App {
             focus_gain_at: self.animations.logo.then_some(now),
             bloom_start: None,
             frame_pacer: FramePacer::new(now),
-        };
-
-        state.resize_panes();
-        state.request_redraw();
-        for pane_id in state.tree.pane_ids() {
-            let session = state.pane_state(pane_id)?.session;
-            self.pending_parsers.enqueue((window_id, pane_id, session));
         }
-        self.windows.insert(window_id, state);
-        self.note_session_change();
-
-        log::info!("spawned window {window_id:?} (total: {})", self.windows.len());
-        Some(window_id)
     }
 
     fn split_pane(&mut self, id: WindowId, axis: Axis) -> Option<PaneId> {
@@ -793,6 +873,7 @@ impl App {
         state.resize_panes();
         state.request_redraw();
         self.pending_parsers.enqueue((id, pane_id, session));
+        self.session_routes.insert(session, app_pane_move::SessionRoute::new(id, pane_id));
         self.note_session_change();
         Some(pane_id)
     }
@@ -823,6 +904,7 @@ impl App {
         state.load_pane(state.tree.active());
         state.other_panes.remove(&pane_id);
         self.pending_parsers.remove(&(id, pane_id, session));
+        self.session_routes.remove(&session);
         self.control_service.retire(session, crate::control::ErrorCode::Closed);
         state.resize_panes();
         state.request_redraw();
@@ -1001,6 +1083,7 @@ impl App {
                 } else {
                     state.captured_pane = None;
                     state.divider_drag = None;
+                    state.set_divider_hover(None);
                     // Cancel pending bloom; let an already committed animation finish.
                     state.focus_gain_at = None;
                 }
@@ -1065,6 +1148,9 @@ impl App {
                         let waker = make_waker_for(&self.proxy, id, pane_id, session);
                         respawn_shell(state, &self.config, id, waker, session);
                         if state.pane.exit_status.is_none() {
+                            self.session_routes.remove(&old_session);
+                            self.session_routes
+                                .insert(session, app_pane_move::SessionRoute::new(id, pane_id));
                             self.control_service
                                 .retire(old_session, crate::control::ErrorCode::Restarted);
                             self.pending_parsers.remove(&(id, pane_id, old_session));
@@ -1206,7 +1292,7 @@ impl App {
                         let cw = state.cell_metrics.cell_width;
                         let ch = state.cell_metrics.cell_height;
                         if cx < grid.cols && cy < grid.rows {
-                            let rect = state.layout.pane(state.loaded_pane).unwrap();
+                            let rect = state.pane_content_rect(state.loaded_pane).unwrap();
                             let px = f64::from(rect.x)
                                 + state.renderer.pane_visual_column(state.loaded_pane, cx, cy)
                                     as f64
@@ -1636,6 +1722,9 @@ impl App {
         id: WindowId,
         mut event: WindowEvent,
     ) {
+        if self.route_pane_drag(event_loop, id, &event) {
+            return;
+        }
         if let WindowEvent::KeyboardInput { event: ref key, .. } = event
             && key.state == ElementState::Pressed
             && let Some(modifiers) = self.windows.get(&id).map(|state| state.modifiers)
@@ -1679,12 +1768,17 @@ impl App {
         };
         state.load_pane(state.tree.active());
         if matches!(&event, WindowEvent::CursorLeft { .. }) {
+            state.pointer_inside = false;
+            state.set_divider_hover(None);
             for pane_id in state.tree.pane_ids() {
                 state.load_pane(pane_id);
                 state.pane.pointer_inside = false;
                 state.pane.link_press.cancel();
             }
             state.load_pane(state.tree.active());
+        }
+        if matches!(&event, WindowEvent::CursorEntered { .. } | WindowEvent::CursorMoved { .. }) {
+            state.pointer_inside = true;
         }
         if let WindowEvent::ModifiersChanged(modifiers) = &event
             && state.modifiers != modifiers.state()
@@ -1715,6 +1809,9 @@ impl App {
             }
         ) && state.divider_drag.take().is_some()
         {
+            state.refresh_pointer_hover();
+            state.content_dirty = true;
+            state.request_redraw();
             return;
         }
         let pointer_event = matches!(
@@ -1739,11 +1836,16 @@ impl App {
                 None
             };
             let target = if let Some(captured) = captured {
+                state.set_divider_hover(None);
                 Some(captured)
             } else {
                 match hit {
-                    Some(Hit::Pane(pane)) => Some(pane),
+                    Some(Hit::Pane(pane)) => {
+                        state.set_divider_hover(None);
+                        Some(pane)
+                    }
                     Some(Hit::Divider(divider)) => {
+                        state.set_divider_hover(Some(divider));
                         if matches!(
                             &event,
                             WindowEvent::MouseInput {
@@ -1754,13 +1856,13 @@ impl App {
                         ) {
                             state.divider_drag = Some(divider);
                         }
-                        state.window.set_cursor(CursorIcon::Default);
-                        state.pointer_cursor = None;
-                        let _ = crate::link_platform::set_hover(&state.window, None);
-                        state.hovered_preview = None;
+                        state.refresh_link_hover();
                         None
                     }
-                    None => None,
+                    None => {
+                        state.set_divider_hover(None);
+                        None
+                    }
                 }
             };
             let Some(target) = target else {
@@ -1773,7 +1875,7 @@ impl App {
             if matches!(&event, WindowEvent::MouseInput { state: ElementState::Pressed, .. }) {
                 state.captured_pane = Some(target);
             }
-            if let Some(rect) = state.layout.pane(target) {
+            if let Some(rect) = state.pane_content_rect(target) {
                 state.pane.mouse_position = pane_local_position(rect, state.pointer_position);
                 if let WindowEvent::CursorMoved { position, .. } = &mut event {
                     position.x = state.pane.mouse_position.0;
@@ -1947,6 +2049,11 @@ impl ApplicationHandler<UserEvent> for App {
                 state.load_pane(state.tree.active());
             }
             UserEvent::PtyOutput(id, pane_id, session) => {
+                let Some((id, pane_id)) =
+                    self.session_routes.get(&session).and_then(|route| route.resolve(id, pane_id))
+                else {
+                    return;
+                };
                 if let Some(state) = self.windows.get(&id) {
                     let pane = if state.loaded_pane == pane_id {
                         Some(&state.pane)
@@ -1960,8 +2067,12 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            UserEvent::NotificationReady(notification) => {
-                let scope = notification.scope;
+            UserEvent::NotificationReady(mut notification) => {
+                let mut scope = notification.scope;
+                if let Some(route) = self.session_routes.get(&scope.session) {
+                    (scope.window, scope.pane) = route.current;
+                    notification.scope = scope;
+                }
                 if let Some(state) = self.windows.get(&scope.window) {
                     let pane = if state.loaded_pane == scope.pane {
                         Some(&state.pane)
@@ -2274,6 +2385,44 @@ fn render_frame(
         bloom_peak_multiplier: config.theme.opacity.bloom_peak_multiplier,
     };
 
+    let dividers: Vec<_> = state
+        .layout
+        .dividers
+        .iter()
+        .map(|divider| RenderDivider {
+            rect: mechanic_renderer::PaneRect {
+                x: divider.rect.x,
+                y: divider.rect.y,
+                width: divider.rect.width,
+                height: divider.rect.height,
+            },
+            highlighted: state.divider_hover == Some(divider.id)
+                || state.divider_drag == Some(divider.id),
+        })
+        .collect();
+    state.renderer.set_pane_dividers(&dividers);
+    let handles: Vec<_> = state
+        .layout
+        .panes
+        .iter()
+        .map(|pane| {
+            let rect = state.pane_header_rect(pane.id).unwrap();
+            RenderPaneHandle {
+                rect: mechanic_renderer::PaneRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                },
+                highlighted: state.pane_drag_visual.hovered == Some(pane.id)
+                    || state.pane_drag_visual.dragged == Some(pane.id),
+            }
+        })
+        .collect();
+    state.renderer.set_pane_handles(&handles);
+    state.renderer.set_pane_drop_preview(state.pane_drag_visual.preview.map(|rect| {
+        mechanic_renderer::PaneRect { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+    }));
     let did_animation_render = !state.content_dirty && state.renderer.render_animation(uniforms);
 
     // A missing cached frame also requires a full render, even when content is clean.
@@ -2308,11 +2457,13 @@ fn render_frame(
                 state.pane.terminal.columns(), state.pane.terminal.screen_lines(),
             );
         }
+        let header_height = state.pane_header_height();
         let panes: Vec<_> = state
             .layout
             .panes
             .iter()
             .map(|item| {
+                let rect = app_pane_drag::content_rect(item.rect, header_height);
                 let pane = if item.id == state.loaded_pane {
                     &state.pane
                 } else {
@@ -2321,10 +2472,10 @@ fn render_frame(
                 RenderPane {
                     id: item.id,
                     rect: mechanic_renderer::PaneRect {
-                        x: item.rect.x,
-                        y: item.rect.y,
-                        width: item.rect.width,
-                        height: item.rect.height,
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
                     },
                     grid: pane.cached_grid.as_ref().unwrap(),
                     active: item.id == active,
@@ -2332,13 +2483,7 @@ fn render_frame(
             })
             .collect();
         state.content_dirty = !state.renderer.render_panes(&panes, uniforms);
-        if let Some(Hit::Pane(pane)) =
-            state.layout.hit_test(state.pointer_position.0, state.pointer_position.1)
-        {
-            state.load_pane(pane);
-            state.refresh_link_hover();
-            state.load_pane(active);
-        }
+        state.refresh_pointer_hover();
     }
 
     if let Some(t) = state.bloom_start
@@ -2605,9 +2750,19 @@ fn format_exit_status(status: Option<std::process::ExitStatus>) -> String {
 mod pane_smoke;
 
 #[cfg(test)]
+#[path = "app_pane_drag_smoke.rs"]
+#[allow(dead_code, reason = "used by the explicit native pane smoke example")]
+mod app_pane_drag_smoke;
+
+#[cfg(test)]
 #[path = "app_session_control_smoke.rs"]
 #[allow(dead_code, reason = "used by the explicit native session and control smoke example")]
 mod app_session_control_smoke;
+
+#[cfg(test)]
+#[path = "app_pane_move_smoke.rs"]
+#[allow(dead_code, reason = "used by the explicit native live pane movement smoke example")]
+mod app_pane_move_smoke;
 
 #[cfg(test)]
 mod tests {

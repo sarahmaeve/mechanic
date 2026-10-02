@@ -94,6 +94,7 @@ fn fixture() -> (RenderState, TextRenderer, FontConfig) {
         pane_order: vec![],
         pane_frame_cached: false,
         pane_colors: (Rgb::new(100, 200, 255), Rgb::new(50, 60, 70)),
+        dividers: DividerState::default(),
     };
     (state, text, config)
 }
@@ -612,4 +613,234 @@ fn multi_pane_profile_counts_scene_instances_and_uploads() {
     assert!(!repeated.atlas_changed);
     assert_eq!(repeated.surface_ns, 0);
     assert_eq!(repeated.submit_present_ns, 0);
+}
+
+#[test]
+#[ignore = "requires a Metal device; run explicitly on macOS"]
+fn multi_pane_dividers_show_hover_both_orientations_and_clear_after_close() {
+    let (mut state, mut text, config) = fixture();
+    let theme = mechanic_config::theme::Theme::default();
+    state.set_divider_colors(theme.foreground, theme.background, theme.cursor);
+    let (idle, highlighted) = state.dividers.colors.unwrap();
+    let mut left = RenderGrid::new(20, 8);
+    let mut right = RenderGrid::new(20, 8);
+    left.cursor_visible = false;
+    right.cursor_visible = false;
+    left.cells[0].character = 'L';
+    right.cells[0].character = 'R';
+    for (left_rect, right_rect, rect) in [
+        (
+            PaneRect { x: 0, y: 0, width: 70, height: 96 },
+            PaneRect { x: 82, y: 0, width: 78, height: 96 },
+            PaneRect { x: 70, y: 0, width: 12, height: 96 },
+        ),
+        (
+            PaneRect { x: 0, y: 0, width: 160, height: 42 },
+            PaneRect { x: 0, y: 54, width: 160, height: 42 },
+            PaneRect { x: 0, y: 42, width: 160, height: 12 },
+        ),
+    ] {
+        let scene = [
+            RenderPane { id: 1, rect: left_rect, grid: &left, active: true },
+            RenderPane { id: 2, rect: right_rect, grid: &right, active: false },
+        ];
+        state.prepare_panes_frame(&scene, &mut text, &config, uniforms()).unwrap();
+        let rows = state.panes[&2].layout.rows.clone();
+        let geometry =
+            bytemuck::cast_slice::<GpuInstance, u8>(&state.panes[&2].cache.instances).to_vec();
+        let divider = RenderDivider { rect, highlighted: false };
+        state.set_pane_dividers(&[divider]);
+        let mut profile = RenderProfile::default();
+        assert_eq!(
+            state.dividers.update(&state.device, &state.queue, Some(&mut profile)),
+            mem::size_of::<GpuInstance>()
+        );
+        assert_eq!(profile.upload_bytes, mem::size_of::<GpuInstance>());
+        assert_eq!(profile.instance_count, 1);
+        let samples = if rect.width < rect.height {
+            [(rect.x, 48), (rect.x + rect.width / 2, 48), (rect.x + rect.width - 1, 48)]
+        } else {
+            [(75, rect.y), (75, rect.y + rect.height / 2), (75, rect.y + rect.height - 1)]
+        };
+        let expected = |color: Rgb| [color.r, color.g, color.b, 255];
+        let assert_strip = |pixels: &[u8], color: [u8; 4]| {
+            for (x, y) in samples {
+                let offset = (y as usize * 160 + x as usize) * 4;
+                assert_eq!(&pixels[offset..offset + 4], color, "divider pixel missing at {x},{y}");
+            }
+        };
+        assert_strip(&pixels(&state), expected(idle));
+        // Identical event state neither rebuilds nor uploads divider geometry.
+        state.set_pane_dividers(&[divider]);
+        assert!(!state.dividers.dirty);
+        assert_eq!(state.dividers.update(&state.device, &state.queue, None), 0);
+        assert_eq!(state.prepare_panes_frame(&scene, &mut text, &config, uniforms()), Some(0));
+        state.pane_frame_cached = true;
+        state.set_pane_dividers(&[RenderDivider { highlighted: true, ..divider }]);
+        assert!(state.pane_frame_cached, "hover invalidated cached terminal scene");
+        assert_eq!(
+            state.dividers.update(&state.device, &state.queue, None),
+            mem::size_of::<GpuInstance>()
+        );
+        assert_strip(&pixels(&state), expected(highlighted));
+        assert!(rows.iter().zip(&state.panes[&2].layout.rows).all(|(a, b)| Arc::ptr_eq(a, b)));
+        assert_eq!(
+            bytemuck::cast_slice::<GpuInstance, u8>(&state.panes[&2].cache.instances),
+            geometry
+        );
+        assert_idle(&mut state, 2, &right, &text);
+        state.set_pane_dividers(&[]);
+        assert_eq!(state.dividers.update(&state.device, &state.queue, None), 0);
+        assert!(state.dividers.instances.is_empty());
+        assert_strip(&pixels(&state), [0, 0, 0, 255]);
+        // Closing the adjacent pane expands the retained pane over the old gap.
+        state
+            .prepare_panes_frame(
+                &[RenderPane {
+                    id: 1,
+                    rect: PaneRect { width: 160, height: 96, ..Default::default() },
+                    grid: &left,
+                    active: true,
+                }],
+                &mut text,
+                &config,
+                uniforms(),
+            )
+            .unwrap();
+        assert_eq!(state.panes.len(), 1);
+        let closed = pixels(&state);
+        for (x, y) in samples {
+            let offset = (y as usize * 160 + x as usize) * 4;
+            assert!(closed[offset + 2] < 30, "closed divider persisted at {x},{y}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal device; run explicitly on macOS"]
+fn multi_pane_grips_and_drop_preview_preserve_cache_and_clip_to_window() {
+    let (mut state, mut text, config) = fixture();
+    let theme = mechanic_config::theme::Theme::default();
+    state.set_divider_colors(theme.foreground, theme.background, theme.cursor);
+    let (idle, active) = state.dividers.colors.unwrap();
+    let mut left = RenderGrid::new(20, 8);
+    let mut right = RenderGrid::new(20, 8);
+    left.cursor_visible = false;
+    right.cursor_visible = false;
+    left.cells[0].character = 'L';
+    right.cells[0].character = 'R';
+    let scene = [
+        RenderPane {
+            id: 1,
+            rect: PaneRect { x: 0, y: 36, width: 70, height: 60 },
+            grid: &left,
+            active: true,
+        },
+        RenderPane {
+            id: 2,
+            rect: PaneRect { x: 80, y: 36, width: 80, height: 60 },
+            grid: &right,
+            active: false,
+        },
+    ];
+    state.prepare_panes_frame(&scene, &mut text, &config, uniforms()).unwrap();
+    let rows = state.panes[&2].layout.rows.clone();
+    let geometry =
+        bytemuck::cast_slice::<GpuInstance, u8>(&state.panes[&2].cache.instances).to_vec();
+    let handles = [
+        RenderPaneHandle {
+            rect: PaneRect { width: 70, height: 36, ..Default::default() },
+            highlighted: false,
+        },
+        RenderPaneHandle {
+            rect: PaneRect { x: 80, width: 80, height: 36, ..Default::default() },
+            highlighted: false,
+        },
+    ];
+    let divider = RenderDivider {
+        rect: PaneRect { x: 70, width: 10, height: 96, ..Default::default() },
+        highlighted: false,
+    };
+    state.set_pane_dividers(&[divider]);
+    state.set_pane_handles(&handles);
+    let mut profile = RenderProfile::default();
+    assert_eq!(
+        state.dividers.update(&state.device, &state.queue, Some(&mut profile)),
+        7 * mem::size_of::<GpuInstance>()
+    );
+    assert_eq!(profile.instance_count, 7);
+    assert_eq!(profile.upload_bytes, 7 * mem::size_of::<GpuInstance>());
+    let pixel = |pixels: &[u8], x: usize, y: usize| {
+        pixels[(y * 160 + x) * 4..(y * 160 + x + 1) * 4].to_vec()
+    };
+    let color = |color: Rgb| vec![color.r, color.g, color.b, 255];
+    let initial = pixels(&state);
+    for y in [12, 17, 22] {
+        assert_eq!(pixel(&initial, 30, y), color(idle), "first drag grip bar missing");
+        assert_eq!(pixel(&initial, 115, y), color(idle), "second drag grip bar missing");
+    }
+    assert_eq!(pixel(&initial, 75, 50), color(idle), "grips replaced the existing divider");
+    for (x, y) in [(25, 12), (45, 12), (30, 15), (30, 25), (5, 5)] {
+        assert_eq!(pixel(&initial, x, y), vec![0, 0, 0, 255], "grip leaked outside its bars");
+    }
+    state.pane_frame_cached = true;
+    let highlighted_handles = [RenderPaneHandle { highlighted: true, ..handles[0] }, handles[1]];
+    let preview = PaneRect { x: 8, y: 43, width: 56, height: 39 };
+    state.set_pane_handles(&highlighted_handles);
+    state.set_pane_drop_preview(Some(preview));
+    assert!(state.pane_frame_cached, "drag decorations invalidated cached terminal scene");
+    let mut profile = RenderProfile::default();
+    assert_eq!(
+        state.dividers.update(&state.device, &state.queue, Some(&mut profile)),
+        11 * mem::size_of::<GpuInstance>()
+    );
+    assert_eq!(profile.upload_bytes, 11 * mem::size_of::<GpuInstance>());
+    assert_eq!(profile.instance_count, 11);
+    let hovered = pixels(&state);
+    for y in [12, 17, 22] {
+        assert_eq!(pixel(&hovered, 30, y), color(active));
+    }
+    for (x, y) in [(32, 43), (32, 46), (8, 60), (11, 60), (63, 60), (32, 81)] {
+        assert_eq!(pixel(&hovered, x, y), color(active), "drop outline missing at {x},{y}");
+    }
+    for (x, y) in [(32, 47), (12, 60), (7, 60), (64, 60), (32, 42), (32, 82)] {
+        assert!(pixel(&hovered, x, y)[2] < 30, "drop outline filled or exceeded bounds at {x},{y}");
+    }
+    state.set_pane_handles(&highlighted_handles);
+    state.set_pane_drop_preview(Some(preview));
+    state.set_pane_dividers(&[divider]);
+    assert!(!state.dividers.dirty);
+    let mut idle_profile = RenderProfile::default();
+    assert_eq!(state.dividers.update(&state.device, &state.queue, Some(&mut idle_profile)), 0);
+    assert_eq!(idle_profile.upload_bytes, 0);
+    assert_eq!(idle_profile.instance_count, 11);
+    assert_eq!(state.prepare_panes_frame(&scene, &mut text, &config, uniforms()), Some(0));
+    assert!(rows.iter().zip(&state.panes[&2].layout.rows).all(|(a, b)| Arc::ptr_eq(a, b)));
+    assert_eq!(bytemuck::cast_slice::<GpuInstance, u8>(&state.panes[&2].cache.instances), geometry);
+    assert_idle(&mut state, 2, &right, &text);
+    // Partly off-window decorations use the window scissor rather than invalid
+    // rectangles from their own unclamped geometry.
+    state.set_pane_handles(&[RenderPaneHandle {
+        rect: PaneRect { x: 145, width: 18, height: 36, ..Default::default() },
+        highlighted: true,
+    }]);
+    state.set_pane_drop_preview(Some(PaneRect { x: 150, y: 85, width: 30, height: 30 }));
+    state.dividers.update(&state.device, &state.queue, None);
+    let clipped = pixels(&state);
+    assert_eq!(pixel(&clipped, 159, 12), color(active));
+    assert_eq!(pixel(&clipped, 159, 86), color(active));
+    assert_eq!(pixel(&clipped, 150, 95), color(active));
+    state.set_pane_handles(&[]);
+    state.set_pane_drop_preview(None);
+    state.set_pane_dividers(&[]);
+    assert_eq!(state.dividers.update(&state.device, &state.queue, None), 0);
+    assert!(state.dividers.instances.is_empty());
+    let cleared = pixels(&state);
+    assert_eq!(pixel(&cleared, 30, 12), vec![0, 0, 0, 255]);
+    assert_eq!(pixel(&cleared, 159, 12), vec![0, 0, 0, 255]);
+    assert_eq!(
+        pixel(&cleared, 159, 86),
+        pixel(&initial, 159, 86),
+        "drop preview did not restore original pane border"
+    );
 }

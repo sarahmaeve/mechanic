@@ -1,0 +1,8 @@
+live move smoke: temporary control ready
+live move smoke: source window ready
+live move smoke: live split ready
+live move smoke: original shell variable ready
+live move smoke: pane detached
+live move smoke: original window closed
+live move smoke: waiting for original reader completion
+native live pane move smoke passed: original shell variable/history/selection/Find preserved, no replacement PTY, original queued and future reader wakes after source window closes, stable control handle and pre-move completion waiter
