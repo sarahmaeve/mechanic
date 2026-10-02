@@ -338,6 +338,31 @@ sparse counter glyphs and offscreen context. Separate renderer tests check
 glyph geometry and pixels. Stage boundaries and exclusions match the benchmark
 above. Use identical harnesses and font installations for before/after runs.
 
+## Shell integration and search
+
+```sh
+cargo test --release -p mechanic-core shell_protocol_benchmark -- --ignored --nocapture --test-threads=1
+cargo test --release -p mechanic-core diverse_ten_thousand_line_search_latency -- --ignored --nocapture --test-threads=1
+```
+
+The shell test compares 2,000 plain commands with the same output surrounded by
+OSC 133 prompt/input/output/completion markers. It checks metadata and final
+output; parsing/tracking are timed, shell startup and rendering are excluded.
+The search test scans 10,000 rows of ASCII, accented Latin, CJK and Arabic,
+verifies hit counts and reports nine samples for full and restricted budgets.
+Both run explicitly; ordinary test runs do not include timing workloads.
+
+The native Find panel has an explicit hidden-window smoke check:
+
+```sh
+cargo rustc -p mechanic-app --example search_native_smoke --locked -- --cfg test
+./target/debug/examples/search_native_smoke
+```
+
+It checks AppKit edits, Match case toggles without losing query/focus, navigation
+actions, keyboard equivalents, close and callback teardown. It does not capture
+the screen or send text to a shell.
+
 ## Hyperlinks
 
 ```sh

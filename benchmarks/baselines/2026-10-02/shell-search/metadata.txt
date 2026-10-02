@@ -1,0 +1,30 @@
+Date: 2026-10-02
+Host: macOS 26.6.2 arm64, Apple M5 Pro, Rust 1.99.0
+Baseline source: git archive 6e5998d in /tmp/mechanic-shell-baseline
+Candidate: working tree based on 6e5998d; shell protocol, zsh hooks and search integration
+Baseline parser executable SHA256: 48ab3d401b4d1859135a85325608925ea9fbf8e1ee64520dcd100744a91c3a14
+Candidate parser executable SHA256: ea4e59d1096ea36bde64dc0dabc573de3f77e70c596dcc19b8200ed3c6f787cb
+Search source SHA256: bf18c6a9847750ef07e53d6296ef2dbabad0528cc853400add2fb905c06676ab
+Shell tracker SHA256: 67c4ac7b86efc6a918c7f8ae13ded51e4d3275807ff92c4d0272345b29976f09
+VTE raw parser SHA256: 6c1f87ffa2da9bfb3e56ecee93653c0ad27bd461ca7ee15209b246d4ff2b3c41
+
+Parser command: parse_responsiveness OUTPUT --mib 32 --samples 3
+Files: parser-before.json, parser-after.json. One warmup and three samples per case, ASCII then SGR; before build then after build; serial without competing builds/tests. Native PTY access required sandbox escalation. Final marker/exit ordering passed in every observation. Full settings and raw parser calls are in JSON.
+
+Search command: cargo test --release -p mechanic-core diverse_ten_thousand_line_search_latency -- --ignored --nocapture --test-threads=1
+File: search.csv, 72 timed samples. 10,000 populated rows plus final blank; 120 columns; 24-row viewport; 10,000 history capacity. ASCII, Latin, CJK and Arabic; nine samples each at max_cells=2,000,000 and 120,000. Raw search_sample stderr lines converted to CSV without changing timing values. Full count=10,000, partial count=999. An untimed complete search verifies the fixture before each workload. No concurrent parent builds/benchmarks.
+
+Shell command: cargo test --release -p mechanic-core shell_protocol_benchmark -- --ignored --nocapture --test-threads=1
+File: shell-protocol.txt. 2,000 commands, ten rounds per variant, plain first then OSC133 markers. Upper median reported. Terminal setup, metadata/output assertions excluded from timing. No timed shell startup or actual shell hook execution.
+
+Validation: 446 workspace tests, 132 alacritty_terminal tests, 55 VTE tests, 9 offscreen Metal tests; native hidden Find-panel smoke; strict workspace Clippy; release workspace build. Upstream tests run using unchanged copies of vendor build inputs in an isolated temporary workspace, since Cargo cannot run external dependency dev-tests from the application workspace. No screen capture or other emulator comparisons.
+
+Final shell compatibility pass: shell-protocol-final.txt uses the same release
+command/harness after the German search work, ERR_RETURN hook repair and native
+window-title deduplication. No concurrent builds/tests during timing. Plain
+upper median 1.100292 ms, markers 2.148792 ms, 524.2 ns additional per lifecycle.
+Shell execution and window-title changes are outside this parser measurement.
+Current validation: 442 workspace tests passed, strict workspace Clippy,
+formatting and release build passed. Six real-zsh/config integration tests
+include existing hooks with ERR_RETURN, prompt status, Unicode output/status42,
+Ctrl+C/status130 and recovery. Default zsh PROMPT_SP output remains unchanged.

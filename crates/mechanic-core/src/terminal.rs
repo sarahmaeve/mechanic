@@ -19,6 +19,7 @@ use crate::TerminalSize;
 use crate::error::TerminalError;
 use crate::event::{EventProxy, TerminalEvent};
 use crate::pty::PtyHandle;
+use crate::shell_state::{ShellIntegration, ShellPosition};
 
 /// Result of one [`Terminal::process_input`] call.
 #[derive(Debug, Clone, Default)]
@@ -90,6 +91,7 @@ pub struct Terminal {
     exit_delivered: bool,
     pending_error: Option<String>,
     output_finished: bool,
+    shell_integration: ShellIntegration,
 }
 
 impl Terminal {
@@ -130,6 +132,7 @@ impl Terminal {
             exit_delivered: false,
             pending_error: None,
             output_finished: false,
+            shell_integration: ShellIntegration::default(),
         })
     }
 
@@ -264,6 +267,30 @@ impl Terminal {
     fn drain_parser_events(&mut self) {
         for event in self.event_proxy.drain() {
             match event {
+                TerminalEvent::ShellIntegration(AlacrittyEvent::ShellIntegration(
+                    params,
+                    point,
+                    scroll,
+                    generation,
+                )) => {
+                    self.shell_integration.marker(&params, point, scroll, generation);
+                }
+                TerminalEvent::ShellIntegration(AlacrittyEvent::ShellErase(
+                    point,
+                    mode,
+                    scroll,
+                    generation,
+                )) => {
+                    self.shell_integration.erase(point, mode, scroll, generation);
+                }
+                TerminalEvent::ShellIntegration(AlacrittyEvent::ShellCellsChanged(
+                    start,
+                    end,
+                    scroll,
+                    generation,
+                )) => {
+                    self.shell_integration.cells_changed(start, end, scroll, generation);
+                }
                 TerminalEvent::TitleChanged(t) => self.title = t,
                 TerminalEvent::TitleReset => self.title.clear(),
                 TerminalEvent::Exit(status) if !self.exit_delivered => {
@@ -287,6 +314,12 @@ impl Terminal {
                 }
                 _ => {}
             }
+        }
+        let (scroll, generation) = self.term.shell_coordinates();
+        let oldest = scroll.min(i64::MAX as u64) as i64 + self.term.grid().topmost_line().0 as i64;
+        // The alternate grid has no history; its bounds cannot evict main-grid markers.
+        if !self.term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
+            self.shell_integration.synchronize(generation, oldest);
         }
     }
 
@@ -327,6 +360,7 @@ impl Terminal {
         if let Some(byte) = data.last() {
             self.previous_byte_is_escape = *byte == b'\x1b';
         }
+        self.drain_parser_events();
     }
 
     /// Send input and return the scrollback viewport to the live screen.
@@ -358,6 +392,8 @@ impl Terminal {
             return;
         }
         self.size = size;
+        // Alacritty may reflow rows during resize; old cell coordinates no longer apply.
+        self.shell_integration.invalidate();
 
         let dimensions = TermDimensions { columns: size.columns, screen_lines: size.rows };
         self.term.resize(dimensions);
@@ -380,6 +416,92 @@ impl Terminal {
     /// The current terminal title as set by OSC 0/2 sequences.
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Shell cwd, command boundaries and last completion status.
+    pub fn shell_integration(&self) -> &ShellIntegration {
+        &self.shell_integration
+    }
+
+    fn shell_point(&self, position: ShellPosition) -> Option<Point> {
+        let (scroll, _) = self.term.shell_coordinates();
+        let line = position.line.checked_sub(scroll.min(i64::MAX as u64) as i64)?;
+        let line = i32::try_from(line).ok()?;
+        if line < self.grid().topmost_line().0
+            || line > self.grid().bottommost_line().0
+            || position.column > self.columns()
+        {
+            return None;
+        }
+        Some(Point::new(
+            alacritty_terminal::index::Line(line),
+            alacritty_terminal::index::Column(position.column),
+        ))
+    }
+
+    /// Navigate to the closest prompt above the current viewport.
+    pub fn jump_to_previous_prompt(&mut self) -> bool {
+        self.jump_to_prompt(true)
+    }
+
+    /// Navigate to the closest prompt below the current viewport.
+    pub fn jump_to_next_prompt(&mut self) -> bool {
+        self.jump_to_prompt(false)
+    }
+
+    fn jump_to_prompt(&mut self, previous: bool) -> bool {
+        if self.term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
+            return false;
+        }
+        let top = -(self.grid().display_offset() as i32);
+        let prompts = self
+            .shell_integration
+            .commands()
+            .iter()
+            .filter_map(|command| command.prompt.and_then(|p| self.shell_point(p)));
+        let target = if previous {
+            prompts.filter(|p| p.line.0 < top).max()
+        } else {
+            prompts.filter(|p| p.line.0 > top).min()
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let offset = (-target.line.0).max(0);
+        if offset == self.grid().display_offset() as i32 {
+            return false;
+        }
+        self.term.scroll_display(Scroll::Delta(offset - self.grid().display_offset() as i32));
+        true
+    }
+
+    /// Output of the most recent completed command, when its full range remains
+    /// in the main grid. Reflow, clearing and history eviction can make it unavailable.
+    pub fn last_command_output(&self) -> Option<String> {
+        if self.term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let command = self.shell_integration.commands().iter().rev().find(|c| c.completed)?;
+        let mut start = self.shell_point(command.output_start?)?;
+        if start.column.0 == self.columns() {
+            start = Point::new(start.line + 1, alacritty_terminal::index::Column(0));
+        }
+        let end = self.shell_point(command.output_end?)?;
+        if end < start {
+            return None;
+        }
+        if start.line > self.grid().bottommost_line() {
+            return None;
+        }
+        if end == start {
+            return Some(String::new());
+        }
+        let end = if end.column.0 == 0 {
+            Point::new(end.line - 1, self.grid().last_column())
+        } else {
+            Point::new(end.line, end.column - 1)
+        };
+        Some(self.term.bounds_to_string(start, end))
     }
 
     /// The current terminal size.
@@ -462,6 +584,7 @@ impl Terminal {
 
     /// Clear scrollback and send Ctrl+L to ask the foreground program to redraw.
     pub fn clear_history(&mut self) {
+        self.shell_integration.invalidate();
         self.term.grid_mut().clear_history();
         let _ = self.pty.write(b"\x0c");
     }
@@ -603,6 +726,7 @@ mod tests {
                 exit_delivered: false,
                 pending_error: None,
                 output_finished: false,
+                shell_integration: ShellIntegration::default(),
             },
             peer,
         )
@@ -610,6 +734,204 @@ mod tests {
 
     fn parse_one_chunk(terminal: &mut Terminal) -> ProcessOutcome {
         terminal.process_input_with_budget(Instant::now(), Duration::ZERO, PARSE_BYTE_BUDGET)
+    }
+
+    #[test]
+    fn shell_protocol_fragmented_lifecycle_and_mixed_output() {
+        let payload = b"\x1b]7;file://host/tmp/a%20b%3Bc\x1b\\\x1b]133;A\x07$ \x1b]133;B\x07printf hello\r\n\x1b]133;C\x1b\\hello\r\nworld\r\n\x1b]133;D;7\x07\x1b]133;A\x07$ \x1b]133;B\x07";
+        // Every possible two-chunk split, plus one-byte fragments, must have
+        // exactly the same lifecycle and output coordinates.
+        for split in 0..=payload.len() {
+            let (mut terminal, _) = buffered_terminal();
+            terminal.parse_chunk(&payload[..split]);
+            terminal.parse_chunk(&payload[split..]);
+            assert_eq!(terminal.shell_integration().cwd(), Some("/tmp/a b;c"));
+            assert_eq!(terminal.shell_integration().cwd_host(), Some("host"));
+            assert_eq!(terminal.shell_integration().last_exit_status(), Some(7));
+            assert_eq!(
+                terminal.last_command_output().as_deref(),
+                Some("hello\nworld"),
+                "split {split}"
+            );
+            assert_eq!(terminal.shell_integration().commands().len(), 2);
+        }
+        let (mut terminal, _) = buffered_terminal();
+        for byte in payload {
+            terminal.parse_chunk(&[*byte]);
+        }
+        assert_eq!(terminal.last_command_output().as_deref(), Some("hello\nworld"));
+    }
+
+    #[test]
+    fn shell_markers_survive_full_scrollback_and_history_capacity() {
+        let (mut terminal, _) = buffered_terminal();
+        terminal.term.grid_mut().update_history(8);
+        terminal.parse_chunk(&b"padding\r\n".repeat(30));
+        terminal.parse_chunk(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07result\r\n\x1b]133;D;0\x07",
+        );
+        terminal.parse_chunk(&b"later\r\n".repeat(24));
+        assert_eq!(terminal.last_command_output().as_deref(), Some("result"));
+        assert!(terminal.jump_to_previous_prompt());
+        assert!(terminal.grid().display_offset() > 0);
+        terminal.parse_chunk(&b"later\r\n".repeat(30));
+        assert!(terminal.last_command_output().is_none());
+        assert!(!terminal.jump_to_previous_prompt());
+        assert_eq!(terminal.shell_integration().last_exit_status(), Some(0));
+    }
+
+    #[test]
+    fn shell_markers_follow_soft_wrap_and_ignore_alternate_screen() {
+        let (mut terminal, _) = buffered_terminal();
+        terminal.parse_chunk(&b"padding\r\n".repeat(25));
+        terminal.parse_chunk(b"\x1b]133;A\x07\x1b]133;B\x07cmd\r\n\x1b]133;C\x07");
+        let output = "x".repeat(200);
+        terminal.parse_chunk(output.as_bytes());
+        terminal.parse_chunk(b"\r\n\x1b]133;D;0\x07");
+        assert_eq!(terminal.last_command_output(), Some(output.clone()));
+        terminal.parse_chunk(b"\x1b[?1049h\x1b]133;A\x07\x1b]7;file:///wrong\x07");
+        terminal.parse_chunk(&b"alt\r\n".repeat(100));
+        assert!(terminal.last_command_output().is_none());
+        assert!(!terminal.jump_to_previous_prompt());
+        terminal.parse_chunk(b"\x1b[?1049l");
+        assert!(terminal.shell_integration().cwd().is_none());
+        assert_eq!(terminal.last_command_output(), Some(output));
+    }
+
+    #[test]
+    fn shell_destructive_changes_invalidate_positions_and_preserve_metadata() {
+        for clear in [b"\x1bc".as_slice(), b"\x1b[2J", b"\x1b[3J", b"\x1b[2;5r\x1b[5;1H\n"] {
+            let (mut terminal, _) = buffered_terminal();
+            terminal.parse_chunk(
+                b"\x1b]7;file:///tmp\x07\x1b]133;A\x07\x1b]133;C\x07output\r\n\x1b]133;D;3\x07",
+            );
+            assert!(terminal.last_command_output().is_some());
+            terminal.parse_chunk(clear);
+            assert!(terminal.last_command_output().is_none(), "{clear:?}");
+            assert!(terminal.shell_integration().commands().is_empty());
+            assert_eq!(terminal.shell_integration().cwd(), Some("/tmp"));
+            assert_eq!(terminal.shell_integration().last_exit_status(), Some(3));
+        }
+        let (mut terminal, _) = buffered_terminal();
+        terminal.parse_chunk(b"\x1b]133;A\x07\x1b]133;C\x07output\r\n\x1b]133;D;0\x07");
+        terminal.shell_integration.invalidate(); // Resize uses this same invalidation before the PTY ioctl.
+        assert!(terminal.last_command_output().is_none());
+    }
+
+    #[test]
+    fn shell_rejects_invalid_status_uri_and_cancelled_markers() {
+        let (mut terminal, _) = buffered_terminal();
+        terminal.parse_chunk(
+            b"\x1b]7;file:///good\x07\x1b]7;file:///bad%xx\x07\x1b]133;A\x18ignored\x07",
+        );
+        assert_eq!(terminal.shell_integration().cwd(), Some("/good"));
+        assert!(terminal.shell_integration().commands().is_empty());
+        terminal.parse_chunk(
+            b"\x1b]133;A\x07\x1b]133;C\x07result\r\n\x1b]133;D;-1\x07\x1b]133;D;2147483648\x07",
+        );
+        assert!(terminal.last_command_output().is_none());
+        terminal.parse_chunk(b"\x1b]133;D;12");
+        assert!(terminal.last_command_output().is_none());
+        terminal.parse_chunk(b"\x1b\\");
+        assert_eq!(terminal.shell_integration().last_exit_status(), Some(12));
+        assert_eq!(terminal.last_command_output().as_deref(), Some("result"));
+        terminal.parse_chunk(b"\x1b]133;D;0\x07");
+        assert_eq!(terminal.shell_integration().last_exit_status(), Some(12));
+    }
+
+    #[test]
+    fn shell_osc_inside_ignored_control_strings_is_not_a_marker() {
+        let (mut terminal, _) = buffered_terminal();
+        terminal.parse_chunk(b"\x1bPignored]133;A\x07\x1b\\");
+        assert!(terminal.shell_integration().commands().is_empty());
+        let oversized = format!("\x1b]7;file:///{}\x07", "x".repeat(9000));
+        terminal.parse_chunk(oversized.as_bytes());
+        assert!(terminal.shell_integration().cwd().is_none());
+        terminal.parse_chunk(b"\x1b]7;file:///okay\x07");
+        assert_eq!(terminal.shell_integration().cwd(), Some("/okay"));
+    }
+
+    #[test]
+    fn shell_requires_complete_st_and_recovers_from_parameter_overflow() {
+        let (mut terminal, _) = buffered_terminal();
+        terminal.parse_chunk(b"\x1b]7;file:///cancelled\x1b");
+        assert!(terminal.shell_integration().cwd().is_none());
+        terminal.parse_chunk(b"[0m\x1b]133;A\x1b[0m");
+        assert!(terminal.shell_integration().cwd().is_none());
+        assert!(terminal.shell_integration().commands().is_empty());
+        let uri = format!("\x1b]7;file:///{}\x07", "a;".repeat(20));
+        terminal.parse_chunk(uri.as_bytes());
+        assert!(terminal.shell_integration().cwd().is_none());
+        terminal.parse_chunk(b"\x1b]7;file:///valid\x1b");
+        assert!(terminal.shell_integration().cwd().is_none());
+        terminal.parse_chunk(b"\\");
+        assert_eq!(terminal.shell_integration().cwd(), Some("/valid"));
+    }
+
+    #[test]
+    fn shell_prompt_redraw_keeps_current_command_and_erased_output_is_unavailable() {
+        let (mut terminal, _) = buffered_terminal();
+        terminal.parse_chunk(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[Jcmd\r\n\x1b]133;C\x07output\r\n\x1b]133;D;0\x07",
+        );
+        assert_eq!(terminal.last_command_output().as_deref(), Some("output"));
+        terminal.parse_chunk(b"\x1b[2;1H\x1b[2K");
+        assert!(terminal.last_command_output().is_none());
+        assert_eq!(terminal.shell_integration().last_exit_status(), Some(0));
+        terminal.parse_chunk(b"\x1b]133;A\x07\x1b]133;C\x07\x1b[2J\x1b]133;D;7\x07");
+        assert_eq!(terminal.shell_integration().last_exit_status(), Some(7));
+        assert!(!terminal.shell_integration().is_running());
+        terminal.parse_chunk(b"\x1b]133;A\x07\x1b]133;C\x07");
+        assert!(terminal.shell_integration().is_running());
+        terminal.shell_integration.invalidate();
+        assert!(terminal.shell_integration().is_running());
+        terminal.parse_chunk(b"\x1b]133;D;0\x07");
+        assert!(!terminal.shell_integration().is_running());
+    }
+
+    #[test]
+    fn shell_output_exclusive_endpoint_includes_pending_wrap_cell() {
+        for output in ["x".repeat(80), format!("{}界", "x".repeat(78))] {
+            let (mut terminal, _) = buffered_terminal();
+            terminal.parse_chunk(&b"padding\r\n".repeat(30));
+            terminal.parse_chunk(b"\x1b]133;A\x07\x1b]133;C\x07");
+            terminal.parse_chunk(output.as_bytes());
+            terminal.parse_chunk(b"\x1b]133;D;0\x07");
+            assert_eq!(terminal.last_command_output(), Some(output));
+        }
+    }
+
+    #[test]
+    #[ignore = "manual shell integration throughput benchmark"]
+    fn shell_protocol_benchmark() {
+        const COMMANDS: usize = 2000;
+        const ROUNDS: usize = 10;
+        let plain = b"$ true\r\noutput\r\n".repeat(COMMANDS);
+        let hooked =
+            b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07output\r\n\x1b]133;D;0\x07"
+                .repeat(COMMANDS);
+        let measure = |payload: &[u8]| {
+            let mut timings = Vec::with_capacity(ROUNDS);
+            for _ in 0..ROUNDS {
+                let (mut terminal, _) = buffered_terminal();
+                let started = Instant::now();
+                terminal.parse_chunk(payload);
+                timings.push(started.elapsed());
+                if payload.len() == hooked.len() {
+                    assert_eq!(terminal.shell_integration().commands().len(), 1024);
+                    assert_eq!(terminal.shell_integration().last_exit_status(), Some(0));
+                    assert_eq!(terminal.last_command_output().as_deref(), Some("output"));
+                }
+            }
+            timings.sort();
+            timings[ROUNDS / 2]
+        };
+        let baseline = measure(&plain);
+        let integration = measure(&hooked);
+        eprintln!(
+            "shell lifecycle: {COMMANDS} commands, plain median {baseline:?}, hooks median {integration:?}, added {:.1} ns/command",
+            integration.as_nanos().saturating_sub(baseline.as_nanos()) as f64 / COMMANDS as f64
+        );
     }
 
     #[test]

@@ -4,10 +4,14 @@ pub mod error;
 pub mod event;
 pub mod paste;
 pub mod pty;
+pub mod search;
+mod shell_integration;
+pub mod shell_state;
 pub mod terminal;
 
 pub use error::TerminalError;
 pub use event::{EventProxy, TerminalEvent};
+pub use shell_state::{ShellCommand, ShellIntegration, ShellPosition};
 pub use terminal::{GridColumn, GridLine, GridPoint, GridSide, MouseProtocol, Terminal};
 
 /// Wake the main loop after PTY output, exit, or transport failure.

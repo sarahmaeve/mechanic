@@ -5,6 +5,113 @@ transfer that previously deadlocked. Output batching also improves most tested
 GUI workloads. These are initial observations from one machine, not stable
 cross-terminal rankings.
 
+## Shell integration and scrollback search — 2026-10-02
+
+Shell integration adds bounded OSC 7/133 metadata to the existing parser.
+It does not add a second parser or an idle timer. Automatic zsh startup hooks
+run in child-only configuration; user startup files remain unchanged.
+
+Matched release PTY flood runs compare commit `6e5998d` with shell integration.
+Each case sends 32 MiB, with one warmup and three measured samples per build;
+before ran first, then after, without concurrent builds or benchmarks.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| ASCII total drain, median | 221.80 ms | 217.85 ms |
+| SGR total drain, median | 220.94 ms | 218.28 ms |
+| Busy parser call p95, both cases | 4.134 ms | 4.163 ms |
+| Maximum parser call | 4.264 ms | 4.294 ms |
+
+All samples verified final-output-before-exit ordering. These short runs show
+similar responsiveness under the existing soft 4 ms parser budget; they do not
+measure GUI latency or idle CPU. The flood emits no shell markers.
+
+A separate 2,000-command parser test compares identical visible output with
+and without four OSC 133 markers per command. Ten batches per variant measured
+upper medians of 0.961 ms plain and 2.078 ms with markers: about 559 ns additional
+work per command in this run. Metadata limits, exit status and final copied
+output were checked. Shell hook execution, startup and rendering are excluded.
+
+Final shell compatibility checks added `ERR_RETURN` coverage and verified
+Unicode output, status 42, Ctrl+C status 130 and subsequent prompt navigation
+through a real zsh PTY. The wrapper preserves status in user prompt hooks and
+`%?`; native window titles update only when their text changes. All 442 current
+workspace tests, strict Clippy and the release build passed. A final serial
+marker benchmark measured 1.100 ms plain versus 2.149 ms with markers for 2,000
+commands, about 524 ns added per lifecycle. This is another short parser-only
+observation, not a measured improvement over the earlier run.
+
+Search timings use 10,000 populated 120-column rows plus the trailing blank row,
+nine samples per fixture and budget. Terminal population is outside timing.
+Full scans use the default two-million-cell limit; restricted scans examine
+the newest 120,000 cells and explicitly report partial results.
+
+| Search text | Full-history median | Restricted median |
+| --- | ---: | ---: |
+| ASCII | 7.36 ms | 0.71 ms |
+| Accented Latin | 7.64 ms | 0.73 ms |
+| Chinese/Japanese | 7.02 ms | 0.70 ms |
+| Arabic | 9.10 ms | 0.90 ms |
+
+Each full scan returned exactly 10,000 matches; each restricted scan returned
+999. Queries run on user input. Streaming output invalidates results without
+rescanning; Return refreshes them. UI rendering and window-system work are
+outside search timings. No other terminal was launched for these measurements.
+
+[Raw observations and build metadata](baselines/2026-10-02/shell-search/metadata.txt).
+
+Validation: 446 workspace tests, 187 vendored parser/terminal unit tests, nine
+offscreen Metal checks, hidden native Find-panel smoke, strict Clippy and a
+release build passed. Real zsh/PTY tests cover startup hooks, user exit status,
+Unicode cwd, copied output and prompt navigation. Search tests cover Russian,
+Ukrainian, Japanese, Chinese, Arabic, French, German, Spanish, Portuguese and
+Italian at four wrap widths, hard breaks, case matching and original-text
+extraction; application tests cover highlighting, selection, cursor and stale
+results. These initial timings predate canonical accent normalization and full
+Unicode case folding; the German-search follow-up below measures that change.
+
+## German and canonical Unicode search — 2026-10-02
+
+Find now uses canonical caseless matching (NFD → full case fold → NFD).
+`Straße`, `STRASSE` and `STRAẞE` match; composed/decomposed umlauts match too.
+Accents remain significant, so `Müller` differs from `Muller` and `Mueller`.
+Matches cover complete source cells: `ss` matches `ß`, but `s` does not match
+half of it. The native Match case control selects exact stored-text matching.
+Original spelling, selection coordinates and copied text remain unchanged.
+
+This follows [Unicode canonical caseless matching, D145](https://www.unicode.org/versions/Unicode17.0.0/core-spec/chapter-3/#G53523)
+and the full mappings for `ß`/`ẞ` in [CaseFolding.txt](https://www.unicode.org/Public/17.0.0/ucd/CaseFolding.txt).
+[ICU German phonebook tailoring](https://unicode-org.github.io/icu/userguide/collation/concepts.html#expansions)
+can additionally equate umlauts with two-letter spellings; Find does not apply
+that locale-specific behavior. The libraries are `caseless` 0.2.2 (Unicode 16
+folding tables) and `unicode-normalization` 0.1.25 (Unicode 17 normalization).
+This does not claim Unicode 17 case-fold coverage for newly added characters.
+
+The unchanged 10,000-row harness ran before/after, then after/before, with no
+concurrent builds or benchmarks. Each cell below is the median of 18 samples.
+Full scans retained 10,000 matches; restricted scans retained 999 and reported
+partial results. Population, rendering and native UI work are outside timing.
+
+| Search text | Full before → after | Restricted before → after |
+| --- | ---: | ---: |
+| ASCII | 7.28 → 8.17 ms | 0.74 → 0.79 ms |
+| Accented Latin | 7.65 → 8.22 ms | 0.77 → 0.83 ms |
+| Chinese/Japanese | 6.99 → 8.71 ms | 0.69 → 0.87 ms |
+| Arabic | 9.21 → 11.55 ms | 0.92 → 1.20 ms |
+
+Correct matching adds measurable cost, including source-boundary checks for
+ASCII and normalization for other scripts. These searches run on user input;
+the change adds no idle work or continuous rescanning. Short local runs are
+not a GUI latency guarantee. [Raw samples and metadata](baselines/2026-10-02/german-search/metadata.txt).
+
+Validation passed: workspace tests, 16 core search tests including overlapping
+fold expansions and rejected partial matches, strict Clippy, formatting and
+release build. German checks cover key translation, copy after reflow/scroll,
+search highlighting, exact mode, styled glyphs, cursor mapping and equivalent
+composed/decomposed rendering. Hidden AppKit checks cover Match case toggles
+without resetting the query or editor selection. No physical German keyboard
+layout or interactive IME session was tested.
+
 ## Font fallback and mixed-direction correctness — 2026-10-02
 
 Font fallback now removes absent family names and exact duplicates from each

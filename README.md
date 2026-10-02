@@ -40,6 +40,29 @@ close_on_exit = "success" # always, success, never
 
 Restart Mechanic after changing configuration.
 
+Zsh shell integration is automatic and leaves your startup files unchanged.
+The title shows the working directory and running/completed command status.
+Cmd+Shift+Up/Down navigates recorded prompts; Cmd+Shift+C copies the last
+completed command's retained output. Set `[shell] integration = false` to
+disable automatic hooks. Other shells can supply compatible OSC 7/133 markers.
+Markers are limited to 1,024 commands. Reflow, clearing, edits and history
+eviction can make old navigation/output ranges unavailable; copied output is
+the current grid text, not an immutable command transcript. It can include zsh's
+end-of-line marker (`%`) when command output has no final newline. Automatic
+hooks apply to the configured zsh session; nested shells need their own hooks.
+
+Cmd+F opens a native scrollback Find panel. Return / Shift+Return and
+Cmd+G / Cmd+Shift+G move between matches; Escape closes it. Search highlights
+logical text across soft wraps, including combining marks and wide characters.
+Hard line breaks separate matches. Search ignores case by default using Unicode
+case folding and canonical normalization: `Straße`, `STRASSE` and `STRAẞE` match,
+as do composed/decomposed umlauts. Accents remain meaningful: `Müller` does not
+match `Muller` or `Mueller`, and `s` does not match half of `ß`. Enable **Match
+case** for exact stored-text matching. Highlighting and copying retain the
+original spelling. Searches are bounded to two million cells and 10,000 matches;
+the panel reports partial results. New output invalidates highlights; press
+Return to refresh. Search does not continually rescan streaming output.
+
 Cmd+N/W opens/closes windows, Cmd+C/V copies/pastes, Cmd+K clears history,
 Cmd+A selects the buffer, and Cmd++/−/0 changes/resets font size. After a
 failed shell exit, Cmd+R restarts the shell.

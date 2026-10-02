@@ -33,7 +33,7 @@ const IO_BUDGET: usize = 1024 * 1024;
 const WRITE_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 static WORKER_ID: AtomicU64 = AtomicU64::new(0);
 // Concurrent PTY creation can fail inside macOS openpty; serialize setup only.
-static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 struct State {
@@ -167,6 +167,7 @@ pub struct PtyHandle {
     pub(crate) exit_rx: Receiver<Option<ExitStatus>>,
     // Cleanup runs on the worker; dropping a window never waits for a child.
     _worker: Option<JoinHandle<()>>,
+    _shell_integration: Option<tempfile::TempDir>,
 }
 
 impl PtyHandle {
@@ -180,6 +181,8 @@ impl PtyHandle {
         if !config.shell.program.is_empty() {
             options.shell = Some(Shell::new(config.shell.program.clone(), vec![]));
         }
+        let shell_integration = crate::shell_integration::configure(&config.shell, &mut options)
+            .map_err(TerminalError::Io)?;
         let pty = {
             let _spawn = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             tty::setup_env();
@@ -211,6 +214,7 @@ impl PtyHandle {
             rx,
             exit_rx,
             _worker: Some(worker),
+            _shell_integration: shell_integration,
         })
     }
 
@@ -299,6 +303,7 @@ impl PtyHandle {
             rx,
             exit_rx,
             _worker: None,
+            _shell_integration: None,
         };
         (handle, peer)
     }

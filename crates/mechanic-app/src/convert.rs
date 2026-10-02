@@ -628,6 +628,40 @@ mod tests {
     }
 
     #[test]
+    fn german_copy_preserves_sharp_s_umlauts_and_quotes_after_reflow() {
+        let original = "ÄÖÜäöüßẞ „Fünf große Füße grüßen Köln.“\nStraße STRASSE STRAẞE: Maße sind keine Masse. Gru\u{308}ße und A\u{308}O\u{308}U\u{308} a\u{308}o\u{308}u\u{308}; 10\u{a0}€ kosten die Bücher.";
+        for initial_cols in [5, 8, 17, 43] {
+            let mut term = parsed_term(initial_cols, 4, &original.replace('\n', "\r\n"));
+            for cols in [initial_cols, 3, 29, 7, 43] {
+                term.resize(TermSize::new(cols, 4));
+                let start = Point::new(term.grid().topmost_line(), Column(0));
+                let mut end = term.grid().cursor.point;
+                if !term.grid().cursor.input_needs_wrap {
+                    if end.column.0 == 0 {
+                        end = Point::new(end.line - 1, term.grid().last_column());
+                    } else {
+                        end.column -= 1;
+                    }
+                }
+                let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+                selection.update(end, Side::Right);
+                term.selection = Some(selection);
+                assert_eq!(
+                    term.selection_to_string().as_deref(),
+                    Some(original),
+                    "width {initial_cols} → {cols}"
+                );
+                for offset in [0, 2, 7] {
+                    term.scroll_display(Scroll::Delta(offset));
+                    let grid = snapshot(&term, &Theme::default(), true);
+                    assert_eq!(grid.cols, cols);
+                    assert_eq!(term.selection_to_string().as_deref(), Some(original));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn wrapped_multilingual_article_copy_preserves_original_logical_order() {
         // Original newspaper-style prose, not a quotation from a published article.
         let original = "أعلنت الجهاتُ المعنيّة، صباحَ اليوم، إطلاقَ مشروعٍ جديدٍ للنقل في المدينة. تبدأ المرحلة الأولى في ١٥ أكتوبر ٢٠٢٦ وتشمل 24 محطةً. وقال التقرير: «لا تكتملُ التنميةُ إلا بمشاركة المجتمع»، مع تخصيص ٣٫٥ ملايين دولار. وتُنشر النتائج عبر Open Data؛ ويمكن متابعة الأخبار والأسئلة: هل يتحسّن العمل؟ نعم، بإذن الله.\nРусский: Новости дня; Українська: Ґрунт і єдність. 日本語: 東京の新聞。 Cafe\u{301} nin\u{303}o ac\u{327}a\u{303}o.";

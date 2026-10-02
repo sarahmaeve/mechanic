@@ -1829,6 +1829,135 @@ mod tests {
     }
 
     #[test]
+    fn german_letters_quotes_and_diaeresis_keep_cells_across_styles_and_wraps() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        let text = "ÄÖÜäöüßẞ „Grüße, Straße!“ A\u{308}O\u{308}U\u{308}a\u{308}o\u{308}u\u{308}";
+        let mut input = Vec::<RenderCell>::new();
+        for character in text.chars() {
+            if character == '\u{308}' {
+                input.last_mut().unwrap().zerowidth.push(character);
+            } else {
+                input.push(RenderCell { character, ..Default::default() });
+            }
+        }
+        assert_eq!(input.iter().filter(|cell| !cell.zerowidth.is_empty()).count(), 6);
+        for style in [
+            CellFlags::empty(),
+            CellFlags::BOLD,
+            CellFlags::ITALIC,
+            CellFlags::BOLD | CellFlags::ITALIC,
+        ] {
+            for cell in &mut input {
+                cell.flags = style;
+            }
+            for width in [1, 3, 7, input.len()] {
+                let rows: Vec<_> = input.chunks(width).collect();
+                let before = input.clone();
+                let shaped = shape_contextual_paragraph(
+                    &mut fonts,
+                    &mut buffer,
+                    &rows,
+                    &config,
+                    metrics,
+                    "",
+                    "",
+                );
+                assert_eq!(shaped.len(), rows.len());
+                for (row, source) in shaped.iter().zip(&rows) {
+                    assert_permutation(row);
+                    assert_eq!(row.visual_cols, (0..source.len()).collect::<Vec<_>>());
+                    assert!(row.rtl.iter().all(|rtl| !rtl));
+                    assert!(
+                        row.glyphs.iter().all(|glyph| glyph.cache_key.glyph_id != 0),
+                        "German glyph fallback failed: style {style:?}, width {width}"
+                    );
+                    for (col, cell) in source.iter().enumerate() {
+                        if cell.character == ' ' {
+                            continue;
+                        }
+                        assert!(
+                            row.glyphs.iter().any(|glyph| glyph.source_col == col
+                                && glyph.cluster_start <= col
+                                && col < glyph.cluster_end),
+                            "German cell lost glyph/selection geometry: {:?}{:?}, style {style:?}, width {width}, column {col}",
+                            cell.character,
+                            cell.zerowidth
+                        );
+                    }
+                }
+                // Shaping may reorder display geometry but must never normalize
+                // the cells later used by clipboard copying or terminal input.
+                assert_eq!(input, before);
+            }
+        }
+    }
+
+    #[test]
+    fn german_composed_and_decomposed_diaeresis_shape_equally_without_losing_marks() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        let signature = |row: &ShapedRow| {
+            row.glyphs
+                .iter()
+                .map(|glyph| {
+                    (
+                        glyph.cache_key,
+                        glyph.x.to_bits(),
+                        glyph.y.to_bits(),
+                        glyph.source_col,
+                        glyph.cluster_start,
+                        glyph.cluster_end,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for style in [
+            CellFlags::empty(),
+            CellFlags::BOLD,
+            CellFlags::ITALIC,
+            CellFlags::BOLD | CellFlags::ITALIC,
+        ] {
+            for (base, composed) in
+                [('A', 'Ä'), ('O', 'Ö'), ('U', 'Ü'), ('a', 'ä'), ('o', 'ö'), ('u', 'ü')]
+            {
+                let composed_cell =
+                    RenderCell { character: composed, flags: style, ..Default::default() };
+                let base_cell = RenderCell { character: base, flags: style, ..Default::default() };
+                let marked_cell = RenderCell { zerowidth: "\u{308}".into(), ..base_cell.clone() };
+                let composed_row = shape_contextual_row(
+                    &mut fonts,
+                    &mut buffer,
+                    &[composed_cell],
+                    &config,
+                    metrics,
+                );
+                let marked_row =
+                    shape_contextual_row(&mut fonts, &mut buffer, &[marked_cell], &config, metrics);
+                let base_row =
+                    shape_contextual_row(&mut fonts, &mut buffer, &[base_cell], &config, metrics);
+                for row in [&composed_row, &marked_row] {
+                    assert_permutation(row);
+                    assert_eq!(row.visual_cols, vec![0]);
+                    assert!(!row.glyphs.is_empty());
+                    assert!(row.glyphs.iter().all(|glyph| glyph.cache_key.glyph_id != 0
+                        && glyph.source_col == 0
+                        && glyph.cluster_start == 0
+                        && glyph.cluster_end == 1));
+                }
+                assert_eq!(
+                    signature(&marked_row),
+                    signature(&composed_row),
+                    "canonical German spelling changed display: {base}/{composed}, {style:?}"
+                );
+                assert_ne!(
+                    signature(&marked_row),
+                    signature(&base_row),
+                    "diaeresis was discarded: {base}, {style:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn arabic_joining_and_prose_punctuation_follow_paragraph_direction() {
         let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
         let input = cells("سلام");

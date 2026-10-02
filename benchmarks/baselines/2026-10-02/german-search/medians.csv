@@ -1,0 +1,17 @@
+variant,workload,cell_budget,samples,median_ms
+after,ASCII,120000,18,0.790312
+after,ASCII,2000000,18,8.17471
+after,Arabic,120000,18,1.19979
+after,Arabic,2000000,18,11.5533
+after,CJK,120000,18,0.874395
+after,CJK,2000000,18,8.70977
+after,Latin,120000,18,0.831271
+after,Latin,2000000,18,8.22138
+before,ASCII,120000,18,0.738896
+before,ASCII,2000000,18,7.27719
+before,Arabic,120000,18,0.921542
+before,Arabic,2000000,18,9.21356
+before,CJK,120000,18,0.694001
+before,CJK,2000000,18,6.98744
+before,Latin,120000,18,0.771354
+before,Latin,2000000,18,7.65008

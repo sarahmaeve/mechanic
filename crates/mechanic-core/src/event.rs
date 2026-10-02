@@ -22,6 +22,8 @@ pub enum TerminalEvent {
     PtyWrite(Vec<u8>),
     /// Color or viewport query, carrying the parser's protocol formatter.
     Query(AlacrittyEvent),
+    /// Parsed shell protocol marker with its main-grid coordinates.
+    ShellIntegration(AlacrittyEvent),
 }
 
 /// Cloneable queue for events emitted by the terminal parser.
@@ -71,6 +73,11 @@ impl Default for EventProxy {
 impl AlacrittyEventListener for EventProxy {
     fn send_event(&self, event: AlacrittyEvent) {
         match event {
+            event @ (AlacrittyEvent::ShellIntegration(..)
+            | AlacrittyEvent::ShellErase(..)
+            | AlacrittyEvent::ShellCellsChanged(..)) => {
+                self.push(TerminalEvent::ShellIntegration(event))
+            }
             AlacrittyEvent::Title(title) => self.push(TerminalEvent::TitleChanged(title)),
             AlacrittyEvent::ResetTitle => self.push(TerminalEvent::TitleReset),
             AlacrittyEvent::Bell => self.push(TerminalEvent::Bell),

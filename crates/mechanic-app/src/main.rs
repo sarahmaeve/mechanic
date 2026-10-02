@@ -9,6 +9,8 @@ mod link_platform;
 mod mouse;
 mod preedit;
 mod scheduling;
+mod search;
+mod search_platform;
 
 use app::UserEvent;
 

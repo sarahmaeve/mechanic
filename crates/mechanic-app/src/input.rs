@@ -10,11 +10,27 @@ pub fn translate_key(
     modifiers: ModifiersState,
     cursor_app_mode: bool,
 ) -> Option<Vec<u8>> {
-    if event.state != ElementState::Pressed {
+    translate_input(
+        event.state,
+        &event.logical_key,
+        event.text.as_deref(),
+        modifiers,
+        cursor_app_mode,
+    )
+}
+
+fn translate_input(
+    state: ElementState,
+    logical_key: &Key,
+    text: Option<&str>,
+    modifiers: ModifiersState,
+    cursor_app_mode: bool,
+) -> Option<Vec<u8>> {
+    if state != ElementState::Pressed {
         return None;
     }
 
-    match &event.logical_key {
+    match logical_key {
         Key::Named(named) => {
             if let Some(bytes) = modified_named_key(named, modifiers) {
                 return Some(bytes);
@@ -35,7 +51,7 @@ pub fn translate_key(
                 return Some(vec![ctrl_byte]);
             }
 
-            if let Some(text) = &event.text
+            if let Some(text) = text
                 && !text.is_empty()
             {
                 return Some(text.as_bytes().to_vec());
@@ -158,7 +174,7 @@ pub fn modified_arrow(
 
 #[cfg(test)]
 mod tests {
-    use winit::keyboard::{NamedKey, SmolStr};
+    use winit::keyboard::NamedKey;
 
     use super::*;
 
@@ -359,29 +375,95 @@ mod tests {
 
     #[test]
     fn char_text_present() {
-        let text = SmolStr::new("a");
-        let bytes: Vec<u8> = text.as_bytes().to_vec();
-        assert_eq!(bytes, b"a");
+        assert_eq!(
+            translate_input(
+                ElementState::Pressed,
+                &Key::Character("a".into()),
+                Some("A"),
+                ModifiersState::SHIFT,
+                false
+            ),
+            Some(b"A".to_vec())
+        );
     }
 
     #[test]
     fn ctrl_c_via_text() {
-        let text = SmolStr::new("\x03");
-        assert_eq!(text.as_bytes(), &[0x03]);
+        assert_eq!(
+            translate_input(
+                ElementState::Pressed,
+                &Key::Character("c".into()),
+                Some("\x03"),
+                ModifiersState::CONTROL,
+                false
+            ),
+            Some(vec![3])
+        );
     }
 
     #[test]
     fn utf8_multibyte() {
-        let text = SmolStr::new("é");
-        assert_eq!(text.as_bytes(), "é".as_bytes());
-        assert_eq!(text.as_bytes(), &[0xC3, 0xA9]);
+        for text in ["Ä", "Ö", "Ü", "ä", "ö", "ü", "ß", "ẞ", "a\u{308}", "„“, €", "Grüße aus Köln"]
+        {
+            for modifiers in [ModifiersState::empty(), ModifiersState::SHIFT, ModifiersState::ALT] {
+                assert_eq!(
+                    translate_input(
+                        ElementState::Pressed,
+                        &Key::Character("x".into()),
+                        Some(text),
+                        modifiers,
+                        false
+                    ),
+                    Some(text.as_bytes().to_vec())
+                );
+                assert_eq!(
+                    translate_input(
+                        ElementState::Pressed,
+                        &Key::Character(text.into()),
+                        None,
+                        modifiers,
+                        false
+                    ),
+                    Some(text.as_bytes().to_vec())
+                );
+            }
+        }
+        assert_eq!(
+            translate_input(
+                ElementState::Released,
+                &Key::Character("ü".into()),
+                Some("ü"),
+                ModifiersState::empty(),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            translate_input(
+                ElementState::Pressed,
+                &Key::Dead(Some('¨')),
+                None,
+                ModifiersState::empty(),
+                false
+            ),
+            None
+        );
     }
 
     #[test]
     fn char_fallback_no_text() {
-        let s = SmolStr::new("z");
-        let bytes: Vec<u8> = s.as_bytes().to_vec();
-        assert_eq!(bytes, b"z");
+        for text in [None, Some("")] {
+            assert_eq!(
+                translate_input(
+                    ElementState::Pressed,
+                    &Key::Character("ẞ".into()),
+                    text,
+                    ModifiersState::SHIFT,
+                    false
+                ),
+                Some("ẞ".as_bytes().to_vec())
+            );
+        }
     }
 
     #[test]

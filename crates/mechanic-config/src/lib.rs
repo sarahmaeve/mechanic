@@ -17,12 +17,14 @@ use std::path::Path;
 pub struct ShellConfig {
     /// Shell path or executable name; defaults to `$SHELL`, then `/bin/zsh`.
     pub program: String,
+    /// Install command-boundary and working-directory hooks in supported shells.
+    pub integration: bool,
 }
 
 impl Default for ShellConfig {
     fn default() -> Self {
         let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        Self { program }
+        Self { program, integration: true }
     }
 }
 
@@ -87,6 +89,7 @@ mod tests {
         assert_eq!(cfg.theme.foreground, theme::palette::ELECTRIC);
         assert_eq!(cfg.font.family, "Berkeley Mono");
         assert!(!cfg.shell.program.is_empty());
+        assert!(cfg.shell.integration);
     }
 
     #[test]
@@ -104,6 +107,7 @@ mod tests {
         assert_eq!(original.font.family, restored.font.family);
         assert!((original.font.size - restored.font.size).abs() < f32::EPSILON);
         assert_eq!(original.shell.program, restored.shell.program);
+        assert_eq!(original.shell.integration, restored.shell.integration);
     }
 
     #[test]
@@ -123,6 +127,7 @@ size = 18.0
 
 [shell]
 program = "/bin/bash"
+integration = false
 "#
         )
         .expect("write tempfile");
@@ -131,6 +136,7 @@ program = "/bin/bash"
         assert!((cfg.font.size - 18.0).abs() < f32::EPSILON);
         assert_eq!(cfg.font.family, "Berkeley Mono"); // still the default
         assert_eq!(cfg.shell.program, "/bin/bash");
+        assert!(!cfg.shell.integration);
     }
 
     #[test]

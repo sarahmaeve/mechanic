@@ -1,0 +1,24 @@
+German canonical Unicode search, 2026-10-02
+macOS 26.6.2 (25G83), arm64
+rustc 1.99.0 (b940084d7 2026-09-28), release profile
+Parent commit: 6e5998d; both variants include uncommitted shell/search work.
+Before: literal lowercase search, captured before Unicode folding changes.
+After: NFD -> full case fold -> NFD; complete source-cell match boundaries.
+Dependencies: caseless 0.2.2, unicode-normalization 0.1.25.
+Existing locked package versions preserved; local vte/alacritty patches retained.
+
+Harness: search::tests::diverse_ten_thousand_line_search_latency
+Arguments: --ignored --exact --nocapture --test-threads=1
+Unchanged harness in both variants. Run order: before, after, after-reverse,
+before-reverse. Nine samples per workload/budget/run, 18 per aggregate median.
+No concurrent builds or benchmarks. Population and correctness warmup excluded.
+All measured scans checked counts: 10,000 full, 999 restricted; partial flag checked.
+medians.csv combines both orders; even medians average observations 9 and 10.
+Timing output is in the four .txt files. Not a GUI or cross-terminal benchmark.
+
+SHA-256:
+before executable: 93dac8e596e0ffcdd6ff45afd026f1255b476e26d8ee96110986e800106e1f0e
+before search.rs: bf18c6a9847750ef07e53d6296ef2dbabad0528cc853400add2fb905c06676ab
+after executable: 3e7e0c18d7425384929d47ca0b9547957b6b87f078ade02e35c50e1ec9fff403
+Final source adds an overlap regression test after the timed binary was built;
+production search and the timing harness are unchanged.

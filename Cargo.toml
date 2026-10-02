@@ -51,3 +51,7 @@ arboard = "3"
 mechanic-core = { path = "crates/mechanic-core" }
 mechanic-renderer = { path = "crates/mechanic-renderer" }
 mechanic-config = { path = "crates/mechanic-config" }
+
+[patch.crates-io]
+vte = { path = "vendor/vte" }
+alacritty_terminal = { path = "vendor/alacritty_terminal" }

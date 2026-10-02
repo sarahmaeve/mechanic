@@ -1,0 +1,85 @@
+
+running 1 test
+test search::tests::diverse_ten_thousand_line_search_latency ... search_sample,ASCII,2000000,10000,0,8602417
+search_sample,ASCII,2000000,10000,1,7879583
+search_sample,ASCII,2000000,10000,2,7306042
+search_sample,ASCII,2000000,10000,3,7407750
+search_sample,ASCII,2000000,10000,4,7193334
+search_sample,ASCII,2000000,10000,5,7156125
+search_sample,ASCII,2000000,10000,6,7163750
+search_sample,ASCII,2000000,10000,7,7191917
+search_sample,ASCII,2000000,10000,8,7282667
+search ASCII: cell_budget=2000000 hits=10000 min=7.156ms median=7.283ms max=8.602ms
+search_sample,ASCII,120000,999,0,743917
+search_sample,ASCII,120000,999,1,742875
+search_sample,ASCII,120000,999,2,742709
+search_sample,ASCII,120000,999,3,739917
+search_sample,ASCII,120000,999,4,740875
+search_sample,ASCII,120000,999,5,741542
+search_sample,ASCII,120000,999,6,740917
+search_sample,ASCII,120000,999,7,749125
+search_sample,ASCII,120000,999,8,743875
+search ASCII: cell_budget=120000 hits=999 min=0.740ms median=0.743ms max=0.749ms
+search_sample,Latin,2000000,10000,0,7656208
+search_sample,Latin,2000000,10000,1,7736625
+search_sample,Latin,2000000,10000,2,7782541
+search_sample,Latin,2000000,10000,3,7709834
+search_sample,Latin,2000000,10000,4,7741667
+search_sample,Latin,2000000,10000,5,7789958
+search_sample,Latin,2000000,10000,6,7817500
+search_sample,Latin,2000000,10000,7,7639542
+search_sample,Latin,2000000,10000,8,7678125
+search Latin: cell_budget=2000000 hits=10000 min=7.640ms median=7.737ms max=7.817ms
+search_sample,Latin,120000,999,0,771291
+search_sample,Latin,120000,999,1,765000
+search_sample,Latin,120000,999,2,779208
+search_sample,Latin,120000,999,3,772250
+search_sample,Latin,120000,999,4,774708
+search_sample,Latin,120000,999,5,768875
+search_sample,Latin,120000,999,6,771417
+search_sample,Latin,120000,999,7,783250
+search_sample,Latin,120000,999,8,773375
+search Latin: cell_budget=120000 hits=999 min=0.765ms median=0.772ms max=0.783ms
+search_sample,CJK,2000000,10000,0,7047750
+search_sample,CJK,2000000,10000,1,7078041
+search_sample,CJK,2000000,10000,2,6950917
+search_sample,CJK,2000000,10000,3,7140542
+search_sample,CJK,2000000,10000,4,6988709
+search_sample,CJK,2000000,10000,5,7003500
+search_sample,CJK,2000000,10000,6,7234042
+search_sample,CJK,2000000,10000,7,6986416
+search_sample,CJK,2000000,10000,8,6922292
+search CJK: cell_budget=2000000 hits=10000 min=6.922ms median=7.003ms max=7.234ms
+search_sample,CJK,120000,999,0,685584
+search_sample,CJK,120000,999,1,697958
+search_sample,CJK,120000,999,2,707542
+search_sample,CJK,120000,999,3,695708
+search_sample,CJK,120000,999,4,693959
+search_sample,CJK,120000,999,5,694042
+search_sample,CJK,120000,999,6,691750
+search_sample,CJK,120000,999,7,656084
+search_sample,CJK,120000,999,8,654500
+search CJK: cell_budget=120000 hits=999 min=0.654ms median=0.694ms max=0.708ms
+search_sample,Arabic,2000000,10000,0,8926417
+search_sample,Arabic,2000000,10000,1,9011875
+search_sample,Arabic,2000000,10000,2,9047167
+search_sample,Arabic,2000000,10000,3,9257708
+search_sample,Arabic,2000000,10000,4,9207958
+search_sample,Arabic,2000000,10000,5,9037250
+search_sample,Arabic,2000000,10000,6,9324208
+search_sample,Arabic,2000000,10000,7,8943334
+search_sample,Arabic,2000000,10000,8,9230167
+search Arabic: cell_budget=2000000 hits=10000 min=8.926ms median=9.047ms max=9.324ms
+search_sample,Arabic,120000,999,0,919750
+search_sample,Arabic,120000,999,1,916875
+search_sample,Arabic,120000,999,2,859959
+search_sample,Arabic,120000,999,3,831417
+search_sample,Arabic,120000,999,4,857208
+search_sample,Arabic,120000,999,5,870250
+search_sample,Arabic,120000,999,6,873125
+search_sample,Arabic,120000,999,7,890334
+search_sample,Arabic,120000,999,8,882542
+search Arabic: cell_budget=120000 hits=999 min=0.831ms median=0.873ms max=0.920ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 122 filtered out; finished in 0.37s

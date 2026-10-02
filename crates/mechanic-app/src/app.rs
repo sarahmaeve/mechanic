@@ -27,12 +27,16 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 pub enum UserEvent {
     /// Wake this window to drain queued PTY output.
     PtyOutput(WindowId),
+    Search(WindowId, crate::search_platform::SearchAction),
 }
 
 /// State for one terminal window.
 struct AppState {
+    search_panel: Option<crate::search_platform::SearchPanel>,
+    search: crate::search::Search,
     /// The OS window, shared with the wgpu surface via `Arc`.
     window: Arc<Window>,
+    window_title: String,
     terminal: Terminal,
     renderer: Renderer,
     /// Real cell metrics from the renderer (used for resize calculations).
@@ -78,6 +82,61 @@ struct AppState {
 }
 
 impl AppState {
+    fn invalidate_search(&mut self) {
+        if self.search.invalidate() {
+            self.update_search_status();
+        }
+    }
+
+    fn update_search_status(&self) {
+        if self.search.active
+            && let Some(panel) = &self.search_panel
+        {
+            panel.set_status(&self.search.status());
+        }
+    }
+
+    fn show_search(&mut self, proxy: &EventLoopProxy<UserEvent>, id: WindowId) {
+        if self.search_panel.is_none() {
+            let proxy = proxy.clone();
+            match crate::search_platform::SearchPanel::new(&self.window, move |action| {
+                let _ = proxy.send_event(UserEvent::Search(id, action));
+            }) {
+                Ok(panel) => self.search_panel = Some(panel),
+                Err(error) => {
+                    log::warn!("could not open search: {error}");
+                    return;
+                }
+            }
+        }
+        self.preedit = None;
+        self.link_press.cancel();
+        self.search.active = true;
+        self.update_search_status();
+        self.search_panel.as_ref().unwrap().show();
+        self.mark_content_dirty();
+        self.request_redraw();
+    }
+
+    fn reveal_search_match(&mut self) {
+        if let Some(hit) = self.search.current() {
+            let offset = self.terminal.grid().display_offset();
+            let top = -(offset as i32);
+            let bottom = top + self.terminal.screen_lines() as i32 - 1;
+            if hit.start.line.0 < top || hit.end.line.0 > bottom {
+                let desired = (-hit.start.line.0).max(0) as usize;
+                if desired > offset {
+                    self.terminal.scroll_up(desired - offset);
+                } else {
+                    self.terminal.scroll_down(offset - desired);
+                }
+            }
+        }
+        self.update_search_status();
+        self.mark_content_dirty();
+        self.request_redraw();
+    }
+
     fn mark_content_dirty(&mut self) {
         self.content_dirty = true;
         self.layout_dirty = true;
@@ -211,12 +270,14 @@ impl App {
             state.preedit = None;
         }
         if outcome.grid_maybe_changed {
+            state.invalidate_search();
             state.mark_content_dirty();
         }
 
         // Fatal transport failures freeze the window even if a child exit was
         // delivered with the same final output batch.
         if let Some(error) = outcome.io_error {
+            state.invalidate_search();
             log::error!("window {id:?} PTY transport failed: {error}");
             state.terminal.inject_local(
                 b"\r\n\x1b[31m[terminal I/O failed; Cmd+R to restart, any key to close]\x1b[0m\r\n",
@@ -244,6 +305,7 @@ impl App {
                 return;
             }
             inject_exit_banner(&mut state.terminal, status);
+            state.invalidate_search();
             state.exit_status = Some(status);
             state.mark_content_dirty();
             state.request_redraw();
@@ -268,6 +330,7 @@ impl App {
         let inner = state.window.inner_size();
         let term_size = Self::terminal_size_from_metrics(inner.width, inner.height, &new_metrics);
         state.terminal.resize(term_size);
+        state.invalidate_search();
 
         state.mark_content_dirty();
         state.request_redraw();
@@ -346,7 +409,10 @@ impl App {
 
         let now = std::time::Instant::now();
         let mut state = AppState {
+            search_panel: None,
+            search: crate::search::Search::default(),
             window: window.clone(),
+            window_title: "Mechanic".into(),
             terminal,
             renderer,
             cell_metrics,
@@ -506,6 +572,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let new_term_size =
                     Self::terminal_size_from_metrics(size.width, size.height, &state.cell_metrics);
                 state.terminal.resize(new_term_size);
+                state.invalidate_search();
 
                 state.mark_content_dirty();
                 state.request_redraw();
@@ -549,6 +616,43 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 if key_event.state == ElementState::Pressed {
                     state.link_press.cancel();
+                }
+                if key_event.state == ElementState::Pressed {
+                    match workspace_shortcut(&key_event.logical_key, state.modifiers) {
+                        Some(WorkspaceShortcut::Find) => {
+                            state.show_search(&self.proxy, id);
+                            return;
+                        }
+                        Some(WorkspaceShortcut::FindNext | WorkspaceShortcut::FindPrevious) => {
+                            let backwards = state.modifiers.shift_key();
+                            if !state.search.active {
+                                state.show_search(&self.proxy, id);
+                            }
+                            state.search.navigate(&state.terminal, backwards);
+                            state.reveal_search_match();
+                            return;
+                        }
+                        Some(WorkspaceShortcut::PreviousPrompt | WorkspaceShortcut::NextPrompt) => {
+                            if key_event.logical_key == Key::Named(NamedKey::ArrowUp) {
+                                state.terminal.jump_to_previous_prompt();
+                            } else {
+                                state.terminal.jump_to_next_prompt();
+                            }
+                            state.mark_content_dirty();
+                            state.request_redraw();
+                            return;
+                        }
+                        Some(WorkspaceShortcut::CopyCommandOutput) => {
+                            if let Some(output) = state.terminal.last_command_output()
+                                && let Some(clipboard) = &mut state.clipboard
+                                && let Err(error) = clipboard.set_text(output)
+                            {
+                                log::warn!("could not copy command output: {error}");
+                            }
+                            return;
+                        }
+                        None => {}
+                    }
                 }
                 if state.exit_status.is_some() && key_event.state == ElementState::Pressed {
                     let key = &key_event.logical_key;
@@ -605,6 +709,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         CmdShortcut::ClearScrollback => {
                             state.terminal.clear_history();
+                            state.invalidate_search();
                             state.mark_content_dirty();
                             state.request_redraw();
                             return;
@@ -1116,6 +1221,41 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::Search(id, action) => {
+                let Some(state) = self.windows.get_mut(&id) else {
+                    return;
+                };
+                if !state.search.active {
+                    return;
+                }
+                match action {
+                    crate::search_platform::SearchAction::Query(query) => {
+                        state.search.set_query(query, &state.terminal)
+                    }
+                    crate::search_platform::SearchAction::CaseSensitive(enabled) => {
+                        state.search.set_case_sensitive(enabled, &state.terminal)
+                    }
+                    crate::search_platform::SearchAction::Next => {
+                        state.search.navigate(&state.terminal, false)
+                    }
+                    crate::search_platform::SearchAction::Previous => {
+                        state.search.navigate(&state.terminal, true)
+                    }
+                    crate::search_platform::SearchAction::Close => {
+                        state.search.active = false;
+                        if let Some(panel) = &state.search_panel {
+                            panel.close();
+                        }
+                        state.window.focus_window();
+                    }
+                }
+                if state.search.active {
+                    state.reveal_search_match();
+                } else {
+                    state.mark_content_dirty();
+                    state.request_redraw();
+                }
+            }
             UserEvent::PtyOutput(id) => {
                 if let Some(state) = self.windows.get(&id)
                     && state.exit_status.is_none()
@@ -1247,6 +1387,63 @@ fn animation_toggle_shortcut(key: PhysicalKey, modifiers: ModifiersState) -> boo
         && modifiers == (ModifiersState::SUPER | ModifiersState::SHIFT)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WorkspaceShortcut {
+    Find,
+    FindNext,
+    FindPrevious,
+    PreviousPrompt,
+    NextPrompt,
+    CopyCommandOutput,
+}
+
+fn workspace_shortcut(key: &Key, modifiers: ModifiersState) -> Option<WorkspaceShortcut> {
+    if modifiers == ModifiersState::SUPER {
+        return match key {
+            Key::Character(c) if c.eq_ignore_ascii_case("f") => Some(WorkspaceShortcut::Find),
+            Key::Character(c) if c.eq_ignore_ascii_case("g") => Some(WorkspaceShortcut::FindNext),
+            _ => None,
+        };
+    }
+    if modifiers == (ModifiersState::SUPER | ModifiersState::SHIFT) {
+        return match key {
+            Key::Character(c) if c.eq_ignore_ascii_case("g") => {
+                Some(WorkspaceShortcut::FindPrevious)
+            }
+            Key::Character(c) if c.eq_ignore_ascii_case("c") => {
+                Some(WorkspaceShortcut::CopyCommandOutput)
+            }
+            Key::Named(NamedKey::ArrowUp) => Some(WorkspaceShortcut::PreviousPrompt),
+            Key::Named(NamedKey::ArrowDown) => Some(WorkspaceShortcut::NextPrompt),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn shell_window_title(
+    title: &str,
+    cwd: Option<&str>,
+    running: bool,
+    status: Option<i32>,
+) -> String {
+    let mut title = if title.is_empty() { "Mechanic".to_owned() } else { title.to_owned() };
+    if let Some(cwd) = cwd {
+        title.push_str(" — ");
+        title.extend(cwd.chars().filter(|c| !c.is_control()).take(256));
+    }
+    if running {
+        title.push_str(" [running]");
+    } else if let Some(status) = status {
+        if status == 0 {
+            title.push_str(" [ok]");
+        } else {
+            title.push_str(&format!(" [exit {status}]"));
+        }
+    }
+    title
+}
+
 fn toggled_animations(
     current: mechanic_config::theme::AnimationConfig,
     logo_visible: bool,
@@ -1306,6 +1503,7 @@ fn render_frame(
             &config.theme,
             state.focused && state.preedit.is_none(),
         );
+        state.search.highlight(&mut grid, &state.terminal, &config.theme);
         if let Some(preedit) = &state.preedit {
             preedit.overlay(&mut grid, &config.theme);
         }
@@ -1327,13 +1525,24 @@ fn render_frame(
         state.bloom_start = None;
     }
 
-    let base_title = state.terminal.title();
+    let shell = state.terminal.shell_integration();
+    let shell_running = state.exit_status.is_none() && shell.is_running();
+    let integrated_title = shell_window_title(
+        state.terminal.title(),
+        shell.cwd(),
+        shell_running,
+        state.exit_status.is_none().then(|| shell.last_exit_status()).flatten(),
+    );
+    let base_title = integrated_title.as_str();
     let base = if base_title.is_empty() { "Mechanic" } else { base_title };
     let title_string = match state.exit_status {
         Some(status) => format!("{base} — {}", format_title_suffix(status)),
         None => base.to_string(),
     };
-    state.window.set_title(&title_string);
+    if title_string != state.window_title {
+        state.window.set_title(&title_string);
+        state.window_title = title_string;
+    }
 }
 
 fn open_link(target: &crate::hyperlinks::LinkTarget) {
@@ -1458,6 +1667,7 @@ fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId, waker: Pty
     let size = state.terminal.size();
     match Terminal::new(config, size, waker) {
         Ok(new_term) => {
+            state.invalidate_search();
             state.terminal = new_term;
             state.link_press.cancel();
             state.preedit = None;
@@ -1557,6 +1767,48 @@ fn format_exit_status(status: Option<std::process::ExitStatus>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_shortcuts_do_not_capture_shell_keys() {
+        for key in
+            [Key::Character("f".into()), Key::Character("g".into()), Key::Named(NamedKey::ArrowUp)]
+        {
+            for modifiers in [ModifiersState::empty(), ModifiersState::CONTROL, ModifiersState::ALT]
+            {
+                assert_eq!(workspace_shortcut(&key, modifiers), None);
+            }
+        }
+        let shifted = ModifiersState::SUPER | ModifiersState::SHIFT;
+        assert_eq!(
+            workspace_shortcut(&Key::Character("f".into()), ModifiersState::SUPER),
+            Some(WorkspaceShortcut::Find)
+        );
+        assert_eq!(
+            workspace_shortcut(&Key::Character("G".into()), shifted),
+            Some(WorkspaceShortcut::FindPrevious)
+        );
+        assert_eq!(
+            workspace_shortcut(&Key::Named(NamedKey::ArrowUp), shifted),
+            Some(WorkspaceShortcut::PreviousPrompt)
+        );
+        assert_eq!(
+            workspace_shortcut(&Key::Character("C".into()), shifted),
+            Some(WorkspaceShortcut::CopyCommandOutput)
+        );
+        assert_eq!(workspace_shortcut(&Key::Character("c".into()), ModifiersState::SUPER), None);
+    }
+
+    #[test]
+    fn shell_titles_distinguish_running_completion_and_absent_metadata() {
+        assert_eq!(shell_window_title("", None, false, None), "Mechanic");
+        assert_eq!(
+            shell_window_title("vim", Some("/tmp/café"), true, Some(2)),
+            "vim — /tmp/café [running]"
+        );
+        assert_eq!(shell_window_title("", Some("/tmp"), false, Some(0)), "Mechanic — /tmp [ok]");
+        assert_eq!(shell_window_title("", None, false, Some(7)), "Mechanic [exit 7]");
+        assert!(!shell_window_title("", Some("/tmp\nfoo"), false, None).contains('\n'));
+    }
 
     #[test]
     fn animation_toggle_does_not_take_select_all_or_extra_modifiers() {

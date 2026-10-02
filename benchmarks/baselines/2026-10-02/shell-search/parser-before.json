@@ -1,0 +1,3420 @@
+{
+  "schema": 1,
+  "workload_version": 1,
+  "build_profile": "release",
+  "os": "macos",
+  "arch": "aarch64",
+  "unix_seconds": 1790960899,
+  "requested_bytes": 33554432,
+  "samples": 3,
+  "warmups_per_case": 1,
+  "cols": 120,
+  "rows": 40,
+  "prefill_ms": 100,
+  "yield_ms": 1,
+  "timeout_seconds": 20,
+  "max_call_seconds": 0.004263958,
+  "p95_busy_call_seconds": 0.004134209,
+  "observations": [
+    {
+      "case": "ascii",
+      "warmup": true,
+      "flood_bytes": 33555456,
+      "total_drain_seconds": 0.231052375,
+      "calls": [
+        {
+          "seconds": 0.004297625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004055209,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004006333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004271875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004171958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004234541,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004027458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004228625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004082708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004134916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0021475,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001230917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001305834,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000997667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001029625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001165291,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001075959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000930458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000973458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000935,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001177583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000969292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001075916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001005542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001216125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000997709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001100167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001012125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00103225,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001076458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001123,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00113275,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0011335,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00115425,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001115792,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001085916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000990208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000946167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001070541,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001151584,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001061,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001174167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001089208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001077583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001196125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001103292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000977333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0010905,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001221916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001097667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001149459,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000968916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001148708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001178875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001047291,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000945,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001242916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001124667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001208458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001063792,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001118916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001019917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000966833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0010495,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0010785,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000954,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001186375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001174416,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001092791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001044125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001016084,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001042708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001212042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001103125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001030667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001060083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001305875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001102083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001018667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001099458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001284166,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001110583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001154375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001069583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000194292,
+          "parsed_output": true,
+          "observed_exit": true
+        }
+      ],
+      "marker_before_exit_verified": true,
+      "error": null
+    },
+    {
+      "case": "ascii",
+      "warmup": false,
+      "flood_bytes": 33555456,
+      "total_drain_seconds": 0.219504208,
+      "calls": [
+        {
+          "seconds": 0.004207666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004108292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004204333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0041475,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004185875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004053958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004209125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004118166,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.002609041,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001132333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00113025,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00111575,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001164791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0010955,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001144417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001106125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00112875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001204,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001248,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001324083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00107475,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001261459,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00120625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001094,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00103175,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001176167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0010215,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001128375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001317417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001328042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001092042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001168375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0011335,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001074625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001022041,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000979125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001227041,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000946375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001083083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001067084,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001170042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001197833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001258875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001028125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001256417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001205083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001189291,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001114125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001041708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001140167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0011605,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001138959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001071959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001281209,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0013185,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001168417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001256334,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001238584,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00130775,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001199084,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001096,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000994583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00101975,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001288916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00128775,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001215083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001208083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001262333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001002041,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001103042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001305417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001076709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001086458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001146209,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00106175,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000984708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001177584,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001201417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001180166,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001068125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000557583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 7.5e-7,
+          "parsed_output": false,
+          "observed_exit": true
+        }
+      ],
+      "marker_before_exit_verified": true,
+      "error": null
+    },
+    {
+      "case": "ascii",
+      "warmup": false,
+      "flood_bytes": 33555456,
+      "total_drain_seconds": 0.222577917,
+      "calls": [
+        {
+          "seconds": 0.004260625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00419675,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004128959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004183208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004025,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004215833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004014042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004185917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.003582583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001046083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001208583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001081542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00109,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001068083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000989708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001141958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001087542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00104625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001038917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001237333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001106708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001175542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001136208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001149292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001129583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001072459,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001063084,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001202125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001075917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001083417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001142375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001210584,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001098791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000997791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00087875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0009735,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001314417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001174208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001157625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000958333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001232709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00107025,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001232417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001150167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001204417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001089625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001124125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001117625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001003709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001167167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001316417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001223,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001157042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001204458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001098125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001091583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001131709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001114958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001105375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001077834,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001155667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000982667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001314541,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001067666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001115334,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000989042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00093325,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001052959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001150416,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00115625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001082625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001155708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001056042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001147791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001017292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001081667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001124291,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001134917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001050709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000947291,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001066542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001054125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000618667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 8.34e-7,
+          "parsed_output": false,
+          "observed_exit": true
+        }
+      ],
+      "marker_before_exit_verified": true,
+      "error": null
+    },
+    {
+      "case": "ascii",
+      "warmup": false,
+      "flood_bytes": 33555456,
+      "total_drain_seconds": 0.22180425,
+      "calls": [
+        {
+          "seconds": 0.004178875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004149542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004148833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004210375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004042708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004192458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004046917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004079917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.003894167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001044333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001034709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001129167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001197625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0012165,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000968375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001169625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001074625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001041917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001214333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001016125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001174084,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001308,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001202666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001062709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001178458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001382375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001140625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001260916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001309792,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001201542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001161666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001218959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001294083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001124166,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001303875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001049,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001268875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001301833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001419167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001033708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001321208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001347917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001247167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000953167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001049708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001276208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001239584,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001007625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001176375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001193166,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001099458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000999625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001296209,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001261375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001267583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000971875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001184583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001046625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001354833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00119775,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001217666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001242542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001249625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001051,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001151042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001332375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001076875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00085375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000772542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001134458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000948125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000938667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000937125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001009042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001314458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00129775,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001208625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001285416,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000996875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001131291,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000989209,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 5.42e-7,
+          "parsed_output": false,
+          "observed_exit": true
+        }
+      ],
+      "marker_before_exit_verified": true,
+      "error": null
+    },
+    {
+      "case": "sgr",
+      "warmup": true,
+      "flood_bytes": 33561600,
+      "total_drain_seconds": 0.216332541,
+      "calls": [
+        {
+          "seconds": 0.004103041,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004226916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004005375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004229625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004069625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0042055,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004004125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004035375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004203666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001535667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00118375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001096666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001103417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001197042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001182292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001216,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001092292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001136167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001109208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001289833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001284,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001160959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001128458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001043292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001013667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001294833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001222292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000910458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00112325,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001263708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001280958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001275917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001310375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001418459,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001269,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001049208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001210375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00113375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001373834,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001284833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001042083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0011205,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001269625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001267916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000993125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001098583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001301583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001262708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000974875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001134834,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001302375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001047292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001101916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001188709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001022,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001024125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001241,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001234958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001027083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001260083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001156042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001105625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001254333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001063667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001214541,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001048833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001035417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000974166,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001172583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001136833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001331041,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001427417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001338208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001104833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001322792,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001164584,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001051042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 3.625e-6,
+          "parsed_output": true,
+          "observed_exit": true
+        }
+      ],
+      "marker_before_exit_verified": true,
+      "error": null
+    },
+    {
+      "case": "sgr",
+      "warmup": false,
+      "flood_bytes": 33561600,
+      "total_drain_seconds": 0.221274916,
+      "calls": [
+        {
+          "seconds": 0.004263958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004023625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004198958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004011167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0041065,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004032917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00421225,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00397975,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001161791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00078875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001040083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001051,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000964708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001008083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001146041,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001143958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001186416,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001203625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001025375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001147,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001054959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000938709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001019875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001097,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001135042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000961208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001080709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001201292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001163416,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001043208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001110791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001113417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001089208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001212833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001236583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001145875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001236375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001291041,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001221208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000913917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000910208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001145709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001064791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000968208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000963417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001191791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001041083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001018,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001198625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001079416,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0012655,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00123825,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001089,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001100667,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001109917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001144458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001068625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001204458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001113458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001179875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001014167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001182209,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00120525,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001060583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001123125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001280792,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001040167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0010925,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001051417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001098333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001048833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00087175,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0011215,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001152,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001364834,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001202333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001144334,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0010945,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001139916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001171542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001175708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00110975,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001049458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000372084,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 5.42e-7,
+          "parsed_output": false,
+          "observed_exit": true
+        }
+      ],
+      "marker_before_exit_verified": true,
+      "error": null
+    },
+    {
+      "case": "sgr",
+      "warmup": false,
+      "flood_bytes": 33561600,
+      "total_drain_seconds": 0.216334583,
+      "calls": [
+        {
+          "seconds": 0.004042416,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004220084,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004207666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004134209,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004117,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004095417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004050875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004101959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004133375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001699334,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00120375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00123925,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001014875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001174208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000926958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001016292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001118792,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001126708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000973542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001017708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001196208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00120125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001099125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001243084,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001165167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001086708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000889833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001097917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000996708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0009965,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000791042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000508375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001288625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0013165,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001285041,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001244458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001295916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001181542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001337666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001226,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001146625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001300084,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001299709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001230709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001285042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001356292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001274291,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001303833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00126725,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00122125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001206166,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00137125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001126875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001202708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001183042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001384916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0012765,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001310917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001185333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000983916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001259125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001191625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000807125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001178666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001269666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000920167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00096925,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001219417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00124275,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001248833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001155292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001232875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001345583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001373209,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001336708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001330167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001364083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000329792,
+          "parsed_output": true,
+          "observed_exit": true
+        }
+      ],
+      "marker_before_exit_verified": true,
+      "error": null
+    },
+    {
+      "case": "sgr",
+      "warmup": false,
+      "flood_bytes": 33561600,
+      "total_drain_seconds": 0.220939042,
+      "calls": [
+        {
+          "seconds": 0.004068542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004168042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004197458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004187084,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004059458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004095375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.004170333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.002364,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0010205,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001006083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001022833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000971959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00102975,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001034042,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00091275,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001155,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001223541,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000987625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001070459,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000985291,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000943833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000922209,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001068833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001090917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000991916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0010325,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001028834,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000922666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000985291,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001107583,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001019375,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001088417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001141542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001041625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001179125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001120958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001122916,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001132625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001214709,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001075791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000979292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000956959,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001018917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001252459,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000971666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00107325,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001031459,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000887417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000929417,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00111,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001012083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001078459,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0010225,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001139958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.0009225,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000969666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001003125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001099,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001126,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00101125,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001137208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.00095225,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000976833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000931958,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000982292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001020833,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001076625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001163792,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001015333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001191292,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001047791,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001227167,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000891666,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001154875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001136333,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001006792,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000979458,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001153875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001077875,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000984625,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001000083,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001061208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001208708,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001127917,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.001033208,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 0.000885542,
+          "parsed_output": true,
+          "observed_exit": false
+        },
+        {
+          "seconds": 9.208e-6,
+          "parsed_output": true,
+          "observed_exit": true
+        }
+      ],
+      "marker_before_exit_verified": true,
+      "error": null
+    }
+  ]
+}

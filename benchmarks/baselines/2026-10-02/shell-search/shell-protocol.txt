@@ -1,0 +1,9 @@
+   Compiling mechanic-core v0.1.0 (/Users/sarah.murphy/git/mechanic/crates/mechanic-core)
+    Finished `release` profile [optimized] target(s) in 1.36s
+     Running unittests src/lib.rs (target/release/deps/mechanic_core-6226e9d938a44ecd)
+
+running 1 test
+test terminal::tests::shell_protocol_benchmark ... shell lifecycle: 2000 commands, plain median 961µs, hooks median 2.078292ms, added 558.6 ns/command
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 122 filtered out; finished in 0.04s
