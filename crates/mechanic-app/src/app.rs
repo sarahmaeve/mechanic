@@ -13,7 +13,7 @@ use mechanic_renderer::{CellMetrics, FrameUniforms, Renderer};
 use crate::mouse as mouse_enc;
 use crate::scheduling::{FramePacer, FrameSchedule, ParseQueue};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -283,7 +283,7 @@ impl App {
             last_mouse_report: None,
             content_dirty: true,
             focus_redraw_frames: FOCUS_REDRAW_BURST_FRAMES,
-            focus_gain_at: Some(now),
+            focus_gain_at: self.hot_cpu.then_some(now),
             bloom_start: None,
             frame_pacer: FramePacer::new(now),
         };
@@ -317,6 +317,24 @@ fn pixel_to_grid_point(
 
     let grid_line = row as i32 - display_offset as i32;
     (GridPoint::new(GridLine(grid_line), GridColumn(col)), side)
+}
+
+fn logical_selection_point(
+    renderer: &Renderer,
+    mut point: GridPoint,
+    mut side: GridSide,
+    display_offset: usize,
+) -> (GridPoint, GridSide) {
+    let row = (point.line.0 + display_offset as i32).max(0) as usize;
+    let (col, rtl) = renderer.logical_column(point.column.0, row);
+    point.column = GridColumn(col);
+    if rtl {
+        side = match side {
+            GridSide::Left => GridSide::Right,
+            GridSide::Right => GridSide::Left,
+        };
+    }
+    (point, side)
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -360,6 +378,20 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
 
+        if state.content_dirty
+            && (matches!(
+                &event,
+                WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::Ime(Ime::Preedit(..))
+            ) || (state.mouse_pressed || state.terminal.mouse_protocol().report_motion)
+                && matches!(&event, WindowEvent::CursorMoved { .. }))
+        {
+            let grid =
+                crate::convert::convert_grid(&state.terminal, &self.config.theme, state.focused);
+            state.renderer.prepare_layout(&grid);
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 log::info!("window {id:?} close requested");
@@ -388,7 +420,7 @@ impl ApplicationHandler<UserEvent> for App {
                 state.focus_redraw_frames = FOCUS_REDRAW_BURST_FRAMES;
 
                 if focused {
-                    state.focus_gain_at = Some(Instant::now());
+                    state.focus_gain_at = self.hot_cpu.then(Instant::now);
                     state.bloom_start = None;
                 } else {
                     // Cancel pending bloom; let an already committed animation finish.
@@ -515,18 +547,21 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Ime::Preedit(text, cursor) => {
                         let (cx, cy) = {
-                            let grid = state.terminal.grid();
-                            let cp = grid.cursor.point;
-                            (cp.column.0, cp.line.0)
+                            let content = state.terminal.renderable_content();
+                            let cp = content.cursor.point;
+                            (cp.column.0, cp.line.0 + content.display_offset as i32)
                         };
                         let cw = state.cell_metrics.cell_width;
                         let ch = state.cell_metrics.cell_height;
-                        let px = cx as f64 * cw as f64;
-                        let py = cy as f64 * ch as f64;
-                        state.window.set_ime_cursor_area(
-                            LogicalPosition::new(px, py),
-                            LogicalSize::new(cw as f64, ch as f64),
-                        );
+                        if cy >= 0 && (cy as usize) < state.terminal.screen_lines() {
+                            let px =
+                                state.renderer.visual_column(cx, cy as usize) as f64 * cw as f64;
+                            let py = cy as f64 * ch as f64;
+                            state.window.set_ime_cursor_area(
+                                winit::dpi::PhysicalPosition::new(px, py),
+                                winit::dpi::PhysicalSize::new(cw as f64, ch as f64),
+                            );
+                        }
                         let _ = (text, cursor);
                     }
                     Ime::Enabled | Ime::Disabled => {}
@@ -551,6 +586,10 @@ impl ApplicationHandler<UserEvent> for App {
                             state.terminal.columns(),
                             state.terminal.screen_lines(),
                         );
+                        let col =
+                            state.renderer.logical_column((col - 1) as usize, (row - 1) as usize).0
+                                as u32
+                                + 1;
                         let kind = match btn_state {
                             ElementState::Pressed => mouse_enc::MouseEventKind::Press,
                             ElementState::Released => mouse_enc::MouseEventKind::Release,
@@ -581,6 +620,8 @@ impl ApplicationHandler<UserEvent> for App {
                         let display_offset = state.terminal.grid().display_offset();
                         let (point, side) =
                             pixel_to_grid_point(x, y, cw, ch, cols, rows, display_offset);
+                        let (point, side) =
+                            logical_selection_point(&state.renderer, point, side, display_offset);
 
                         match btn_state {
                             ElementState::Pressed => {
@@ -671,6 +712,10 @@ impl ApplicationHandler<UserEvent> for App {
                             state.terminal.columns(),
                             state.terminal.screen_lines(),
                         );
+                        let col =
+                            state.renderer.logical_column((col - 1) as usize, (row - 1) as usize).0
+                                as u32
+                                + 1;
                         if state.last_mouse_report != Some((col, row)) {
                             state.last_mouse_report = Some((col, row));
                             let btn = mouse_enc::MouseButton::Left;
@@ -705,6 +750,8 @@ impl ApplicationHandler<UserEvent> for App {
                         rows,
                         display_offset,
                     );
+                    let (point, side) =
+                        logical_selection_point(&state.renderer, point, side, display_offset);
                     state.terminal.update_selection(point, side);
                     state.content_dirty = true;
                     state.request_redraw();
@@ -733,6 +780,10 @@ impl ApplicationHandler<UserEvent> for App {
                             state.terminal.columns(),
                             state.terminal.screen_lines(),
                         );
+                        let col =
+                            state.renderer.logical_column((col - 1) as usize, (row - 1) as usize).0
+                                as u32
+                                + 1;
                         let btn = if lines > 0 {
                             mouse_enc::MouseButton::WheelUp
                         } else {
@@ -810,7 +861,8 @@ impl ApplicationHandler<UserEvent> for App {
                 AnimationState::Active { next_frame } => Some(next_frame),
                 AnimationState::Idle => None,
             };
-            if state.exit_status.is_none()
+            if self.hot_cpu
+                && state.exit_status.is_none()
                 && let Some(gain) = state.focus_gain_at
             {
                 let dwell = Duration::from_millis(self.config.theme.opacity.bloom_dwell_ms as u64);
@@ -969,11 +1021,14 @@ fn render_frame(state: &mut AppState, config: &Config, hot_cpu: bool) {
 
     let dwell = Duration::from_millis(config.theme.opacity.bloom_dwell_ms as u64);
     let duration = Duration::from_millis(config.theme.opacity.bloom_duration_ms as u64);
-    if let Some(start) = maybe_commit_bloom(state.focus_gain_at, state.bloom_start, dwell, now) {
+    if hot_cpu
+        && let Some(start) = maybe_commit_bloom(state.focus_gain_at, state.bloom_start, dwell, now)
+    {
         state.bloom_start = Some(start);
         state.focus_gain_at = None;
     }
-    let bloom_progress = compute_bloom_progress(state.bloom_start, duration, now);
+    let bloom_progress =
+        if hot_cpu { compute_bloom_progress(state.bloom_start, duration, now) } else { 0.0 };
 
     let opacity = opacity_for_focus(state.focused, &config.theme.opacity);
     let text_opacity = text_opacity_for_focus(state.focused, &config.theme.opacity);
@@ -996,9 +1051,18 @@ fn render_frame(state: &mut AppState, config: &Config, hot_cpu: bool) {
 
     // A missing cached frame also requires a full render, even when content is clean.
     if !did_animation_render {
+        let conversion_started =
+            log::log_enabled!(target: "mechanic_render_profile", log::Level::Trace)
+                .then(Instant::now);
         let grid = crate::convert::convert_grid(&state.terminal, &config.theme, state.focused);
-        state.renderer.render(&grid, uniforms);
-        state.content_dirty = false;
+        if let Some(started) = conversion_started {
+            let conversion_ns = started.elapsed().as_nanos();
+            log::trace!(target: "mechanic_render_profile",
+                "render-profile conversion_ns={conversion_ns} cols={} rows={}",
+                grid.cols, grid.rows,
+            );
+        }
+        state.content_dirty = !state.renderer.render(&grid, uniforms);
     }
 
     if let Some(t) = state.bloom_start
@@ -1073,7 +1137,7 @@ fn classify_animation(input: AnimationInputs, hot_cpu: bool, now: Instant) -> An
     if input.focus_redraw_frames > 0 {
         return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
-    if input.bloom_start.is_some() {
+    if hot_cpu && input.bloom_start.is_some() {
         return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
     if input.focused && hot_cpu {
@@ -1399,7 +1463,7 @@ mod tests {
     #[test]
     fn anim_bloom_active_focused_is_active() {
         let now = Instant::now();
-        match classify_animation(inputs_with_bloom(true, true), false, now) {
+        match classify_animation(inputs_with_bloom(true, true), true, now) {
             AnimationState::Active { next_frame } => {
                 let delta = next_frame.saturating_duration_since(now);
                 assert!(delta >= FRAME_INTERVAL);
@@ -1412,7 +1476,7 @@ mod tests {
     #[test]
     fn anim_bloom_runs_to_completion_even_after_focus_loss() {
         assert!(matches!(
-            classify_animation(inputs_with_bloom(true, false), false, Instant::now()),
+            classify_animation(inputs_with_bloom(true, false), true, Instant::now()),
             AnimationState::Active { .. }
         ));
     }
@@ -1424,7 +1488,7 @@ mod tests {
         let mut input = inputs(true, false);
         input.bloom_start = Some(now - Duration::from_secs(1));
         assert_eq!(compute_bloom_progress(input.bloom_start, Duration::from_millis(100), now), 1.0,);
-        let AnimationState::Active { next_frame } = classify_animation(input, false, last_render)
+        let AnimationState::Active { next_frame } = classify_animation(input, true, last_render)
         else {
             panic!("expired bloom still needs a frame to restore baseline brightness");
         };
@@ -1442,11 +1506,11 @@ mod tests {
     }
 
     #[test]
-    fn anim_bloom_overrides_hot_cpu_off_default() {
-        assert!(matches!(
+    fn quiet_default_ignores_bloom_state() {
+        assert_eq!(
             classify_animation(inputs_with_bloom(true, true), false, Instant::now()),
-            AnimationState::Active { .. }
-        ));
+            AnimationState::Idle
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub struct FontConfig {
     /// Font size in points.
     pub size: f32,
 
-    /// Configured fallback families; currently unused by the renderer.
+    /// Preferred fallback families, followed by platform font fallback.
     pub fallback_families: Vec<String>,
 }
 
@@ -26,6 +26,10 @@ impl Default for FontConfig {
                 "Menlo".to_string(),
                 "Monaco".to_string(),
                 "Courier New".to_string(),
+                "Hiragino Sans".to_string(),
+                "Noto Sans Mono CJK JP".to_string(),
+                "Geeza Pro".to_string(),
+                "Noto Sans Arabic".to_string(),
             ],
         }
     }

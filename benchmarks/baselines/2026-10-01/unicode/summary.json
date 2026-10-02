@@ -1,0 +1,572 @@
+[
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-before-cell.json",
+    "label": "b815ddf-plus-profile",
+    "workload": "cell",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 5.938158052662537,
+    "sample_seconds": 5.003568958,
+    "frames": 101,
+    "presented_frames": 101,
+    "median_upload_bytes": 894568,
+    "median_us": {
+      "conversion_ns": 100.125,
+      "atlas_ns": 191.209,
+      "instances_ns": 364.292,
+      "upload_ns": 552.125,
+      "surface_ns": 91.583,
+      "submit_present_ns": 396.792
+    },
+    "p95_us": {
+      "conversion_ns": 114.208,
+      "atlas_ns": 203.708,
+      "instances_ns": 387.583,
+      "upload_ns": 706.042,
+      "surface_ns": 122.875,
+      "submit_present_ns": 570.125
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-before-full-r2.json",
+    "label": "b815ddf-plus-profile",
+    "workload": "full",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 5.844839834055849,
+    "sample_seconds": 5.004414292,
+    "frames": 106,
+    "presented_frames": 106,
+    "median_upload_bytes": 894568,
+    "median_us": {
+      "conversion_ns": 95.354,
+      "atlas_ns": 191.688,
+      "instances_ns": 364.27049999999997,
+      "upload_ns": 490.83299999999997,
+      "surface_ns": 73.375,
+      "submit_present_ns": 347.45849999999996
+    },
+    "p95_us": {
+      "conversion_ns": 99.542,
+      "atlas_ns": 198.084,
+      "instances_ns": 376.375,
+      "upload_ns": 580.167,
+      "surface_ns": 93.583,
+      "submit_present_ns": 425.75
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-before-idle-r2.json",
+    "label": "before-unicode",
+    "workload": "idle",
+    "status": "ok",
+    "focused": false,
+    "columns": null,
+    "rows": null,
+    "cpu_percent_one_core": 0.014362290599577294,
+    "sample_seconds": 5.003839708,
+    "frames": 0,
+    "presented_frames": 0,
+    "median_upload_bytes": null,
+    "median_us": {
+      "conversion_ns": null,
+      "atlas_ns": null,
+      "instances_ns": null,
+      "upload_ns": null,
+      "surface_ns": null,
+      "submit_present_ns": null
+    },
+    "p95_us": {
+      "conversion_ns": null,
+      "atlas_ns": null,
+      "instances_ns": null,
+      "upload_ns": null,
+      "surface_ns": null,
+      "submit_present_ns": null
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-before-row.json",
+    "label": "b815ddf-plus-profile",
+    "workload": "row",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 5.6442186621937225,
+    "sample_seconds": 5.001098166,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 894568,
+    "median_us": {
+      "conversion_ns": 99.792,
+      "atlas_ns": 191.5205,
+      "instances_ns": 363.77049999999997,
+      "upload_ns": 533.8955000000001,
+      "surface_ns": 85.5415,
+      "submit_present_ns": 365.02049999999997
+    },
+    "p95_us": {
+      "conversion_ns": 112.292,
+      "atlas_ns": 205.292,
+      "instances_ns": 395.792,
+      "upload_ns": 703.375,
+      "surface_ns": 106.125,
+      "submit_present_ns": 480.375
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-before-scroll-r2.json",
+    "label": "b815ddf-plus-profile",
+    "workload": "scroll",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 5.165364545541946,
+    "sample_seconds": 5.004033708,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 894568,
+    "median_us": {
+      "conversion_ns": 99.4585,
+      "atlas_ns": 192.0215,
+      "instances_ns": 365.70849999999996,
+      "upload_ns": 466.396,
+      "surface_ns": 71.479,
+      "submit_present_ns": 348.45799999999997
+    },
+    "p95_us": {
+      "conversion_ns": 106.167,
+      "atlas_ns": 200.042,
+      "instances_ns": 381.084,
+      "upload_ns": 546.709,
+      "surface_ns": 92.583,
+      "submit_present_ns": 410.417
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-cache-pair-after.json",
+    "label": "unicode-frame-cache",
+    "workload": "cell",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 6.590073647819391,
+    "sample_seconds": 5.000097125,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 894480,
+    "median_us": {
+      "conversion_ns": 156.688,
+      "atlas_ns": 234.6875,
+      "instances_ns": 688.979,
+      "upload_ns": 512.604,
+      "surface_ns": 83.125,
+      "submit_present_ns": 368.91650000000004
+    },
+    "p95_us": {
+      "conversion_ns": 167.125,
+      "atlas_ns": 303.209,
+      "instances_ns": 844,
+      "upload_ns": 628.084,
+      "surface_ns": 100.834,
+      "submit_present_ns": 449.25
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-cached-atlas-inconclusive.json",
+    "label": "unicode-frame-cache",
+    "workload": "atlas",
+    "status": "inconclusive",
+    "focused": true,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 6.041110018066519,
+    "sample_seconds": 3.003947792,
+    "frames": 61,
+    "presented_frames": 61,
+    "median_upload_bytes": 537464,
+    "median_us": {
+      "conversion_ns": 158.916,
+      "atlas_ns": 204.458,
+      "instances_ns": 276.959,
+      "upload_ns": 410.875,
+      "surface_ns": 81.708,
+      "submit_present_ns": 356.209
+    },
+    "p95_us": {
+      "conversion_ns": 169.541,
+      "atlas_ns": 219.624,
+      "instances_ns": 326.25,
+      "upload_ns": 513.959,
+      "surface_ns": 102.375,
+      "submit_present_ns": 435.709
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-cached-cell.json",
+    "label": "unicode-frame-cache",
+    "workload": "cell",
+    "status": "ok",
+    "focused": true,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 6.242160723568728,
+    "sample_seconds": 5.001694875,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 894480,
+    "median_us": {
+      "conversion_ns": 154.35399999999998,
+      "atlas_ns": 235.91750000000002,
+      "instances_ns": 791.4169999999999,
+      "upload_ns": 495.02099999999996,
+      "surface_ns": 78.708,
+      "submit_present_ns": 345.16700000000003
+    },
+    "p95_us": {
+      "conversion_ns": 163.041,
+      "atlas_ns": 415.334,
+      "instances_ns": 827.792,
+      "upload_ns": 623.709,
+      "surface_ns": 103.334,
+      "submit_present_ns": 425.333
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-cached-full.json",
+    "label": "unicode-frame-cache",
+    "workload": "full",
+    "status": "ok",
+    "focused": true,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 8.022771211448953,
+    "sample_seconds": 5.000597542,
+    "frames": 109,
+    "presented_frames": 109,
+    "median_upload_bytes": 894480,
+    "median_us": {
+      "conversion_ns": 148.833,
+      "atlas_ns": 657.583,
+      "instances_ns": 784.791,
+      "upload_ns": 507.417,
+      "surface_ns": 82.833,
+      "submit_present_ns": 352.834
+    },
+    "p95_us": {
+      "conversion_ns": 163.333,
+      "atlas_ns": 684.75,
+      "instances_ns": 835.542,
+      "upload_ns": 616.375,
+      "surface_ns": 103.5,
+      "submit_present_ns": 439.958
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-cached-row.json",
+    "label": "unicode-frame-cache",
+    "workload": "row",
+    "status": "ok",
+    "focused": true,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 6.325265824442379,
+    "sample_seconds": 5.003760708,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 894480,
+    "median_us": {
+      "conversion_ns": 155.3745,
+      "atlas_ns": 216.25,
+      "instances_ns": 792.0625,
+      "upload_ns": 496.3125,
+      "surface_ns": 73.542,
+      "submit_present_ns": 345.25
+    },
+    "p95_us": {
+      "conversion_ns": 168.125,
+      "atlas_ns": 242.167,
+      "instances_ns": 820.625,
+      "upload_ns": 677.417,
+      "surface_ns": 110.708,
+      "submit_present_ns": 441.792
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-cached-scroll.json",
+    "label": "unicode-frame-cache",
+    "workload": "scroll",
+    "status": "ok",
+    "focused": true,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 6.860809671164596,
+    "sample_seconds": 5.000514625,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 894480,
+    "median_us": {
+      "conversion_ns": 151.3955,
+      "atlas_ns": 643.771,
+      "instances_ns": 790.75,
+      "upload_ns": 458.0625,
+      "surface_ns": 70.8545,
+      "submit_present_ns": 316.2295
+    },
+    "p95_us": {
+      "conversion_ns": 180.916,
+      "atlas_ns": 669.917,
+      "instances_ns": 824.792,
+      "upload_ns": 637.375,
+      "surface_ns": 97.5,
+      "submit_present_ns": 420.083
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-cached-unicode.json",
+    "label": "unicode-frame-cache",
+    "workload": "unicode",
+    "status": "ok",
+    "focused": true,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 5.368101706095136,
+    "sample_seconds": 5.001180542,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 545472,
+    "median_us": {
+      "conversion_ns": 166.58350000000002,
+      "atlas_ns": 188.70850000000002,
+      "instances_ns": 253.562,
+      "upload_ns": 425.04150000000004,
+      "surface_ns": 79.896,
+      "submit_present_ns": 361.16650000000004
+    },
+    "p95_us": {
+      "conversion_ns": 182.375,
+      "atlas_ns": 230.792,
+      "instances_ns": 300.125,
+      "upload_ns": 489.166,
+      "surface_ns": 99.709,
+      "submit_present_ns": 439.75
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-final-atlas.json",
+    "label": "unicode-final",
+    "workload": "atlas",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 6.0660007257237805,
+    "sample_seconds": 5.000210958,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 537464,
+    "median_us": {
+      "conversion_ns": 156.77100000000002,
+      "atlas_ns": 838.687,
+      "instances_ns": 229.83350000000002,
+      "upload_ns": 384.52049999999997,
+      "surface_ns": 68.3955,
+      "submit_present_ns": 328.72900000000004
+    },
+    "p95_us": {
+      "conversion_ns": 168.042,
+      "atlas_ns": 882.291,
+      "instances_ns": 243.5,
+      "upload_ns": 489.959,
+      "surface_ns": 94.083,
+      "submit_present_ns": 424.25
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-final-cell-r2.json",
+    "label": "unicode-final",
+    "workload": "cell",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 7.675303008434027,
+    "sample_seconds": 5.005049958,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 894480,
+    "median_us": {
+      "conversion_ns": 158.14600000000002,
+      "atlas_ns": 761.021,
+      "instances_ns": 790.9585,
+      "upload_ns": 534.792,
+      "surface_ns": 77.125,
+      "submit_present_ns": 355.77099999999996
+    },
+    "p95_us": {
+      "conversion_ns": 166.083,
+      "atlas_ns": 831.207,
+      "instances_ns": 834.542,
+      "upload_ns": 647.583,
+      "surface_ns": 98.5,
+      "submit_present_ns": 442
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-final-full.json",
+    "label": "unicode-final",
+    "workload": "full",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 8.09926059205788,
+    "sample_seconds": 5.002435042,
+    "frames": 107,
+    "presented_frames": 107,
+    "median_upload_bytes": 894480,
+    "median_us": {
+      "conversion_ns": 149.584,
+      "atlas_ns": 732.501,
+      "instances_ns": 706.625,
+      "upload_ns": 511.542,
+      "surface_ns": 77.375,
+      "submit_present_ns": 347.542
+    },
+    "p95_us": {
+      "conversion_ns": 162.916,
+      "atlas_ns": 774.541,
+      "instances_ns": 827.375,
+      "upload_ns": 664.708,
+      "surface_ns": 107.083,
+      "submit_present_ns": 461.166
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-final-idle.json",
+    "label": "unicode-final",
+    "workload": "idle",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 0.08401781951668853,
+    "sample_seconds": 5.003055333,
+    "frames": 0,
+    "presented_frames": 0,
+    "median_upload_bytes": null,
+    "median_us": {
+      "conversion_ns": null,
+      "atlas_ns": null,
+      "instances_ns": null,
+      "upload_ns": null,
+      "surface_ns": null,
+      "submit_present_ns": null
+    },
+    "p95_us": {
+      "conversion_ns": null,
+      "atlas_ns": null,
+      "instances_ns": null,
+      "upload_ns": null,
+      "surface_ns": null,
+      "submit_present_ns": null
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-final-row.json",
+    "label": "unicode-final",
+    "workload": "row",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 7.265194772821716,
+    "sample_seconds": 5.005047041,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 894480,
+    "median_us": {
+      "conversion_ns": 151.9785,
+      "atlas_ns": 666.229,
+      "instances_ns": 664.542,
+      "upload_ns": 510.20799999999997,
+      "surface_ns": 83.6875,
+      "submit_present_ns": 365.125
+    },
+    "p95_us": {
+      "conversion_ns": 165.042,
+      "atlas_ns": 751.208,
+      "instances_ns": 822.542,
+      "upload_ns": 622.333,
+      "surface_ns": 102.875,
+      "submit_present_ns": 440.834
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-final-scroll.json",
+    "label": "unicode-final",
+    "workload": "scroll",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 7.367494999375464,
+    "sample_seconds": 5.005050333,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 894480,
+    "median_us": {
+      "conversion_ns": 153.9375,
+      "atlas_ns": 722.4995,
+      "instances_ns": 785.771,
+      "upload_ns": 521.688,
+      "surface_ns": 82.021,
+      "submit_present_ns": 358.54200000000003
+    },
+    "p95_us": {
+      "conversion_ns": 169.334,
+      "atlas_ns": 762.125,
+      "instances_ns": 808.417,
+      "upload_ns": 661.625,
+      "surface_ns": 113.459,
+      "submit_present_ns": 457.041
+    }
+  },
+  {
+    "source": "benchmarks/baselines/2026-10-01/unicode/unicode-final-unicode.json",
+    "label": "unicode-final",
+    "workload": "unicode",
+    "status": "ok",
+    "focused": false,
+    "columns": 121,
+    "rows": 42,
+    "cpu_percent_one_core": 5.9049125906740185,
+    "sample_seconds": 5.005052208,
+    "frames": 100,
+    "presented_frames": 100,
+    "median_upload_bytes": 545472,
+    "median_us": {
+      "conversion_ns": 148.875,
+      "atlas_ns": 544.4795,
+      "instances_ns": 213.8125,
+      "upload_ns": 411.85400000000004,
+      "surface_ns": 76.5625,
+      "submit_present_ns": 354.3125
+    },
+    "p95_us": {
+      "conversion_ns": 175.334,
+      "atlas_ns": 669.042,
+      "instances_ns": 264.791,
+      "upload_ns": 510.791,
+      "surface_ns": 93.25,
+      "submit_present_ns": 411.667
+    }
+  }
+]

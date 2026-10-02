@@ -8,6 +8,9 @@ rust-version.workspace = true
 [dependencies]
 wgpu.workspace = true
 cosmic-text.workspace = true
+swash = "0.2"
+unicode-script = "0.5"
+unicode-bidi = "0.3"
 log.workspace = true
 mechanic-config.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
@@ -18,5 +21,7 @@ raw-window-handle = "0.6"
 resvg = { version = "0.48", default-features = false }
 
 [dev-dependencies]
+pollster.workspace = true
+unicode-width = "0.2"
 # Shader validation.
 naga = { version = "30", features = ["wgsl-in"] }

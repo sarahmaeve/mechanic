@@ -1,4 +1,5 @@
 use std::mem;
+use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -38,15 +39,69 @@ fn rgb_to_f32(c: Rgb) -> [f32; 4] {
     [f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0, 1.0]
 }
 
+fn effective_fg(cell: &crate::grid::RenderCell) -> Rgb {
+    if cell.flags.contains(crate::grid::CellFlags::INVERSE) { cell.bg } else { cell.fg }
+}
+
+fn clip_glyph(
+    left: f32,
+    width: f32,
+    mut uv: [f32; 4],
+    clip_left: f32,
+    clip_right: f32,
+) -> Option<(f32, f32, [f32; 4])> {
+    let x = left.max(clip_left);
+    let right = (left + width).min(clip_right);
+    if width <= 0.0 || right <= x {
+        return None;
+    }
+    let du = uv[2] - uv[0];
+    uv[2] = uv[0] + du * (right - left) / width;
+    uv[0] += du * (x - left) / width;
+    Some((x, right - x, uv))
+}
+
+/// Opt-in host-side stage timings. Surface acquisition and submit/present can
+/// include driver waits; these numbers do not measure completed GPU execution.
+#[derive(Default)]
+struct RenderProfile {
+    atlas_ns: u128,
+    instances_ns: u128,
+    upload_ns: u128,
+    surface_ns: u128,
+    submit_present_ns: u128,
+    instance_count: usize,
+    upload_bytes: usize,
+    atlas_changed: bool,
+}
+
+impl RenderProfile {
+    fn log(&self, presented: bool) {
+        log::trace!(target: "mechanic_render_profile",
+            "render-profile atlas_ns={} instances_ns={} upload_ns={} surface_ns={} submit_present_ns={} instance_count={} upload_bytes={} atlas_changed={} presented={}",
+            self.atlas_ns,
+            self.instances_ns,
+            self.upload_ns,
+            self.surface_ns,
+            self.submit_present_ns,
+            self.instance_count,
+            self.upload_bytes,
+            u8::from(self.atlas_changed),
+            u8::from(presented),
+        );
+    }
+}
+
 /// Solid background/cursor shader branch.
 const SOLID_USE_ATLAS: u32 = 0;
 
 /// Glyph shader branch.
-#[expect(dead_code, reason = "reserved for future callers; paired with the _USE_ATLAS constants")]
 const GLYPH_USE_ATLAS: u32 = 1;
 
 /// Hollow block cursor for unfocused windows.
 const HOLLOW_BLOCK_USE_ATLAS: u32 = 2;
+
+const CURSOR_USE_ATLAS: u32 = 3;
 
 /// Cursor border in physical pixels; must match cell.wgsl.
 #[expect(dead_code, reason = "used in the shader; recorded here so both sides drift together")]
@@ -106,6 +161,7 @@ pub struct RenderState {
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    foreground_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     globals_buf: wgpu::Buffer,
@@ -124,6 +180,8 @@ pub struct RenderState {
     last_atlas_generation: u64,
     /// Count of instances uploaded by the most recent full [`Self::render`] call.  Zero before the first full render.
     last_instance_count: u32,
+    last_background_count: u32,
+    shaped_rows: Vec<std::sync::Arc<crate::text::ShapedRow>>,
 }
 
 /// Initialise the wgpu instance, adapter, device, queue, and configured surface — without building any pipelines or textures.
@@ -194,6 +252,29 @@ where
 }
 
 impl RenderState {
+    pub fn prepare_layout(
+        &mut self,
+        grid: &RenderGrid,
+        text: &mut TextRenderer,
+        config: &mechanic_config::font::FontConfig,
+    ) {
+        self.shaped_rows = text.shape_grid(grid, config);
+    }
+    pub fn visual_column(&self, col: usize, row: usize) -> usize {
+        self.shaped_rows.get(row).and_then(|r| r.visual_cols.get(col)).copied().unwrap_or(col)
+    }
+
+    pub fn logical_column(&self, col: usize, row: usize) -> (usize, bool) {
+        self.shaped_rows
+            .get(row)
+            .and_then(|r| {
+                r.visual_cols
+                    .iter()
+                    .position(|visual| *visual == col)
+                    .map(|logical| (logical, r.rtl[logical]))
+            })
+            .unwrap_or((col, false))
+    }
     /// Build the pipeline and bind the text renderer's atlas.
     pub fn new_with_atlas(
         SurfaceInit { device, queue, surface, surface_config }: SurfaceInit,
@@ -210,47 +291,7 @@ impl RenderState {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cell.wgsl").into()),
         });
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("cell_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        let bind_group_layout = create_cell_bind_group_layout(&device);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cell_pipeline_layout"),
@@ -258,53 +299,10 @@ impl RenderState {
             immediate_size: 0,
         });
 
-        let instance_layout = wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<GpuInstance>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &wgpu::vertex_attr_array![
-                0 => Uint32x2,   // cell_pos
-                1 => Float32x4,  // atlas_uv
-                2 => Float32x4,  // fg_color
-                3 => Float32x4,  // bg_color
-                4 => Float32x2,  // glyph_offset
-                5 => Float32x2,  // glyph_size
-                6 => Uint32,     // use_atlas
-            ],
-        };
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("cell_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[Some(instance_layout)],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline =
+            create_cell_pipeline(&device, &shader, Some(&pipeline_layout), surface_format, false);
+        let foreground_pipeline =
+            create_cell_pipeline(&device, &shader, Some(&pipeline_layout), surface_format, true);
 
         let cell_size = (cell_metrics.cell_width, cell_metrics.cell_height);
         let globals = Globals {
@@ -361,6 +359,7 @@ impl RenderState {
             surface,
             surface_config,
             pipeline,
+            foreground_pipeline,
             bind_group_layout,
             bind_group,
             globals_buf,
@@ -373,6 +372,8 @@ impl RenderState {
             clear_color: background::clear_color(bg),
             last_atlas_generation: atlas_generation,
             last_instance_count: 0,
+            last_background_count: 0,
+            shaped_rows: Vec::new(),
         })
     }
 
@@ -446,12 +447,14 @@ impl RenderState {
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         self.last_instance_count = 0;
+        self.shaped_rows.clear();
     }
 
     /// Update the cell size used by the pipeline's globals uniform.
     pub fn set_cell_size(&mut self, cell_size: (f32, f32)) {
         self.cell_size = cell_size;
         self.last_instance_count = 0;
+        self.shaped_rows.clear();
     }
 
     /// Render a single frame.
@@ -461,7 +464,11 @@ impl RenderState {
         text_renderer: &mut TextRenderer,
         font_config: &mechanic_config::font::FontConfig,
         uniforms: FrameUniforms,
-    ) {
+    ) -> bool {
+        // Full rendering replaces the cached buffer before surface acquisition.
+        self.last_instance_count = 0;
+        let profiling = log::log_enabled!(target: "mechanic_render_profile", log::Level::Trace);
+        let mut profile = profiling.then(RenderProfile::default);
         let globals = Globals {
             viewport_size: [self.size.0 as f32, self.size.1 as f32],
             cell_size: [self.cell_size.0, self.cell_size.1],
@@ -473,109 +480,51 @@ impl RenderState {
             bloom_peak_multiplier: uniforms.bloom_peak_multiplier,
             _pad: [0.0; 2],
         };
+        let uniform_upload_started = profiling.then(Instant::now);
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
-
-        let unique_glyphs = collect_unique_glyphs(grid);
-        text_renderer.populate_atlas(unique_glyphs, &self.device, &self.queue, font_config);
-
-        let total_cells = grid.cols * grid.rows;
-        let mut instances: Vec<GpuInstance> = Vec::with_capacity(total_cells * 2);
-
-        for row in 0..grid.rows {
-            for col in 0..grid.cols {
-                let Some(cell) = grid.get(col, row) else {
-                    continue;
-                };
-
-                let mut fg = cell.fg;
-                let mut bg = cell.bg;
-
-                if cell.flags.contains(crate::grid::CellFlags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-
-                instances.push(GpuInstance {
-                    cell_pos: [col as u32, row as u32],
-                    atlas_uv: [0.0; 4],
-                    fg_color: [0.0; 4],
-                    bg_color: rgb_to_f32(bg),
-                    glyph_offset: [0.0; 2],
-                    glyph_size: [0.0; 2],
-                    use_atlas: 0,
-                    _pad: [0; 3],
-                });
-
-                if cell.character != ' ' {
-                    let bold = cell.flags.contains(crate::grid::CellFlags::BOLD);
-                    let italic = cell.flags.contains(crate::grid::CellFlags::ITALIC);
-
-                    if let Some(info) = text_renderer.rasterize_char(
-                        cell.character,
-                        bold,
-                        italic,
-                        &self.device,
-                        &self.queue,
-                        font_config,
-                    ) {
-                        instances.push(GpuInstance {
-                            cell_pos: [col as u32, row as u32],
-                            atlas_uv: info.atlas_uv,
-                            fg_color: rgb_to_f32(fg),
-                            bg_color: rgb_to_f32(bg),
-                            glyph_offset: [info.offset_x, info.offset_y],
-                            glyph_size: [info.glyph_width, info.glyph_height],
-                            use_atlas: 1,
-                            _pad: [0; 3],
-                        });
-                    }
-                }
-            }
+        if let (Some(profile), Some(started)) = (&mut profile, uniform_upload_started) {
+            profile.upload_ns = started.elapsed().as_nanos();
+            profile.upload_bytes = mem::size_of::<Globals>();
         }
 
+        let atlas_started = profiling.then(Instant::now);
+        self.prepare_layout(grid, text_renderer, font_config);
+        if let Err(error) =
+            text_renderer.prepare_frame(&self.shaped_rows, &self.device, &self.queue)
         {
-            use crate::grid::CursorStyle;
-            use mechanic_config::theme::palette;
-
-            let (cx, cy) = grid.cursor_position;
-            if grid.get(cx, cy).is_some() {
-                let cursor_color = palette::CELESTE;
-                let cell_w = self.cell_size.0;
-                let cell_h = self.cell_size.1;
-
-                let quad = match (grid.cursor_style, uniforms.window_focused) {
-                    (CursorStyle::Block, false) => {
-                        Some(([0.0f32, 0.0f32], [cell_w, cell_h], HOLLOW_BLOCK_USE_ATLAS))
-                    }
-                    (CursorStyle::Block, true) => None,
-                    (CursorStyle::Bar, _) => {
-                        Some(([0.0f32, 0.0f32], [2.0f32, cell_h], SOLID_USE_ATLAS))
-                    }
-                    (CursorStyle::Underline, _) => {
-                        Some(([0.0f32, cell_h - 2.0f32], [cell_w, 2.0f32], SOLID_USE_ATLAS))
-                    }
-                };
-
-                if let Some((glyph_offset, glyph_size, use_atlas)) = quad {
-                    instances.push(GpuInstance {
-                        cell_pos: [cx as u32, cy as u32],
-                        atlas_uv: [0.0; 4],
-                        fg_color: [0.0; 4],
-                        bg_color: rgb_to_f32(cursor_color),
-                        glyph_offset,
-                        glyph_size,
-                        use_atlas,
-                        _pad: [0; 3],
-                    });
-                }
-            }
+            log::error!("glyph atlas preparation failed: {error}");
+        }
+        if let (Some(profile), Some(started)) = (&mut profile, atlas_started) {
+            profile.atlas_ns = started.elapsed().as_nanos();
         }
 
+        let instances_started = profiling.then(Instant::now);
+        let (instances, background_count) = build_instances(
+            grid,
+            &self.shaped_rows,
+            text_renderer,
+            self.cell_size,
+            uniforms.window_focused,
+        );
+
+        if let (Some(profile), Some(started)) = (&mut profile, instances_started) {
+            profile.instances_ns = started.elapsed().as_nanos();
+            profile.instance_count = instances.len();
+        }
+
+        let atlas_binding_started = profiling.then(Instant::now);
         let current_gen = text_renderer.atlas_generation();
-        if current_gen != self.last_atlas_generation {
+        let atlas_changed = current_gen != self.last_atlas_generation;
+        if atlas_changed {
             self.update_atlas_bind_group(&text_renderer.atlas_view);
             self.last_atlas_generation = current_gen;
         }
+        if let (Some(profile), Some(started)) = (&mut profile, atlas_binding_started) {
+            profile.atlas_ns += started.elapsed().as_nanos();
+            profile.atlas_changed = atlas_changed;
+        }
 
+        let instance_upload_started = profiling.then(Instant::now);
         let instance_bytes = bytemuck::cast_slice::<GpuInstance, u8>(&instances);
 
         if instances.len() > self.instance_capacity {
@@ -590,17 +539,35 @@ impl RenderState {
         }
 
         self.queue.write_buffer(&self.instance_buf, 0, instance_bytes);
+        if let (Some(profile), Some(started)) = (&mut profile, instance_upload_started) {
+            profile.upload_ns += started.elapsed().as_nanos();
+            profile.upload_bytes += instance_bytes.len();
+        }
 
-        let surface_texture = match self.surface.get_current_texture() {
+        let surface_started = profiling.then(Instant::now);
+        let surface_texture = self.surface.get_current_texture();
+        if let (Some(profile), Some(started)) = (&mut profile, surface_started) {
+            profile.surface_ns = started.elapsed().as_nanos();
+        }
+        let surface_texture = match surface_texture {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.surface_config);
-                return;
+                if let Some(profile) = profile {
+                    profile.log(false);
+                }
+                return false;
             }
-            _ => return,
+            _ => {
+                if let Some(profile) = profile {
+                    profile.log(false);
+                }
+                return false;
+            }
         };
 
+        let submit_present_started = profiling.then(Instant::now);
         let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -635,13 +602,21 @@ impl RenderState {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.instance_buf.slice(..));
-            pass.draw(0..6, 0..instances.len() as u32);
+            pass.draw(0..6, 0..background_count);
+            pass.set_pipeline(&self.foreground_pipeline);
+            pass.draw(0..6, background_count..instances.len() as u32);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(surface_texture);
+        if let (Some(profile), Some(started)) = (&mut profile, submit_present_started) {
+            profile.submit_present_ns = started.elapsed().as_nanos();
+            profile.log(true);
+        }
 
         self.last_instance_count = instances.len() as u32;
+        self.last_background_count = background_count;
+        true
     }
 
     /// Draw cached instances with new uniforms; false if no full frame is cached.
@@ -707,7 +682,9 @@ impl RenderState {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.instance_buf.slice(..));
-            pass.draw(0..6, 0..self.last_instance_count);
+            pass.draw(0..6, 0..self.last_background_count);
+            pass.set_pipeline(&self.foreground_pipeline);
+            pass.draw(0..6, self.last_background_count..self.last_instance_count);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -715,118 +692,264 @@ impl RenderState {
         true
     }
 }
-
-/// Collect the set of unique `(char, bold, italic)` glyph keys that need to be rendered for `grid` this frame.
-fn collect_unique_glyphs(grid: &RenderGrid) -> std::collections::HashSet<(char, bool, bool)> {
-    let mut unique = std::collections::HashSet::with_capacity(128);
-    for cell in &grid.cells {
-        if cell.character != ' ' {
-            let bold = cell.flags.contains(crate::grid::CellFlags::BOLD);
-            let italic = cell.flags.contains(crate::grid::CellFlags::ITALIC);
-            unique.insert((cell.character, bold, italic));
-        }
-    }
-    unique
+fn create_cell_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: Option<&wgpu::PipelineLayout>,
+    format: wgpu::TextureFormat,
+    foreground: bool,
+) -> wgpu::RenderPipeline {
+    let attributes = wgpu::vertex_attr_array![
+        0 => Uint32x2, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
+        4 => Float32x2, 5 => Float32x2, 6 => Uint32,
+    ];
+    let instance_layout = wgpu::VertexBufferLayout {
+        array_stride: mem::size_of::<GpuInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &attributes,
+    };
+    // Preserve the surface opacity while blending glyph coverage over cells.
+    let blend = foreground.then_some(wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("cell_pipeline"),
+        layout,
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(instance_layout)],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::{CellFlags, RenderCell, RenderGrid};
 
-    fn make_grid_with_cells(cols: usize, rows: usize, cells: Vec<RenderCell>) -> RenderGrid {
-        let mut grid = RenderGrid::new(cols, rows);
-        for (i, cell) in cells.into_iter().enumerate() {
-            if i < grid.cells.len() {
-                grid.cells[i] = cell;
+    #[test]
+    fn ligature_clips_uvs_at_selection_boundary() {
+        let uv = [0.2, 0.1, 0.6, 0.9];
+        let (x, w, clipped) = clip_glyph(2.0, 20.0, uv, 10.0, 20.0).unwrap();
+        assert_eq!((x, w), (10.0, 10.0));
+        assert!((clipped[0] - 0.36).abs() < 0.0001);
+        assert!((clipped[2] - 0.56).abs() < 0.0001);
+        assert_eq!((clipped[1], clipped[3]), (uv[1], uv[3]));
+        assert!(clip_glyph(2.0, 20.0, uv, 22.0, 30.0).is_none());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "pipeline_gpu_tests.rs"]
+mod gpu_tests;
+
+fn build_instances(
+    grid: &RenderGrid,
+    shaped_rows: &[std::sync::Arc<crate::text::ShapedRow>],
+    text_renderer: &TextRenderer,
+    cell_size: (f32, f32),
+    focused: bool,
+) -> (Vec<GpuInstance>, u32) {
+    let total_cells = grid.cols * grid.rows;
+    let mut instances: Vec<GpuInstance> = Vec::with_capacity(total_cells * 2);
+
+    for (row, shaped) in shaped_rows.iter().enumerate().take(grid.rows) {
+        for col in 0..grid.cols {
+            let Some(cell) = grid.get(col, row) else {
+                continue;
+            };
+
+            let mut fg = cell.fg;
+            let mut bg = cell.bg;
+
+            if cell.flags.contains(crate::grid::CellFlags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+
+            let visual_col = shaped.visual_cols[col];
+            instances.push(GpuInstance {
+                cell_pos: [visual_col as u32, row as u32],
+                atlas_uv: [0.0; 4],
+                fg_color: [0.0; 4],
+                bg_color: rgb_to_f32(bg),
+                glyph_offset: [0.0; 2],
+                glyph_size: [0.0; 2],
+                use_atlas: SOLID_USE_ATLAS,
+                _pad: [0; 3],
+            });
+        }
+    }
+    let background_count = instances.len() as u32;
+
+    // Paint every background first so wide glyphs and combining marks survive.
+    for (row, shaped) in shaped_rows.iter().enumerate() {
+        let mut logical_cols = vec![0; grid.cols];
+        for (logical, &visual) in shaped.visual_cols.iter().enumerate() {
+            logical_cols[visual] = logical;
+        }
+        for glyph in &shaped.glyphs {
+            let Some(info) = text_renderer.glyph_info(glyph.cache_key) else { continue };
+            let scale_x = glyph.scale_x / info.raster_scale_x;
+            let left = glyph.x + info.offset_x * scale_x;
+            let bitmap_width = info.glyph_width * scale_x;
+            let right = left + bitmap_width;
+            let first = (left / cell_size.0).floor().max(0.0) as usize;
+            let end = ((right / cell_size.0).ceil().max(0.0) as usize).min(grid.cols);
+            // Split at color boundaries so selecting part of a ligature
+            // recolors that cell without breaking contextual shaping.
+            let mut col = first;
+            let colored_cell = |visual: usize| {
+                let logical = if (glyph.cluster_start..glyph.cluster_end).contains(&visual) {
+                    logical_cols[visual]
+                } else {
+                    glyph.source_col
+                };
+                &grid.cells[row * grid.cols + logical]
+            };
+            while col < end {
+                let cell = colored_cell(col);
+                let fg = effective_fg(cell);
+                let hidden = cell.flags.contains(crate::grid::CellFlags::HIDDEN);
+                let mut next = col + 1;
+                while next < end {
+                    let other = colored_cell(next);
+                    if effective_fg(other) != fg
+                        || other.flags.contains(crate::grid::CellFlags::HIDDEN) != hidden
+                    {
+                        break;
+                    }
+                    next += 1;
+                }
+                if !hidden
+                    && let Some((x, width, uv)) = clip_glyph(
+                        left,
+                        bitmap_width,
+                        info.atlas_uv,
+                        col as f32 * cell_size.0,
+                        next as f32 * cell_size.0,
+                    )
+                {
+                    instances.push(GpuInstance {
+                        cell_pos: [col as u32, row as u32],
+                        atlas_uv: uv,
+                        fg_color: rgb_to_f32(fg),
+                        bg_color: [0.0; 4],
+                        glyph_offset: [x - col as f32 * cell_size.0, glyph.y + info.offset_y],
+                        glyph_size: [width, info.glyph_height],
+                        use_atlas: GLYPH_USE_ATLAS,
+                        _pad: [0; 3],
+                    });
+                }
+                col = next;
             }
         }
-        grid
     }
 
-    fn cell(ch: char, flags: CellFlags) -> RenderCell {
-        RenderCell { character: ch, flags, ..Default::default() }
+    {
+        use crate::grid::CursorStyle;
+        let (cx, cy) = grid.cursor_position;
+        if grid.cursor_visible && grid.get(cx, cy).is_some() {
+            let cursor_color = grid.cursor_color;
+            let cell_w = cell_size.0 * grid.cursor_width as f32;
+            let cell_h = cell_size.1;
+
+            let quad = match (grid.cursor_style, focused) {
+                (CursorStyle::HollowBlock, _) | (CursorStyle::Block, false) => {
+                    Some(([0.0f32, 0.0f32], [cell_w, cell_h], HOLLOW_BLOCK_USE_ATLAS))
+                }
+                (CursorStyle::Block, true) => None,
+                (CursorStyle::Bar, _) => {
+                    let x = if shaped_rows[cy].rtl[cx] { (cell_w - 2.0).max(0.0) } else { 0.0 };
+                    Some(([x, 0.0f32], [2.0f32, cell_h], CURSOR_USE_ATLAS))
+                }
+                (CursorStyle::Underline, _) => {
+                    Some(([0.0f32, cell_h - 2.0f32], [cell_w, 2.0f32], CURSOR_USE_ATLAS))
+                }
+            };
+
+            if let Some((glyph_offset, glyph_size, use_atlas)) = quad {
+                instances.push(GpuInstance {
+                    cell_pos: [shaped_rows[cy].visual_cols[cx] as u32, cy as u32],
+                    atlas_uv: [0.0; 4],
+                    fg_color: [0.0; 4],
+                    bg_color: rgb_to_f32(cursor_color),
+                    glyph_offset,
+                    glyph_size,
+                    use_atlas,
+                    _pad: [0; 3],
+                });
+            }
+        }
     }
 
-    #[test]
-    fn unique_glyphs_empty_grid() {
-        let grid = RenderGrid::new(10, 5);
-        assert!(collect_unique_glyphs(&grid).is_empty());
-    }
+    (instances, background_count)
+}
 
-    #[test]
-    fn unique_glyphs_all_spaces_produces_empty_set() {
-        let grid = make_grid_with_cells(
-            3,
-            1,
-            vec![
-                cell(' ', CellFlags::empty()),
-                cell(' ', CellFlags::empty()),
-                cell(' ', CellFlags::empty()),
-            ],
-        );
-        assert!(collect_unique_glyphs(&grid).is_empty());
-    }
-
-    #[test]
-    fn unique_glyphs_dedups_repeated_chars() {
-        let cells = vec![cell('h', CellFlags::empty()); 20];
-        let grid = make_grid_with_cells(5, 4, cells);
-        let u = collect_unique_glyphs(&grid);
-        assert_eq!(u.len(), 1);
-        assert!(u.contains(&('h', false, false)));
-    }
-
-    #[test]
-    fn unique_glyphs_distinguishes_style_variants() {
-        let grid = make_grid_with_cells(
-            4,
-            1,
-            vec![
-                cell('a', CellFlags::empty()),
-                cell('a', CellFlags::BOLD),
-                cell('a', CellFlags::ITALIC),
-                cell('a', CellFlags::BOLD | CellFlags::ITALIC),
-            ],
-        );
-        let u = collect_unique_glyphs(&grid);
-        assert_eq!(u.len(), 4);
-        assert!(u.contains(&('a', false, false)));
-        assert!(u.contains(&('a', true, false)));
-        assert!(u.contains(&('a', false, true)));
-        assert!(u.contains(&('a', true, true)));
-    }
-
-    #[test]
-    fn unique_glyphs_mixed_chars_and_spaces() {
-        let grid = make_grid_with_cells(
-            6,
-            1,
-            vec![
-                cell('H', CellFlags::empty()),
-                cell('i', CellFlags::empty()),
-                cell(' ', CellFlags::empty()),
-                cell('!', CellFlags::empty()),
-                cell(' ', CellFlags::empty()),
-                cell('H', CellFlags::empty()),
-            ],
-        );
-        let u = collect_unique_glyphs(&grid);
-        assert_eq!(u.len(), 3);
-        assert!(u.contains(&('H', false, false)));
-        assert!(u.contains(&('i', false, false)));
-        assert!(u.contains(&('!', false, false)));
-    }
-
-    #[test]
-    fn unique_glyphs_underlined_does_not_split_from_plain() {
-        let grid = make_grid_with_cells(
-            2,
-            1,
-            vec![cell('a', CellFlags::empty()), cell('a', CellFlags::UNDERLINE)],
-        );
-        let u = collect_unique_glyphs(&grid);
-        assert_eq!(u.len(), 1);
-        assert!(u.contains(&('a', false, false)));
-    }
+fn create_cell_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("cell_bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
 }

@@ -265,6 +265,11 @@ impl Terminal {
         self.term.grid()
     }
 
+    /// Visible content with the effective cursor visibility and wide-cell position.
+    pub fn renderable_content(&self) -> alacritty_terminal::term::RenderableContent<'_> {
+        self.term.renderable_content()
+    }
+
     /// The current terminal title as set by OSC 0/2 sequences.
     pub fn title(&self) -> &str {
         &self.title

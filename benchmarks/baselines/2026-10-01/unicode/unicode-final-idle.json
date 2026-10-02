@@ -1,0 +1,61 @@
+{
+  "schema_version": 3,
+  "status": "ok",
+  "error": null,
+  "app_binary": "/Users/sarah.murphy/git/mechanic/target/release/mechanic",
+  "app_binary_bytes": 13433920,
+  "app_binary_modified_unix_seconds": 1790911053,
+  "label": "unicode-final",
+  "benchmark_version": "0.1.0",
+  "benchmark_debug_assertions": false,
+  "mode": "idle",
+  "settle_seconds": 3,
+  "requested_sample_seconds": 5,
+  "pid": 18195,
+  "cpu_start": {
+    "user_mach_ticks": 2696556,
+    "system_mach_ticks": 1876548,
+    "user_ns": 112356500,
+    "system_ns": 78189500
+  },
+  "cpu_end": {
+    "user_mach_ticks": 2761483,
+    "system_mach_ticks": 1912504,
+    "user_ns": 115061791,
+    "system_ns": 79687666
+  },
+  "cpu_timebase": {
+    "numerator": 125,
+    "denominator": 3
+  },
+  "cpu_delta_mach_ticks": 100883,
+  "cpu_delta_ns": 4203458,
+  "elapsed_seconds": 5.003055333,
+  "cpu_percent_one_core": 0.08401781951668853,
+  "focused_at_start": false,
+  "focus_events_during_sample": [],
+  "render_profile_enabled": true,
+  "render_frames": [],
+  "render_profile_scope": "Raw complete full-content frames during sampling. Stage timings measure host CPU/wall work only; upload_ns measures host writes/resizing, atlas_changed denotes atlas generation/bind-group change, and presented indicates host present issued. No GPU completion timing. Calculate stage distributions from these records.",
+  "settings": {
+    "actual_terminal_columns": 121,
+    "actual_terminal_rows": 42,
+    "actual_window_dimensions": "not measured; keep window unchanged",
+    "app_build_revision": "not inferred; use --label to identify the build",
+    "arabic_paragraph_original_fixture": null,
+    "atlas_fixture": null,
+    "fixture_cursor": null,
+    "font_family": "Menlo",
+    "font_size_points": 14,
+    "opacity": 1.0,
+    "pty_peer": "controlled Rust peer",
+    "requested_default_window_logical_height": 768,
+    "requested_default_window_logical_width": 1024,
+    "unicode_samples": null,
+    "workload": "idle",
+    "workload_alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    "workload_update_interval_ms": null
+  },
+  "scope": "App process user + system CPU only; 100% is one CPU core. Excludes PTY peer, WindowServer, GPU usage and energy. Compare identical hardware, display, window size and app build profile.",
+  "app_stderr": "[2026-10-02T03:17:59Z INFO  mechanic::app] spawned window WindowId(46931722880) (total: 1)\n[2026-10-02T03:17:59Z TRACE mechanic_render_profile] render-profile conversion_ns=49083 cols=121 rows=42\n[2026-10-02T03:17:59Z TRACE mechanic_render_profile] render-profile atlas_ns=55666 instances_ns=33542 upload_ns=150084 surface_ns=5042 submit_present_ns=0 instance_count=5082 upload_bytes=447264 atlas_changed=0 presented=0\n[2026-10-02T03:17:59Z DEBUG mechanic::app] window WindowId(46931722880) focused: false\n[2026-10-02T03:17:59Z DEBUG mechanic::app] window WindowId(46931722880) focused: true\n[2026-10-02T03:17:59Z TRACE mechanic_render_profile] render-profile conversion_ns=35208 cols=121 rows=42\n[2026-10-02T03:17:59Z TRACE mechanic_render_profile] render-profile atlas_ns=49042 instances_ns=11667 upload_ns=80292 surface_ns=662833 submit_present_ns=776041 instance_count=5082 upload_bytes=447264 atlas_changed=0 presented=1\n[2026-10-02T03:18:01Z DEBUG mechanic::app] window WindowId(46931722880) focused: false\n[2026-10-02T03:18:01Z TRACE mechanic_render_profile] render-profile conversion_ns=93584 cols=121 rows=42\n[2026-10-02T03:18:01Z TRACE mechanic_render_profile] render-profile atlas_ns=126542 instances_ns=54042 upload_ns=434125 surface_ns=60417 submit_present_ns=307500 instance_count=5083 upload_bytes=447352 atlas_changed=0 presented=1\n"
+}

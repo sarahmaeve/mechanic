@@ -162,3 +162,40 @@ Percentages use one CPU core as 100%. They exclude the peer, WindowServer,
 GPU activity and energy use. Actual window dimensions are not instrumented.
 Compare identical window/display conditions and release builds. The example
 passes the legacy `--hot-cpu` alias so it can also measure older app binaries.
+
+## Render stages and multilingual text
+
+```sh
+./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cell.json --workload cell --render-profile
+./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/unicode.json --workload unicode --render-profile
+./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/atlas.json --workload atlas --render-profile
+./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cursor.json --workload text-fixture --fixture-cursor bar
+```
+
+Workloads `cell`, `row`, `full`, and `scroll` update an ASCII grid at 20 Hz.
+`unicode` and `text-fixture` show the requested languages, combining marks and an
+original Arabic news-style paragraph. `atlas` displays 223 distinct characters
+in four styles. `--fixture-cursor block|bar|underline|hidden` controls the fixed
+cursor; unfocus the fixture to inspect its hollow outline.
+
+`--render-profile` records complete frame pairs during the CPU sample, including
+actual terminal dimensions. Fields are conversion, shaping/atlas preparation,
+instance construction, host buffer upload, surface acquisition and submit/present
+nanoseconds. Upload time excludes GPU completion; tracing affects CPU totals.
+Animation and profiling/output workloads cannot be combined. Keep focus and window
+size stable; failed runs remain marked inconclusive.
+
+These GUI CPU/stage measurements are Mechanic-specific. Use the terminal workloads
+above for iTerm2/Ghostty comparisons; parser replies do not validate rendered text.
+
+Metal pixel and atlas checks run explicitly on macOS:
+
+```sh
+cargo test -p mechanic-renderer -- --ignored --nocapture
+```
+
+The multilingual test saves `mechanic-text-fixture.png` in the system temporary
+directory; `MECHANIC_TEXT_FIXTURE_PNG` chooses another path. It uses the production
+instance builder and shaders and reads the GPU target directly. It does not capture
+the screen. Tests cover cursor geometry, overlapping glyph coverage, surface opacity
+and atlas growth. Inspect the image for language typography as well as running tests.

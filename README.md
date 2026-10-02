@@ -33,8 +33,10 @@ failed shell exit, Cmd+R restarts the shell.
 
 `mechanic-core` owns terminal state and PTY I/O; `mechanic-app` routes events
 and converts the grid; `mechanic-renderer` shapes glyphs and draws cells;
-`mechanic-config` loads TOML. Rendering and Unicode support are incomplete;
-see [review findings](design/REVIEW.md).
+`mechanic-config` loads TOML. Text shaping supports combining marks, Japanese
+wide cells and Arabic paragraph direction. Configured font fallbacks precede
+platform fallback; macOS supplies Hiragino Sans and Geeza Pro. See
+[review findings](design/REVIEW.md) for remaining rendering limits.
 
 PTY writes are queued without waiting for the child. Pending input is limited
 to 8 MiB (including paste markers) and 1,024 queued messages; a full queue
@@ -49,8 +51,10 @@ time budget is soft: one parser chunk can take additional time.
 
 Content redraws are paced at 16 ms and animation frames at 33 ms. Input and
 resize redraws remain immediate. Hidden windows keep parsing but suspend
-presentation. Focus glow runs briefly by default; continuous effects require
-`--animate`. The event loop waits when parsing and animations are idle.
+presentation. The nested triangle logo and gradient are static by default.
+`--animate` enables focus glow, pulses travelling around both triangles, and
+a faint breathing glow inside the inner triangle.
+The event loop waits when parsing and animations are idle.
 
 See [benchmarks](benchmarks/README.md) for Rust microbenchmarks and identical
 workloads for Mechanic, iTerm2, and Ghostty.

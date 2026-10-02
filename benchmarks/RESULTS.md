@@ -220,3 +220,79 @@ strict Clippy, formatting and release builds. Scheduler tests cover fairness,
 continuation without presentation, fixed deadlines, pending redraws,
 occlusion/restoration, and the final bloom frame. Multi-window native input
 latency and GPU frame timing were not measured.
+
+## Unicode, cursor and atlas correctness
+
+The renderer now keeps combining marks, shapes Arabic in context, resolves bidi
+across soft-wrapped rows, and preserves logical copy order. Connected RTL words
+retain their relative glyph positions; horizontal transforms rasterize from font
+outlines. Japanese wide cells retain both backgrounds. Hidden cursors stay hidden,
+bar/underline geometry is honored, and wide hollow cursors have one outline.
+Atlas growth finishes before instance construction, checks device limits and
+preserves all active glyphs. Configured font fallbacks now apply.
+
+The [offscreen GPU fixture](baselines/2026-10-01/unicode/text-fixture.png) covers
+Russian, Ukrainian, Japanese, Arabic, French, German, Spanish, Portuguese and
+Italian, including decomposed accents and original Arabic news-style prose.
+It uses Menlo 14 pt at 2× scale; Arabic resolves to installed Courier New.
+The image comes from GPU readback, not screen capture. Word wrapping still follows
+terminal cell boundaries, and joining stops at those boundaries.
+
+Stage profiling used 121×42 cells, Menlo 14 pt, opaque content, a controlled Rust
+PTY peer updating at 20 Hz, and release builds. Each sample lasted five seconds.
+CPU percentages mean one process CPU core, excluding the peer, WindowServer and
+GPU. Logs are enabled for both sides and affect CPU totals. These are single-run
+observations, not latency or energy claims.
+
+The initial correctness implementation increased unfocused ASCII output CPU from
+about 5–6% to 7–8%. Profiling found repeated atlas residency checks on unchanged
+rows. The resulting frame cache skips those rows, checks changed rows, and falls
+back to full-frame preflight on a miss or atlas generation change.
+
+Matched unfocused `cell` samples, with five-second settling and five-second sampling:
+
+| Measurement | Correctness build before frame cache | With frame cache |
+| --- | ---: | ---: |
+| App CPU, one core | 7.675% | 6.590% |
+| Shaping/atlas median | 0.761 ms | 0.235 ms |
+| Shaping/atlas p95 | 0.831 ms | 0.303 ms |
+| Complete presented frames | 100 | 100 |
+
+The final focused samples below are a separate series. Do not compare their CPU
+values directly with the unfocused baseline. Shaping/atlas and instance columns
+are median host time; upload includes host writes/allocation, not GPU completion.
+
+| Workload | App CPU | Shaping/atlas | Instances | Upload |
+| --- | ---: | ---: | ---: | ---: |
+| Cell | 6.242% | 0.236 ms | 0.792 ms | 0.497 ms |
+| Row | 6.325% | 0.216 ms | 0.792 ms | 0.496 ms |
+| Full repaint | 8.023% | 0.658 ms | 0.785 ms | 0.507 ms |
+| Scroll | 6.861% | 0.644 ms | 0.791 ms | 0.461 ms |
+| Multilingual fixture + changing status cell | 5.368% | 0.191 ms | 0.254 ms | 0.427 ms |
+
+The multilingual sample measures steady display with a changing status cell; it
+does not measure continuously reshaping new Arabic paragraphs. Unfocused idle
+samples were 0.014% before these changes and 0.084% afterward, with no content
+frames during the latter sample. They are too small and brief to infer a useful
+idle regression. Text rendering adds no idle timer. Final atlas CPU attempts had
+focus transitions and are inconclusive; the explicit atlas growth tests passed.
+
+Full-grid instance construction remains the largest measured preparation stage
+in ASCII workloads. Partial conversion/instance uploads are not implemented here.
+
+[Raw observations and stage distributions](baselines/2026-10-01/unicode/summary.json)
+include focus, dimensions, frame counts, medians and p95. The matched cache pair is
+`unicode-final-cell-r2.json` / `unicode-cache-pair-after.json`; other files preserve
+the original text path, the initial correctness build and the focused cached runs.
+Rejected focus-transition attempts remain in the ignored results directory; one
+final rejected atlas sample is retained beside the accepted observations.
+
+Release binary SHA-256:
+
+- Original text path plus instrumentation: `4e828c951b10779b47b08ca0422b994f76e98993028ed70dffc0b0a08f4ba71b`.
+- Correctness build before frame cache: `b30d2c40244da000c051ef9b3503f6bb12697782fe843fd9206185240ff0a464`.
+- With frame cache: `b813a46387ef8b9e8c59686395dbc47cdc0243bc9014f69006f1d704017a9e12`.
+
+Validation: 339 workspace/all-target tests, three explicit Metal checks, strict
+Clippy, formatting and release build. PTY tests need native terminal access;
+sandbox-denied runs were rerun successfully without weakening assertions.

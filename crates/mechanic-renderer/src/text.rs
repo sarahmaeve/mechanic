@@ -1,18 +1,98 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
-use cosmic_text::{Attrs, Buffer, CacheKey, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{
+    Attrs, Buffer, CacheKey, Fallback, FontSystem, LayoutGlyph, Metrics, PlatformFallback, Shaping,
+    SwashCache, SwashContent, Wrap,
+};
 use mechanic_config::font::FontConfig;
+
+use crate::grid::{CellFlags, RenderCell};
 
 /// Number of slots per row in the atlas.
 const ATLAS_COLS: u32 = 16;
 /// Initial number of rows in the atlas (grows on demand).
 const ATLAS_INITIAL_ROWS: u32 = 8;
+const GLYPH_GUTTER: u32 = 1;
+const SHAPE_CACHE_ROWS: usize = 256;
+const SHAPE_CACHE_BYTES: usize = 1024 * 1024;
+static INTERNED_FAMILIES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+struct ConfiguredFallback {
+    common: Vec<&'static str>,
+    scripts: HashMap<unicode_script::Script, Vec<&'static str>>,
+}
+
+impl Fallback for ConfiguredFallback {
+    fn common_fallback(&self) -> &[&'static str] {
+        &self.common
+    }
+
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        PlatformFallback.forbidden_fallback()
+    }
+
+    fn script_fallback(&self, script: unicode_script::Script, locale: &str) -> &[&'static str] {
+        self.scripts
+            .get(&script)
+            .map_or_else(|| PlatformFallback.script_fallback(script, locale), Vec::as_slice)
+    }
+}
+
+fn configured_font_system(config: &FontConfig) -> FontSystem {
+    let mut common = Vec::new();
+    let mut interned = INTERNED_FAMILIES.lock().unwrap_or_else(|error| error.into_inner());
+    for family in config.fallback_families.iter().take(32) {
+        if family.len() > 256 {
+            log::warn!("ignoring font fallback name longer than 256 bytes");
+            continue;
+        }
+        let name = match interned.iter().find(|name| **name == family) {
+            Some(name) => *name,
+            None if interned.len() < 128 => {
+                // Cosmic's Fallback interface requires static family names.
+                // Intern once across renderer recreation, with a fixed bound.
+                let name: &'static str = Box::leak(family.clone().into_boxed_str());
+                interned.push(name);
+                name
+            }
+            None => {
+                log::warn!("font fallback name intern table is full");
+                continue;
+            }
+        };
+        common.push(name);
+    }
+    drop(interned);
+    let system = FontSystem::new();
+    let mut scripts = HashMap::new();
+    for script in [
+        unicode_script::Script::Latin,
+        unicode_script::Script::Cyrillic,
+        unicode_script::Script::Arabic,
+        unicode_script::Script::Han,
+        unicode_script::Script::Hiragana,
+        unicode_script::Script::Katakana,
+        unicode_script::Script::Common,
+        unicode_script::Script::Inherited,
+    ] {
+        let mut names = common.clone();
+        names.extend_from_slice(PlatformFallback.script_fallback(script, system.locale()));
+        scripts.insert(script, names);
+    }
+    common.extend_from_slice(PlatformFallback.common_fallback());
+    FontSystem::new_with_locale_and_db_and_fallback(
+        system.locale().to_owned(),
+        system.db().clone(),
+        ConfiguredFallback { common, scripts },
+    )
+}
 
 /// Compute the atlas slot size from the cell dimensions.
 pub fn compute_slot_size(cell_width: f32, cell_height: f32) -> u32 {
     let max_dim = cell_width.max(cell_height);
     let padded = (max_dim * 1.5).ceil() as u32;
-    padded.next_power_of_two().max(32)
+    padded.checked_next_power_of_two().unwrap_or(u32::MAX).max(32)
 }
 
 /// Shaped font metrics in physical pixels.
@@ -33,12 +113,40 @@ pub struct GlyphInfo {
     pub atlas_uv: [f32; 4],
     /// Horizontal offset in pixels from the cell left edge to the glyph's left edge (bearing X).
     pub offset_x: f32,
-    /// Vertical offset in pixels from the cell top to the glyph's top edge (`ascent - placement.top`).
+    /// Vertical bearing from the shaped glyph origin (`-placement.top`).
     pub offset_y: f32,
     /// Width of the rasterized bitmap in pixels.
     pub glyph_width: f32,
     /// Height of the rasterized bitmap in pixels.
     pub glyph_height: f32,
+    /// Scale already applied while rasterizing the outline; geometry should
+    /// only apply the remaining requested-scale / raster-scale correction.
+    pub raster_scale_x: f32,
+}
+
+/// Raster cache identity includes its horizontal outline transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlyphKey {
+    pub base: CacheKey,
+    horizontal_scale: u32,
+}
+
+impl GlyphKey {
+    fn new(base: CacheKey, scale_x: f32) -> Self {
+        Self { base, horizontal_scale: (scale_x * 1024.0).round().max(1.0) as u32 }
+    }
+
+    fn scale_x(self) -> f32 {
+        self.horizontal_scale as f32 / 1024.0
+    }
+}
+
+impl std::ops::Deref for GlyphKey {
+    type Target = CacheKey;
+
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
 }
 
 /// Character and style key for cached glyphs.
@@ -49,52 +157,187 @@ struct CharStyleKey {
     italic: bool,
 }
 
+/// One glyph from a shaped terminal row. A cluster can contain several glyphs.
+#[derive(Debug, Clone)]
+pub struct ShapedGlyph {
+    pub cache_key: GlyphKey,
+    pub source_col: usize,
+    /// Physical origin in pixels from the visual row's left/top edges.
+    pub x: f32,
+    pub y: f32,
+    /// Horizontal scale shared by a cluster or a complete RTL word.
+    pub scale_x: f32,
+    /// Visual cells sharing this geometry group, excluding glyph overhangs.
+    pub cluster_start: usize,
+    pub cluster_end: usize,
+}
+
+/// Shaping and terminal hit-test data share the same visual cell permutation.
+#[derive(Debug)]
+pub struct ShapedRow {
+    pub glyphs: Vec<ShapedGlyph>,
+    /// `visual_cols[logical_col]` is the displayed terminal column.
+    pub visual_cols: Vec<usize>,
+    /// Logical cells in right-to-left clusters invert their selection side.
+    pub rtl: Vec<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RowCellKey {
+    character: char,
+    marks: String,
+    flags: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RowKey(Vec<RowCellKey>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ParagraphKey {
+    rows: Vec<RowKey>,
+    prefix: String,
+    suffix: String,
+}
+
+impl RowKey {
+    fn new(cells: &[RenderCell]) -> Self {
+        let relevant = CellFlags::BOLD
+            | CellFlags::ITALIC
+            | CellFlags::WIDE_CHAR
+            | CellFlags::WIDE_CHAR_SPACER
+            | CellFlags::LEADING_WIDE_CHAR_SPACER
+            | CellFlags::HIDDEN;
+        Self(
+            cells
+                .iter()
+                .map(|cell| RowCellKey {
+                    character: cell.character,
+                    marks: cell.zerowidth.clone(),
+                    flags: (cell.flags & relevant).bits(),
+                })
+                .collect(),
+        )
+    }
+
+    fn bytes(&self) -> usize {
+        self.0.len() * std::mem::size_of::<RowCellKey>()
+            + self.0.iter().map(|cell| cell.marks.len()).sum::<usize>()
+    }
+}
+
+/// Failure is explicit: atlas uploads never crop a bitmap or exceed device bounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AtlasError {
+    GlyphTooLarge { width: u32, height: u32, limit: u32 },
+    FrameTooLarge { glyphs: usize, capacity: usize },
+    InvalidBitmap,
+}
+
+impl std::fmt::Display for AtlasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "glyph atlas preparation failed: {self:?}")
+    }
+}
+
+impl std::error::Error for AtlasError {}
+
+struct RasterGlyph {
+    key: GlyphKey,
+    width: u32,
+    height: u32,
+    left: i32,
+    top: i32,
+    coverage: Vec<u8>,
+    raster_scale_x: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AtlasLayout {
+    columns: u32,
+    rows: u32,
+    slot_size: u32,
+}
+
+impl AtlasLayout {
+    fn new(slot_size: u32, glyphs: usize, limit: u32) -> Result<Self, AtlasError> {
+        let axis = limit / slot_size.max(1);
+        if axis == 0 {
+            return Err(AtlasError::GlyphTooLarge { width: slot_size, height: slot_size, limit });
+        }
+        let capacity = u64::from(axis) * u64::from(axis);
+        if glyphs as u64 > capacity {
+            return Err(AtlasError::FrameTooLarge { glyphs, capacity: capacity as usize });
+        }
+        let glyphs = glyphs.max(1) as u32;
+        let columns = ATLAS_COLS.min(axis).max(glyphs.div_ceil(axis));
+        let rows = glyphs.div_ceil(columns);
+        Ok(Self { columns, rows, slot_size })
+    }
+
+    fn capacity(self) -> u32 {
+        self.columns * self.rows
+    }
+
+    fn uv(self, slot: u32, width: u32, height: u32) -> [f32; 4] {
+        let x = (slot % self.columns) * self.slot_size + GLYPH_GUTTER;
+        let y = (slot / self.columns) * self.slot_size + GLYPH_GUTTER;
+        let atlas_width = (self.columns * self.slot_size) as f32;
+        let atlas_height = (self.rows * self.slot_size) as f32;
+        [
+            x as f32 / atlas_width,
+            y as f32 / atlas_height,
+            (x + width) as f32 / atlas_width,
+            (y + height) as f32 / atlas_height,
+        ]
+    }
+}
+
 /// Manages font shaping and GPU glyph atlas upload.
 pub struct TextRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
+    raster_context: swash::scale::ScaleContext,
     /// The atlas texture lives on the GPU.
     pub atlas_texture: wgpu::Texture,
     /// A view into `atlas_texture`, kept alive alongside the texture.
     pub atlas_view: wgpu::TextureView,
     /// Map from cosmic-text `CacheKey` to cached `GlyphInfo`.
-    atlas_map: HashMap<CacheKey, GlyphInfo>,
-    /// Fast-path cache: `(char, bold, italic)` → `GlyphInfo`.
-    char_cache: HashMap<CharStyleKey, Option<GlyphInfo>>,
+    atlas_map: HashMap<GlyphKey, GlyphInfo>,
+    empty_glyphs: HashSet<GlyphKey>,
+    ascii_shapes: HashMap<CharStyleKey, Vec<LayoutGlyph>>,
+    shape_cache: HashMap<RowKey, Arc<ShapedRow>>,
+    shape_order: VecDeque<(RowKey, usize)>,
+    shape_cache_bytes: usize,
+    paragraph_cache: HashMap<ParagraphKey, Vec<Arc<ShapedRow>>>,
+    paragraph_order: VecDeque<(ParagraphKey, usize)>,
+    paragraph_cache_bytes: usize,
+    /// Strong references keep identity comparisons valid; retain only the
+    /// currently prepared frame, independent of the bounded shaping caches.
+    prepared_rows: Vec<Arc<ShapedRow>>,
+    prepared_generation: Option<u64>,
+    shape_buffer: Buffer,
     /// Next free slot index.
     atlas_next_slot: u32,
     /// Total number of slots currently allocated.
     atlas_capacity_slots: u32,
     /// Glyph slot width and height in pixels.
     slot_size: u32,
+    atlas_layout: AtlasLayout,
     /// Incremented on texture replacement; invalidates cached bind groups and UVs.
     atlas_generation: u64,
-    /// Font metrics (size, line height).
-    metrics: Metrics,
     /// Real cell metrics derived from a shaped test character.
     cell_metrics: CellMetrics,
 }
 
 impl TextRenderer {
-    /// Width of the atlas texture in pixels.
-    fn atlas_width(slot_size: u32) -> u32 {
-        slot_size * ATLAS_COLS
-    }
-
-    /// Current height of the atlas texture in pixels.
-    fn atlas_height(slot_size: u32, capacity_slots: u32) -> u32 {
-        let rows = capacity_slots.div_ceil(ATLAS_COLS);
-        rows * slot_size
-    }
-
     /// Construct a new `TextRenderer`, loading fonts from `config`.
     pub fn new(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         config: &FontConfig,
         scale_factor: f32,
     ) -> Self {
-        let mut font_system = FontSystem::new();
+        let mut font_system = configured_font_system(config);
 
         let px_size = config.size * scale_factor;
         let line_height = px_size * 1.3; // initial estimate; overridden by real metrics below
@@ -151,32 +394,49 @@ impl TextRenderer {
             CellMetrics { cell_width, cell_height, ascent }
         };
 
-        let slot_size = compute_slot_size(cell_metrics.cell_width, cell_metrics.cell_height);
+        let limit = device.limits().max_texture_dimension_2d;
+        let slot_size =
+            compute_slot_size(cell_metrics.cell_width, cell_metrics.cell_height).min(limit);
 
         let swash_cache = SwashCache::new();
 
-        let capacity_slots = ATLAS_COLS * ATLAS_INITIAL_ROWS;
-        let atlas_texture = Self::create_atlas_texture(device, slot_size, capacity_slots);
+        let max_slots = (limit / slot_size).pow(2);
+        let atlas_layout = AtlasLayout::new(
+            slot_size,
+            (ATLAS_COLS * ATLAS_INITIAL_ROWS).min(max_slots) as usize,
+            limit,
+        )
+        .expect("initial atlas fits device bounds");
+        let capacity_slots = atlas_layout.capacity();
+        let atlas_texture = Self::create_atlas_texture(device, atlas_layout);
         let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut renderer = Self {
+        let shape_buffer = Buffer::new(&mut font_system, metrics);
+        Self {
             font_system,
             swash_cache,
+            raster_context: swash::scale::ScaleContext::new(),
             atlas_texture,
             atlas_view,
             atlas_map: HashMap::new(),
-            char_cache: HashMap::new(),
+            empty_glyphs: HashSet::new(),
+            ascii_shapes: HashMap::new(),
+            shape_cache: HashMap::new(),
+            shape_order: VecDeque::new(),
+            shape_cache_bytes: 0,
+            paragraph_cache: HashMap::new(),
+            paragraph_order: VecDeque::new(),
+            paragraph_cache_bytes: 0,
+            prepared_rows: Vec::new(),
+            prepared_generation: None,
+            shape_buffer,
             atlas_next_slot: 0,
             atlas_capacity_slots: capacity_slots,
             slot_size,
+            atlas_layout,
             atlas_generation: 0,
-            metrics,
             cell_metrics,
-        };
-
-        renderer.rasterize_ascii_range(device, queue, config);
-
-        renderer
+        }
     }
 
     /// Return the real cell metrics extracted from the font.
@@ -189,16 +449,14 @@ impl TextRenderer {
         self.atlas_generation
     }
 
-    fn create_atlas_texture(
-        device: &wgpu::Device,
-        slot_size: u32,
-        capacity_slots: u32,
-    ) -> wgpu::Texture {
-        let width = Self::atlas_width(slot_size);
-        let height = Self::atlas_height(slot_size, capacity_slots);
+    fn create_atlas_texture(device: &wgpu::Device, layout: AtlasLayout) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph_atlas"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: layout.columns * layout.slot_size,
+                height: layout.rows * layout.slot_size,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -208,193 +466,1200 @@ impl TextRenderer {
         })
     }
 
-    /// Allocate a new atlas slot, growing the texture if necessary.
-    fn alloc_slot(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> u32 {
-        if self.atlas_next_slot >= self.atlas_capacity_slots {
-            let new_capacity = self.atlas_capacity_slots * 2;
-            let new_texture = Self::create_atlas_texture(device, self.slot_size, new_capacity);
-            let new_view = new_texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.atlas_texture = new_texture;
-            self.atlas_view = new_view;
-            self.atlas_capacity_slots = new_capacity;
-            self.atlas_generation += 1;
-            log::debug!(
-                "Glyph atlas grown to {} slots ({} rows), generation {}",
-                new_capacity,
-                new_capacity / ATLAS_COLS,
-                self.atlas_generation
-            );
-            self.atlas_map.clear();
-            self.char_cache.clear();
-            self.atlas_next_slot = 0;
-            let _ = queue; // queue not needed for clear
+    /// Shape complete rows with cell spans independent of proportional fallback
+    /// advances. Cached shaping is independent of colors, selection and atlas UVs.
+    pub fn shape_row(&mut self, cells: &[RenderCell], config: &FontConfig) -> Arc<ShapedRow> {
+        let key = RowKey::new(cells);
+        if let Some(row) = self.shape_cache.get(&key) {
+            return Arc::clone(row);
         }
-
-        let slot = self.atlas_next_slot;
-        self.atlas_next_slot += 1;
-        slot
-    }
-
-    /// Convert a slot index to `(col, row)` within the atlas grid.
-    fn slot_to_grid(slot: u32) -> (u32, u32) {
-        (slot % ATLAS_COLS, slot / ATLAS_COLS)
-    }
-
-    /// UV rectangle for a given slot covering only the actual glyph bitmap (not the full slot).
-    fn glyph_uv(
-        slot: u32,
-        glyph_w: u32,
-        glyph_h: u32,
-        slot_size: u32,
-        capacity_slots: u32,
-    ) -> [f32; 4] {
-        let (col, row) = Self::slot_to_grid(slot);
-        let atlas_w = Self::atlas_width(slot_size) as f32;
-        let atlas_h = Self::atlas_height(slot_size, capacity_slots) as f32;
-        let x0 = (col * slot_size) as f32 / atlas_w;
-        let y0 = (row * slot_size) as f32 / atlas_h;
-        let x1 = x0 + glyph_w as f32 / atlas_w;
-        let y1 = y0 + glyph_h as f32 / atlas_h;
-        [x0, y0, x1, y1]
-    }
-
-    /// Pre-rasterize glyphs. Growth clears earlier entries; this pass is not atomic.
-    pub fn populate_atlas<I>(
-        &mut self,
-        glyphs: I,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        config: &FontConfig,
-    ) where
-        I: IntoIterator<Item = (char, bool, bool)>,
-    {
-        for (ch, bold, italic) in glyphs {
-            self.rasterize_char(ch, bold, italic, device, queue, config);
-        }
-    }
-
-    /// Pre-rasterize printable ASCII glyphs (U+0020 – U+007E).
-    fn rasterize_ascii_range(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        config: &FontConfig,
-    ) {
-        for cp in 0x20u32..=0x7E {
-            let ch = char::from_u32(cp).unwrap_or(' ');
-            self.rasterize_char(ch, false, false, device, queue, config);
-        }
-    }
-
-    /// Rasterize and upload a character; None for whitespace or missing glyphs.
-    pub fn rasterize_char(
-        &mut self,
-        ch: char,
-        bold: bool,
-        italic: bool,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        config: &FontConfig,
-    ) -> Option<GlyphInfo> {
-        if ch == ' ' || ch == '\t' || ch == '\n' {
-            return None;
-        }
-
-        let style_key = CharStyleKey { ch, bold, italic };
-        if let Some(cached) = self.char_cache.get(&style_key) {
-            return *cached;
-        }
-
-        let cache_key = {
-            let mut buffer = Buffer::new(&mut self.font_system, self.metrics);
-            let mut borrow = buffer.borrow_with(&mut self.font_system);
-
-            let mut attrs = Attrs::new().family(cosmic_text::Family::Name(&config.family));
-            if bold {
-                attrs = attrs.weight(cosmic_text::Weight::BOLD);
-            }
-            if italic {
-                attrs = attrs.style(cosmic_text::Style::Italic);
-            }
-
-            let text = ch.to_string();
-            borrow.set_text(&text, &attrs, Shaping::Advanced, None);
-            borrow.shape_until_scroll(false);
-
-            // physical() provides the raster cache key.
-            borrow.layout_runs().find_map(|run| {
-                run.glyphs.iter().next().map(|glyph| glyph.physical((0.0, 0.0), 1.0).cache_key)
-            })
-        };
-        let Some(cache_key) = cache_key else {
-            self.char_cache.insert(style_key, None);
-            return None;
-        };
-
-        if let Some(&info) = self.atlas_map.get(&cache_key) {
-            self.char_cache.insert(style_key, Some(info));
-            return Some(info);
-        }
-
-        let image = self.swash_cache.get_image_uncached(&mut self.font_system, cache_key)?;
-
-        let glyph_w = image.placement.width;
-        let glyph_h = image.placement.height;
-
-        if glyph_w == 0 || glyph_h == 0 {
-            return None;
-        }
-
-        let offset_x = image.placement.left as f32;
-        let offset_y = self.cell_metrics.ascent - image.placement.top as f32;
-
-        let slot = self.alloc_slot(device, queue);
-        let slot_size = self.slot_size;
-
-        let (col, row) = Self::slot_to_grid(slot);
-        let dst_x = col * slot_size;
-        let dst_y = row * slot_size;
-
-        let upload_w = glyph_w.min(slot_size);
-        let upload_h = glyph_h.min(slot_size);
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: dst_x, y: dst_y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
+        let row = Arc::new(
+            if cells.iter().all(|cell| {
+                cell.character.is_ascii()
+                    && !cell.character.is_control()
+                    && cell.zerowidth.is_empty()
+                    && !cell.flags.intersects(
+                        CellFlags::WIDE_CHAR
+                            | CellFlags::WIDE_CHAR_SPACER
+                            | CellFlags::LEADING_WIDE_CHAR_SPACER,
+                    )
+            }) {
+                self.shape_ascii(cells, config)
+            } else {
+                shape_contextual_row(
+                    &mut self.font_system,
+                    &mut self.shape_buffer,
+                    cells,
+                    config,
+                    self.cell_metrics,
+                )
             },
-            &image.data[..(upload_w * upload_h) as usize],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(upload_w),
-                rows_per_image: None,
-            },
-            wgpu::Extent3d { width: upload_w, height: upload_h, depth_or_array_layers: 1 },
         );
+        let bytes = key.bytes() * 2
+            + row.glyphs.len() * std::mem::size_of::<ShapedGlyph>()
+            + row.visual_cols.len() * (std::mem::size_of::<usize>() + 1);
+        if bytes <= SHAPE_CACHE_BYTES {
+            while self.shape_cache.len() >= SHAPE_CACHE_ROWS
+                || self.shape_cache_bytes + bytes > SHAPE_CACHE_BYTES
+            {
+                if let Some((old, old_bytes)) = self.shape_order.pop_front() {
+                    self.shape_cache.remove(&old);
+                    self.shape_cache_bytes -= old_bytes;
+                } else {
+                    break;
+                }
+            }
+            self.shape_order.push_back((key.clone(), bytes));
+            self.shape_cache.insert(key, Arc::clone(&row));
+            self.shape_cache_bytes += bytes;
+        }
+        row
+    }
 
-        let uv = Self::glyph_uv(slot, upload_w, upload_h, slot_size, self.atlas_capacity_slots);
-        let info = GlyphInfo {
-            atlas_uv: uv,
-            offset_x,
-            offset_y,
-            glyph_width: upload_w as f32,
-            glyph_height: upload_h as f32,
+    /// Soft-wrapped rows share paragraph bidi resolution. Glyph joining is
+    /// deliberately broken at a physical row boundary, so a lam-alef ligature
+    /// cannot occupy cells from two separately presented terminal rows.
+    pub fn shape_grid(
+        &mut self,
+        grid: &crate::grid::RenderGrid,
+        config: &FontConfig,
+    ) -> Vec<Arc<ShapedRow>> {
+        let mut output = Vec::with_capacity(grid.rows);
+        let mut first = 0;
+        while first < grid.rows {
+            let mut end = first + 1;
+            while end < grid.rows && grid.wrapped.get(end - 1).copied().unwrap_or(false) {
+                end += 1;
+            }
+            let rows: Vec<_> = (first..end)
+                .map(|row| &grid.cells[row * grid.cols..(row + 1) * grid.cols])
+                .collect();
+            let prefix = if first == 0 { grid.bidi_prefix.as_str() } else { "" };
+            let suffix = if end == grid.rows { grid.bidi_suffix.as_str() } else { "" };
+            if prefix.is_empty()
+                && suffix.is_empty()
+                && (rows.len() == 1
+                    || rows.iter().all(|row| {
+                        row.iter()
+                            .all(|cell| cell.character.is_ascii() && cell.zerowidth.is_empty())
+                    }))
+            {
+                output.extend(rows.iter().map(|row| self.shape_row(row, config)));
+            } else {
+                let key = ParagraphKey {
+                    rows: rows.iter().map(|row| RowKey::new(row)).collect(),
+                    prefix: prefix.to_owned(),
+                    suffix: suffix.to_owned(),
+                };
+                if let Some(cached) = self.paragraph_cache.get(&key) {
+                    output.extend(cached.iter().cloned());
+                } else {
+                    let shaped: Vec<_> = shape_contextual_paragraph(
+                        &mut self.font_system,
+                        &mut self.shape_buffer,
+                        &rows,
+                        config,
+                        self.cell_metrics,
+                        prefix,
+                        suffix,
+                    )
+                    .into_iter()
+                    .map(Arc::new)
+                    .collect();
+                    let bytes = (key.rows.iter().map(RowKey::bytes).sum::<usize>()
+                        + prefix.len()
+                        + suffix.len())
+                        * 2
+                        + shaped
+                            .iter()
+                            .map(|row| {
+                                row.glyphs.len() * std::mem::size_of::<ShapedGlyph>()
+                                    + row.visual_cols.len() * (std::mem::size_of::<usize>() + 1)
+                            })
+                            .sum::<usize>();
+                    if bytes <= SHAPE_CACHE_BYTES {
+                        while self.paragraph_cache.len() >= 64
+                            || self.paragraph_cache_bytes + bytes > SHAPE_CACHE_BYTES
+                        {
+                            if let Some((old, old_bytes)) = self.paragraph_order.pop_front() {
+                                self.paragraph_cache.remove(&old);
+                                self.paragraph_cache_bytes -= old_bytes;
+                            } else {
+                                break;
+                            }
+                        }
+                        self.paragraph_order.push_back((key.clone(), bytes));
+                        self.paragraph_cache.insert(key, shaped.clone());
+                        self.paragraph_cache_bytes += bytes;
+                    }
+                    output.extend(shaped);
+                }
+            }
+            first = end;
+        }
+        output
+    }
+
+    fn shape_ascii(&mut self, cells: &[RenderCell], config: &FontConfig) -> ShapedRow {
+        let mut shaped = ShapedRow {
+            glyphs: Vec::with_capacity(cells.len()),
+            visual_cols: (0..cells.len()).collect(),
+            rtl: vec![false; cells.len()],
         };
-        self.atlas_map.insert(cache_key, info);
-        self.char_cache.insert(style_key, Some(info));
-        Some(info)
+        for (col, cell) in cells.iter().enumerate() {
+            if cell.character == ' ' || cell.flags.contains(CellFlags::HIDDEN) {
+                continue;
+            }
+            let key = CharStyleKey {
+                ch: cell.character,
+                bold: cell.flags.contains(CellFlags::BOLD),
+                italic: cell.flags.contains(CellFlags::ITALIC),
+            };
+            let glyphs = self.ascii_shapes.entry(key).or_insert_with(|| {
+                let text = cell.character.to_string();
+                let attrs = cell_attrs(cell, config);
+                let mut buffer = self.shape_buffer.borrow_with(&mut self.font_system);
+                buffer.set_wrap(Wrap::None);
+                buffer.set_text(&text, &attrs, Shaping::Advanced, None);
+                buffer.shape_until_scroll(false);
+                buffer.layout_runs().flat_map(|run| run.glyphs.to_vec()).collect()
+            });
+            for glyph in glyphs.iter() {
+                let physical = glyph.physical(
+                    (col as f32 * self.cell_metrics.cell_width, self.cell_metrics.ascent),
+                    1.0,
+                );
+                shaped.glyphs.push(ShapedGlyph {
+                    cache_key: GlyphKey::new(physical.cache_key, 1.0),
+                    source_col: col,
+                    x: physical.x as f32,
+                    y: physical.y as f32,
+                    scale_x: 1.0,
+                    cluster_start: col,
+                    cluster_end: col + 1,
+                });
+            }
+        }
+        shaped
+    }
+
+    fn raster_glyph(&mut self, key: GlyphKey) -> Result<Option<RasterGlyph>, AtlasError> {
+        let scale_x = key.scale_x();
+        let transformed = if key.horizontal_scale != 1024 {
+            transformed_swash_image(&mut self.font_system, &mut self.raster_context, key)
+        } else {
+            None
+        };
+        let (image, raster_scale_x) = if let Some(image) = transformed {
+            (Some(image), scale_x)
+        } else {
+            // Bitmap-only fonts have no outline to transform. Preserve their
+            // correct coverage and let the remaining geometry scale handle it.
+            (self.swash_cache.get_image_uncached(&mut self.font_system, key.base), 1.0)
+        };
+        let Some(image) = image else {
+            return Ok(None);
+        };
+        let placement = image.placement;
+        if placement.width == 0 || placement.height == 0 {
+            return Ok(None);
+        }
+        let coverage =
+            bitmap_coverage(image.content, placement.width, placement.height, image.data)?;
+        Ok(Some(RasterGlyph {
+            key,
+            width: placement.width,
+            height: placement.height,
+            left: placement.left,
+            top: placement.top,
+            coverage,
+            raster_scale_x,
+        }))
+    }
+
+    /// Reserve/upload every frame glyph before immutable instance-building
+    /// lookups. Rebuilding discards older rows only after all images validate.
+    pub fn prepare_glyphs<I>(
+        &mut self,
+        keys: I,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), AtlasError>
+    where
+        I: IntoIterator<Item = GlyphKey>,
+    {
+        let keys: HashSet<_> = keys.into_iter().collect();
+        let mut images = Vec::new();
+        let mut empty = Vec::new();
+        for &key in &keys {
+            if self.atlas_map.contains_key(&key) || self.empty_glyphs.contains(&key) {
+                continue;
+            }
+            match self.raster_glyph(key)? {
+                Some(image) => images.push(image),
+                None => empty.push(key),
+            }
+        }
+        let max_width = images
+            .iter()
+            .map(|image| image.width)
+            .chain(
+                keys.iter()
+                    .filter_map(|key| self.atlas_map.get(key).map(|info| info.glyph_width as u32)),
+            )
+            .max()
+            .unwrap_or(1);
+        let max_height = images
+            .iter()
+            .map(|image| image.height)
+            .chain(
+                keys.iter()
+                    .filter_map(|key| self.atlas_map.get(key).map(|info| info.glyph_height as u32)),
+            )
+            .max()
+            .unwrap_or(1);
+        let limit = device.limits().max_texture_dimension_2d;
+        let padded = max_width.max(max_height).saturating_add(GLYPH_GUTTER * 2);
+        if padded > limit {
+            return Err(AtlasError::GlyphTooLarge { width: max_width, height: max_height, limit });
+        }
+        let needed_size = padded.checked_next_power_of_two().unwrap_or(limit);
+        let slot_size = self.slot_size.max(needed_size.min(limit));
+        let rebuild = slot_size != self.slot_size
+            || self.atlas_next_slot as usize + images.len() > self.atlas_capacity_slots as usize;
+        if rebuild {
+            let active_count =
+                images.len() + keys.iter().filter(|key| self.atlas_map.contains_key(key)).count();
+            let axis = limit / slot_size;
+            let max_capacity = (u64::from(axis) * u64::from(axis)) as usize;
+            let desired =
+                (self.atlas_capacity_slots as usize * 2).max(active_count).min(max_capacity);
+            // Validate the active frame independently of our growth preference.
+            if active_count > max_capacity {
+                return Err(AtlasError::FrameTooLarge {
+                    glyphs: active_count,
+                    capacity: max_capacity,
+                });
+            }
+            let layout = AtlasLayout::new(slot_size, desired, limit)?;
+            for &key in &keys {
+                if self.atlas_map.contains_key(&key) {
+                    if let Some(image) = self.raster_glyph(key)? {
+                        images.push(image);
+                    } else {
+                        empty.push(key);
+                    }
+                }
+            }
+            let texture = Self::create_atlas_texture(device, layout);
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.atlas_texture = texture;
+            self.atlas_view = view;
+            self.atlas_map.clear();
+            self.empty_glyphs.retain(|key| keys.contains(key));
+            self.atlas_next_slot = 0;
+            self.atlas_capacity_slots = layout.capacity();
+            self.slot_size = slot_size;
+            self.atlas_layout = layout;
+            self.atlas_generation += 1;
+        }
+        for image in images {
+            let slot = self.atlas_next_slot;
+            self.atlas_next_slot += 1;
+            let x = (slot % self.atlas_layout.columns) * self.slot_size + GLYPH_GUTTER;
+            let y = (slot / self.atlas_layout.columns) * self.slot_size + GLYPH_GUTTER;
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.atlas_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &image.coverage,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(image.width),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: image.width,
+                    height: image.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.atlas_map.insert(
+                image.key,
+                GlyphInfo {
+                    atlas_uv: self.atlas_layout.uv(slot, image.width, image.height),
+                    offset_x: image.left as f32,
+                    offset_y: -(image.top as f32),
+                    glyph_width: image.width as f32,
+                    glyph_height: image.height as f32,
+                    raster_scale_x: image.raster_scale_x,
+                },
+            );
+        }
+        if self.empty_glyphs.len() + empty.len() > 1024 {
+            self.empty_glyphs.clear();
+        }
+        let remaining = 1024 - self.empty_glyphs.len();
+        self.empty_glyphs.extend(empty.into_iter().take(remaining));
+        Ok(())
+    }
+
+    /// Unchanged row identities already have valid UVs at this generation.
+    /// Changed rows need only residency checks until a missing glyph requires
+    /// the complete frame preflight that makes atlas growth atomic.
+    pub fn prepare_frame(
+        &mut self,
+        rows: &[Arc<ShapedRow>],
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), AtlasError> {
+        let all_resident = self.prepared_generation == Some(self.atlas_generation)
+            && rows.iter().enumerate().all(|(index, row)| {
+                self.prepared_rows.get(index).is_some_and(|old| Arc::ptr_eq(old, row))
+                    || row.glyphs.iter().all(|glyph| {
+                        self.atlas_map.contains_key(&glyph.cache_key)
+                            || self.empty_glyphs.contains(&glyph.cache_key)
+                    })
+            });
+        if !all_resident {
+            self.prepare_glyphs(
+                rows.iter().flat_map(|row| row.glyphs.iter().map(|glyph| glyph.cache_key)),
+                device,
+                queue,
+            )?;
+        }
+        self.prepared_rows.clear();
+        self.prepared_rows.extend(rows.iter().cloned());
+        self.prepared_generation = Some(self.atlas_generation);
+        Ok(())
+    }
+
+    /// Lookup only: it cannot grow the atlas or invalidate another glyph's UVs.
+    pub fn glyph_info(&self, key: GlyphKey) -> Option<GlyphInfo> {
+        self.atlas_map.get(&key).copied()
+    }
+}
+
+fn cell_attrs<'a>(cell: &RenderCell, config: &'a FontConfig) -> Attrs<'a> {
+    let mut attrs = Attrs::new().family(cosmic_text::Family::Name(&config.family));
+    if cell.flags.contains(CellFlags::BOLD) {
+        attrs = attrs.weight(cosmic_text::Weight::BOLD);
+    }
+    if cell.flags.contains(CellFlags::ITALIC) {
+        attrs = attrs.style(cosmic_text::Style::Italic);
+    }
+    attrs
+}
+
+struct CellRange {
+    start: usize,
+    end: usize,
+    col: usize,
+    span: usize,
+    row: usize,
+}
+
+struct GlyphCluster {
+    first: usize,
+    end: usize,
+    min_x: f32,
+    glyphs: Vec<LayoutGlyph>,
+}
+
+fn shape_contextual_row(
+    font_system: &mut FontSystem,
+    buffer: &mut Buffer,
+    cells: &[RenderCell],
+    config: &FontConfig,
+    metrics: CellMetrics,
+) -> ShapedRow {
+    shape_contextual_paragraph(font_system, buffer, &[cells], config, metrics, "", "").remove(0)
+}
+
+fn shape_contextual_paragraph(
+    font_system: &mut FontSystem,
+    buffer: &mut Buffer,
+    rows: &[&[RenderCell]],
+    config: &FontConfig,
+    metrics: CellMetrics,
+    prefix: &str,
+    suffix: &str,
+) -> Vec<ShapedRow> {
+    let mut shaped: Vec<_> = rows
+        .iter()
+        .map(|cells| ShapedRow {
+            glyphs: Vec::new(),
+            visual_cols: (0..cells.len()).collect(),
+            rtl: vec![false; cells.len()],
+        })
+        .collect();
+    let mut text = String::new();
+    let mut ranges = Vec::<CellRange>::new();
+    let mut spans = Vec::new();
+    let mut row_bytes = Vec::new();
+    let mut occupied_ranges = Vec::new();
+    let mut row_cell_indices = Vec::new();
+    if !prefix.is_empty() {
+        text.push_str(prefix);
+        text.push('\u{200c}');
+        spans.push((0..text.len(), Attrs::new().family(cosmic_text::Family::Name(&config.family))));
+    }
+    let occupied = |cell: &RenderCell| {
+        !cell.flags.intersects(
+            CellFlags::HIDDEN | CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER,
+        ) && (cell.character != ' ' || !cell.zerowidth.is_empty())
+    };
+    for (row, cells) in rows.iter().enumerate() {
+        let first = cells.iter().position(occupied);
+        let last = cells.iter().rposition(occupied);
+        let occupied_range = match (first, last) {
+            (Some(first), Some(last)) => {
+                let span = if cells[last].flags.contains(CellFlags::WIDE_CHAR)
+                    && cells
+                        .get(last + 1)
+                        .is_some_and(|cell| cell.flags.contains(CellFlags::WIDE_CHAR_SPACER))
+                {
+                    2
+                } else {
+                    1
+                };
+                first..last + span
+            }
+            _ => 0..0,
+        };
+        occupied_ranges.push(occupied_range);
+        let row_start = text.len();
+        let mut cell_indices = vec![0; cells.len()];
+        let mut col = 0;
+        while col < cells.len() {
+            let cell = &cells[col];
+            let start = text.len();
+            let hidden = cell.flags.intersects(
+                CellFlags::HIDDEN
+                    | CellFlags::WIDE_CHAR_SPACER
+                    | CellFlags::LEADING_WIDE_CHAR_SPACER,
+            );
+            text.push(if hidden { ' ' } else { cell.character });
+            if !hidden {
+                text.push_str(&cell.zerowidth);
+            }
+            let end = text.len();
+            let span = if cell.flags.contains(CellFlags::WIDE_CHAR)
+                && cells
+                    .get(col + 1)
+                    .is_some_and(|cell| cell.flags.contains(CellFlags::WIDE_CHAR_SPACER))
+            {
+                2
+            } else {
+                1
+            };
+            for index in &mut cell_indices[col..col + span] {
+                *index = ranges.len();
+            }
+            ranges.push(CellRange { start, end, col, span, row });
+            spans.push((start..end, cell_attrs(cell, config)));
+            col += span;
+        }
+        row_bytes.push(row_start..text.len());
+        row_cell_indices.push(cell_indices);
+        if row + 1 < rows.len() {
+            // ZWNJ is not a paragraph break. Bidi context is retained, while
+            // Arabic joins/ligatures do not straddle two physical row bitmaps.
+            let start = text.len();
+            text.push('\u{200c}');
+            spans.push((
+                start..text.len(),
+                Attrs::new().family(cosmic_text::Family::Name(&config.family)),
+            ));
+        }
+    }
+    if !suffix.is_empty() {
+        let start = text.len();
+        text.push('\u{200c}');
+        text.push_str(suffix);
+        spans.push((
+            start..text.len(),
+            Attrs::new().family(cosmic_text::Family::Name(&config.family)),
+        ));
+    }
+    if text.is_empty() {
+        return shaped;
+    }
+    let bidi = unicode_bidi::BidiInfo::new(&text, None);
+    let attrs = Attrs::new().family(cosmic_text::Family::Name(&config.family));
+    let mut borrow = buffer.borrow_with(font_system);
+    borrow.set_wrap(Wrap::None);
+    borrow.set_size(None, None);
+    borrow.set_monospace_width(Some(metrics.cell_width));
+    borrow.set_rich_text(
+        spans.iter().map(|(range, attrs)| (&text[range.clone()], attrs.clone())),
+        &attrs,
+        Shaping::Advanced,
+        Some(cosmic_text::Align::Left),
+    );
+    borrow.shape_until_scroll(false);
+    let mut row_clusters: Vec<Vec<GlyphCluster>> = (0..rows.len()).map(|_| Vec::new()).collect();
+    let mut cluster_indices: Vec<HashMap<(usize, usize), usize>> =
+        (0..rows.len()).map(|_| HashMap::new()).collect();
+    for run in borrow.layout_runs() {
+        for glyph in run.glyphs {
+            if ranges.is_empty()
+                || glyph.end <= ranges[0].start
+                || glyph.start >= ranges[ranges.len() - 1].end
+            {
+                continue;
+            }
+            let first_index = ranges.partition_point(|range| range.end <= glyph.start);
+            let end_index = ranges.partition_point(|range| range.start < glyph.end);
+            if first_index >= end_index {
+                continue;
+            }
+            let source = &ranges[first_index];
+            let tail = &ranges[end_index - 1];
+            // Row boundary controls prevent cross-row ligatures. Keep any
+            // invisible boundary-only glyph out of the terminal-cell mapping.
+            if source.row != tail.row {
+                continue;
+            }
+            let row = source.row;
+            if !occupied_ranges[row].contains(&source.col) {
+                continue;
+            }
+            let first_col = source.col;
+            let last_col = tail.col + tail.span;
+            let clusters = &mut row_clusters[row];
+            if let Some(index) = cluster_indices[row].get(&(first_col, last_col)) {
+                let cluster = &mut clusters[*index];
+                cluster.min_x = cluster.min_x.min(glyph.x);
+                cluster.glyphs.push(glyph.clone());
+            } else {
+                cluster_indices[row].insert((first_col, last_col), clusters.len());
+                clusters.push(GlyphCluster {
+                    first: first_col,
+                    end: last_col,
+                    min_x: glyph.x,
+                    glyphs: vec![glyph.clone()],
+                });
+            }
+        }
+    }
+    for (row, mut clusters) in row_clusters.into_iter().enumerate() {
+        // Default-ignorable characters may produce no glyph. They still own
+        // their terminal cells, so reserve empty clusters before reordering.
+        let mut covered = vec![false; rows[row].len()];
+        for cluster in &clusters {
+            covered[cluster.first..cluster.end].fill(true);
+        }
+        let mut col = occupied_ranges[row].start;
+        while col < occupied_ranges[row].end {
+            let range = &ranges[row_cell_indices[row][col]];
+            if !covered[col] {
+                clusters.push(GlyphCluster {
+                    first: col,
+                    end: col + range.span,
+                    min_x: 0.0,
+                    glyphs: Vec::new(),
+                });
+            }
+            col += range.span;
+        }
+        clusters.sort_by_key(|cluster| cluster.first);
+        let mut merged = Vec::<GlyphCluster>::new();
+        for cluster in clusters {
+            if let Some(previous) = merged.last_mut()
+                && cluster.first < previous.end
+            {
+                previous.end = previous.end.max(cluster.end);
+                previous.min_x = previous.min_x.min(cluster.min_x);
+                previous.glyphs.extend(cluster.glyphs);
+            } else {
+                merged.push(cluster);
+            }
+        }
+        let Some(paragraph) = bidi.paragraphs.iter().find(|paragraph| {
+            paragraph.range.start <= row_bytes[row].start
+                && row_bytes[row].start < paragraph.range.end
+        }) else {
+            continue;
+        };
+        let line_levels = bidi.reordered_levels(paragraph, row_bytes[row].clone());
+        let levels: Vec<_> = merged
+            .iter()
+            .map(|cluster| {
+                let byte = ranges[row_cell_indices[row][cluster.first]].start;
+                line_levels[byte]
+            })
+            .collect();
+        let order = unicode_bidi::BidiInfo::reorder_visual(&levels);
+        let mut visual_col = occupied_ranges[row].start;
+        let mut visual_spans = vec![(0, 0); merged.len()];
+        for &index in &order {
+            let cluster = &merged[index];
+            let rtl = levels[index].is_rtl();
+            let cluster_visual = visual_col;
+            let mut units = Vec::new();
+            let mut col = cluster.first;
+            while col < cluster.end {
+                let range = &ranges[row_cell_indices[row][col]];
+                units.push(range);
+                col += range.span;
+            }
+            if rtl {
+                units.reverse();
+            }
+            for unit in units {
+                for offset in 0..unit.span {
+                    shaped[row].visual_cols[unit.col + offset] = visual_col + offset;
+                    shaped[row].rtl[unit.col + offset] = rtl;
+                }
+                visual_col += unit.span;
+            }
+            visual_spans[index] = (cluster_visual, visual_col);
+        }
+        let is_rtl_word = |index: usize| {
+            levels[index].is_rtl()
+                && rows[row][merged[index].first..merged[index].end]
+                    .iter()
+                    .all(|cell| !cell.character.is_whitespace())
+        };
+        let mut first = 0;
+        while first < order.len() {
+            let mut end = first + 1;
+            if is_rtl_word(order[first]) {
+                while end < order.len()
+                    && levels[order[end]] == levels[order[first]]
+                    && is_rtl_word(order[end])
+                {
+                    end += 1;
+                }
+            }
+            let group = &order[first..end];
+            let group_start = visual_spans[group[0]].0;
+            let group_end = visual_spans[group[group.len() - 1]].1;
+            // Scale a connected RTL word as one geometry group. Independent
+            // cell/cluster scaling deforms joining strokes and stacks ligature
+            // parts; one affine transform preserves all natural glyph offsets.
+            let natural_start = group
+                .iter()
+                .flat_map(|index| &merged[*index].glyphs)
+                .map(|glyph| glyph.x)
+                .fold(f32::INFINITY, f32::min);
+            let natural_end = group
+                .iter()
+                .flat_map(|index| &merged[*index].glyphs)
+                .map(|glyph| glyph.x + glyph.w)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let natural_width = natural_end - natural_start;
+            let reserved_width = (group_end - group_start) as f32 * metrics.cell_width;
+            let scale_x = if natural_width > 0.0 { reserved_width / natural_width } else { 1.0 };
+            for (cluster, glyph) in group.iter().flat_map(|index| {
+                let cluster = &merged[*index];
+                cluster.glyphs.iter().map(move |glyph| (cluster, glyph))
+            }) {
+                let index = ranges.partition_point(|range| range.end <= glyph.start);
+                let source_col = ranges
+                    .get(index)
+                    .filter(|range| range.row == row && range.start <= glyph.start)
+                    .map_or(cluster.first, |range| range.col);
+                let physical = glyph.physical((0.0, metrics.ascent), 1.0);
+                shaped[row].glyphs.push(ShapedGlyph {
+                    cache_key: GlyphKey::new(physical.cache_key, scale_x),
+                    source_col,
+                    x: group_start as f32 * metrics.cell_width
+                        + (physical.x as f32 - natural_start) * scale_x,
+                    y: physical.y as f32,
+                    scale_x,
+                    cluster_start: group_start,
+                    cluster_end: group_end,
+                });
+            }
+            first = end;
+        }
+    }
+    shaped
+}
+
+fn transformed_swash_image(
+    font_system: &mut FontSystem,
+    context: &mut swash::scale::ScaleContext,
+    key: GlyphKey,
+) -> Option<cosmic_text::SwashImage> {
+    use swash::scale::{Render, Source};
+    use swash::zeno::{Angle, Format, Transform, Vector};
+
+    let font = font_system.get_font(key.font_id, key.font_weight)?;
+    let variable_weight =
+        font.as_swash().variations().find_by_tag(swash::Tag::from_be_bytes(*b"wght"));
+    let mut scaler = context
+        .builder(font.as_swash())
+        .size(f32::from_bits(key.font_size_bits))
+        .hint(!key.flags.contains(cosmic_text::CacheKeyFlags::DISABLE_HINTING));
+    if let Some(axis) = variable_weight {
+        scaler = scaler.normalized_coords(font.as_swash().variations().normalized_coords([(
+            swash::Tag::from_be_bytes(*b"wght"),
+            f32::from(key.font_weight.0).clamp(axis.min_value(), axis.max_value()),
+        )]));
+    }
+    let mut scaler = scaler.build();
+    let scale_x = key.scale_x();
+    let transform = if key.flags.contains(cosmic_text::CacheKeyFlags::FAKE_ITALIC) {
+        Transform::skew(Angle::from_degrees(14.0), Angle::from_degrees(0.0))
+            .then_scale(scale_x, 1.0)
+    } else {
+        Transform::scale(scale_x, 1.0)
+    };
+    let pixel_font = key.flags.contains(cosmic_text::CacheKeyFlags::PIXEL_FONT);
+    let x = key.x_bin.as_float();
+    let y = key.y_bin.as_float();
+    Render::new(&[Source::ColorOutline(0), Source::Outline])
+        .format(Format::Alpha)
+        .offset(Vector::new(
+            if pixel_font { x.round() * scale_x } else { x * scale_x },
+            if pixel_font { y.round() } else { y },
+        ))
+        .transform(Some(transform))
+        .render(&mut scaler, key.glyph_id)
+}
+
+fn bitmap_coverage(
+    content: SwashContent,
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+) -> Result<Vec<u8>, AtlasError> {
+    let pixels = (width as usize).checked_mul(height as usize).ok_or(AtlasError::InvalidBitmap)?;
+    let channels = if content == SwashContent::Mask { 1 } else { 4 };
+    if data.len() != pixels.checked_mul(channels).ok_or(AtlasError::InvalidBitmap)? {
+        return Err(AtlasError::InvalidBitmap);
+    }
+    match content {
+        SwashContent::Mask => Ok(data),
+        // The terminal shader colors glyph coverage; retain alpha from color
+        // bitmaps rather than interpreting interleaved RGBA bytes as rows.
+        SwashContent::Color => Ok(data.as_chunks::<4>().0.iter().map(|rgba| rgba[3]).collect()),
+        SwashContent::SubpixelMask => Ok(data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|rgba| ((u16::from(rgba[0]) + u16::from(rgba[1]) + u16::from(rgba[2])) / 3) as u8)
+            .collect()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::compute_slot_size;
+    use super::*;
+
+    fn cells(text: &str) -> Vec<RenderCell> {
+        text.chars().map(|character| RenderCell { character, ..RenderCell::default() }).collect()
+    }
+
+    fn cpu_shaper() -> (FontSystem, Buffer, FontConfig, CellMetrics) {
+        let config = FontConfig { family: "Menlo".into(), ..FontConfig::default() };
+        let mut fonts = configured_font_system(&config);
+        let buffer = Buffer::new(&mut fonts, Metrics::new(16.0, 24.0));
+        (fonts, buffer, config, CellMetrics { cell_width: 10.0, cell_height: 24.0, ascent: 18.0 })
+    }
+
+    fn assert_permutation(row: &ShapedRow) {
+        let mut columns = row.visual_cols.clone();
+        columns.sort_unstable();
+        assert_eq!(columns, (0..columns.len()).collect::<Vec<_>>());
+        assert!(row.glyphs.iter().all(|glyph| glyph.source_col < columns.len()
+            && glyph.x.is_finite()
+            && glyph.y.is_finite()));
+    }
+
+    #[test]
+    fn language_rows_preserve_glyphs_marks_and_terminal_spans() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        for text in [
+            "Français déjà Noël — Deutsch Grüße Straße",
+            "Español canción — Português ação — Italiano città",
+            "Русский текст — Українська мова ї є ґ",
+            "قال المسؤول: «سنبدأ عام 2026».",
+        ] {
+            let input = cells(text);
+            let shaped = shape_contextual_row(&mut fonts, &mut buffer, &input, &config, metrics);
+            assert_permutation(&shaped);
+            assert!(!shaped.glyphs.is_empty(), "missing language glyphs for {text}");
+            assert!(
+                shaped.glyphs.iter().all(|glyph| glyph.cache_key.glyph_id != 0),
+                "font fallback failed for {text}"
+            );
+        }
+        let mut marked = cells("a");
+        marked[0].zerowidth = "\u{315}\u{323}".into();
+        let shaped = shape_contextual_row(&mut fonts, &mut buffer, &marked, &config, metrics);
+        assert!(shaped.glyphs.len() >= 2, "multiple combining glyphs were discarded");
+        assert!(shaped.glyphs.iter().all(|glyph| glyph.source_col == 0));
+        assert_permutation(&shaped);
+
+        let mut japanese = Vec::new();
+        for character in "日本語".chars() {
+            japanese.push(RenderCell {
+                character,
+                flags: CellFlags::WIDE_CHAR,
+                ..RenderCell::default()
+            });
+            japanese
+                .push(RenderCell { flags: CellFlags::WIDE_CHAR_SPACER, ..RenderCell::default() });
+        }
+        let shaped = shape_contextual_row(&mut fonts, &mut buffer, &japanese, &config, metrics);
+        assert_permutation(&shaped);
+        assert_eq!(shaped.visual_cols, vec![0, 1, 2, 3, 4, 5]);
+        for col in [0, 2, 4] {
+            assert!(
+                shaped
+                    .glyphs
+                    .iter()
+                    .any(|glyph| glyph.source_col == col && glyph.cache_key.glyph_id != 0)
+            );
+        }
+    }
+
+    #[test]
+    fn arabic_joining_and_prose_punctuation_follow_paragraph_direction() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        let input = cells("سلام");
+        let row = shape_contextual_row(&mut fonts, &mut buffer, &input, &config, metrics);
+        assert_permutation(&row);
+        assert_eq!(row.visual_cols, vec![3, 2, 1, 0]);
+        let joined: Vec<_> = row.glyphs.iter().map(|glyph| glyph.cache_key.glyph_id).collect();
+        let isolated: Vec<_> = input
+            .iter()
+            .flat_map(|cell| {
+                shape_contextual_row(
+                    &mut fonts,
+                    &mut buffer,
+                    std::slice::from_ref(cell),
+                    &config,
+                    metrics,
+                )
+                .glyphs
+            })
+            .map(|glyph| glyph.cache_key.glyph_id)
+            .collect();
+        assert_ne!(joined, isolated, "Arabic was shaped character by character");
+
+        let mut prose = cells("قال المسؤول: «سنبدأ عام 2026».");
+        let end = prose.len();
+        prose.extend(cells("      "));
+        let row = shape_contextual_row(&mut fonts, &mut buffer, &prose, &config, metrics);
+        assert_permutation(&row);
+        assert_eq!(
+            row.visual_cols[end - 1],
+            0,
+            "final neutral period must follow RTL paragraph direction"
+        );
+        assert_eq!(&row.visual_cols[end..], &(end..prose.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn proportional_arabic_advances_scale_to_contiguous_terminal_clusters() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        for word in ["سلام", "الله", "المسؤول"] {
+            let input = cells(word);
+            let row = shape_contextual_row(&mut fonts, &mut buffer, &input, &config, metrics);
+            assert_permutation(&row);
+            let natural: Vec<_> =
+                buffer.layout_runs().flat_map(|run| run.glyphs.to_vec()).collect();
+            let scale = row.glyphs[0].scale_x;
+            let min_x = natural.iter().map(|glyph| glyph.x).fold(f32::INFINITY, f32::min);
+            let max_x =
+                natural.iter().map(|glyph| glyph.x + glyph.w).fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                ((max_x - min_x) * scale - input.len() as f32 * metrics.cell_width).abs() < 0.001
+            );
+            let mut origins = Vec::new();
+            for glyph in &row.glyphs {
+                assert_eq!(glyph.cluster_start, 0);
+                assert_eq!(glyph.cluster_end, input.len());
+                assert_eq!(glyph.scale_x, scale, "joining letters need one shared word transform");
+                let source = natural
+                    .iter()
+                    .find(|source| {
+                        word[..source.start].chars().count() == glyph.source_col
+                            && source.physical((0.0, metrics.ascent), 1.0).cache_key
+                                == glyph.cache_key.base
+                    })
+                    .unwrap();
+                origins.push((glyph.x, source.physical((0.0, metrics.ascent), 1.0).x as f32));
+            }
+            for pair in origins.windows(2) {
+                let transformed = pair[1].0 - pair[0].0;
+                let expected = (pair[1].1 - pair[0].1) * scale;
+                assert!(
+                    (transformed - expected).abs() < 0.001,
+                    "word glyph origins lost their natural joining geometry"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_ignorables_keep_unique_cell_reservations() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        for control in ['\u{200e}', '\u{200f}', '\u{202a}', '\u{202c}', '\u{2066}', '\u{2069}'] {
+            let text = format!("س{control}لام 2026");
+            let row =
+                shape_contextual_row(&mut fonts, &mut buffer, &cells(&text), &config, metrics);
+            assert_permutation(&row);
+            let mut attached = cells("سلام 2026");
+            attached[1].zerowidth.push(control);
+            let row = shape_contextual_row(&mut fonts, &mut buffer, &attached, &config, metrics);
+            assert_permutation(&row);
+        }
+    }
+
+    #[test]
+    fn scaled_outline_rasterization_has_distinct_keys_and_native_resolution() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        let word = shape_contextual_row(&mut fonts, &mut buffer, &cells("الله"), &config, metrics);
+        let base = word.glyphs[0].cache_key.base;
+        let unit = GlyphKey::new(base, 1.0);
+        let doubled = GlyphKey::new(base, 2.0);
+        assert_ne!(unit, doubled);
+        assert_eq!(
+            GlyphKey::new(base, 2.0001),
+            doubled,
+            "subquantum changes should reuse raster images"
+        );
+        let face = fonts.db().face(base.font_id).unwrap();
+        println!("Arabic fallback resolved to {:?}", face.families);
+        let original = SwashCache::new().get_image_uncached(&mut fonts, base).unwrap();
+        let scaled =
+            transformed_swash_image(&mut fonts, &mut swash::scale::ScaleContext::new(), doubled)
+                .unwrap();
+        assert_eq!(scaled.content, SwashContent::Mask);
+        assert!(
+            scaled.placement.width >= original.placement.width.saturating_mul(2).saturating_sub(2)
+        );
+        assert!(scaled.placement.width > original.placement.width);
+        assert!(
+            (i64::from(scaled.placement.height) - i64::from(original.placement.height)).abs() <= 1
+        );
+        assert_eq!(scaled.data.len(), (scaled.placement.width * scaled.placement.height) as usize);
+        assert!(scaled.data.iter().any(|alpha| *alpha > 0));
+    }
+
+    #[test]
+    fn soft_wrapped_arabic_keeps_numeric_and_neutral_continuation_context() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        let first = cells("قال المسؤول في ");
+        let second = cells("2026)،");
+        let third = cells(".");
+        let rows = shape_contextual_paragraph(
+            &mut fonts,
+            &mut buffer,
+            &[&first, &second, &third],
+            &config,
+            metrics,
+            "",
+            "",
+        );
+        for row in &rows {
+            assert_permutation(row);
+        }
+        assert_eq!(rows[1].visual_cols, vec![2, 3, 4, 5, 1, 0]);
+        assert!(rows[1].rtl[4] && rows[1].rtl[5]);
+        assert!(rows[2].rtl[0], "punctuation-only continuation lost paragraph direction");
+        let separate = shape_contextual_row(&mut fonts, &mut buffer, &third, &config, metrics);
+        assert!(!separate.rtl[0], "a hard break should start a new paragraph");
+        let viewport = shape_contextual_paragraph(
+            &mut fonts,
+            &mut buffer,
+            &[&second],
+            &config,
+            metrics,
+            "قال المسؤول في ",
+            ".",
+        );
+        assert_eq!(viewport[0].visual_cols, rows[1].visual_cols);
+        assert_eq!(viewport[0].rtl, rows[1].rtl);
+
+        let lam = cells("ل");
+        let alef = cells("ا");
+        let split = shape_contextual_paragraph(
+            &mut fonts,
+            &mut buffer,
+            &[&lam, &alef],
+            &config,
+            metrics,
+            "",
+            "",
+        );
+        assert!(
+            split.iter().all(|row| !row.glyphs.is_empty()
+                && row.glyphs.iter().all(|glyph| glyph.source_col == 0))
+        );
+    }
+
+    #[test]
+    fn full_bitmap_coverage_preserves_rgba_rows_without_clipping() {
+        assert_eq!(
+            bitmap_coverage(SwashContent::Mask, 3, 2, vec![1, 2, 3, 4, 5, 6]).unwrap(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        let rgba = vec![9, 8, 7, 1, 6, 5, 4, 2, 3, 2, 1, 3, 7, 8, 9, 4, 1, 2, 3, 5, 4, 5, 6, 6];
+        assert_eq!(
+            bitmap_coverage(SwashContent::Color, 3, 2, rgba).unwrap(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            bitmap_coverage(SwashContent::SubpixelMask, 1, 1, vec![30, 60, 90, 0]).unwrap(),
+            vec![60]
+        );
+        assert_eq!(
+            bitmap_coverage(SwashContent::Mask, 3, 2, vec![1; 5]),
+            Err(AtlasError::InvalidBitmap)
+        );
+        assert_eq!(
+            bitmap_coverage(SwashContent::Color, 3, 2, vec![1; 6]),
+            Err(AtlasError::InvalidBitmap)
+        );
+    }
+
+    #[test]
+    fn atlas_layout_respects_device_limits_and_full_bitmap_extents() {
+        let layout = AtlasLayout::new(64, 400, 2048).unwrap();
+        assert!(layout.columns * layout.slot_size <= 2048);
+        assert!(layout.rows * layout.slot_size <= 2048);
+        assert!(layout.capacity() >= 400);
+        let uv = layout.uv(399, 62, 60);
+        assert!(uv.iter().all(|value| (0.0..=1.0).contains(value)));
+        assert!(matches!(AtlasLayout::new(2048, 1, 1024), Err(AtlasError::GlyphTooLarge { .. })));
+        assert!(matches!(AtlasLayout::new(64, 257, 1024), Err(AtlasError::FrameTooLarge { .. })));
+    }
 
     #[test]
     fn slot_size_basic() {
         assert!(compute_slot_size(8.0, 16.0) >= 16);
+    }
+
+    #[test]
+    fn configured_fallback_is_used_before_platform_defaults() {
+        let config = FontConfig {
+            family: "Mechanic deliberately missing primary font".into(),
+            fallback_families: vec!["Georgia".into()],
+            ..FontConfig::default()
+        };
+        let mut fonts = configured_font_system(&config);
+        let mut buffer = Buffer::new(&mut fonts, Metrics::new(16.0, 24.0));
+        let shaped = shape_contextual_row(
+            &mut fonts,
+            &mut buffer,
+            &cells("é"),
+            &config,
+            CellMetrics { cell_width: 10.0, cell_height: 24.0, ascent: 18.0 },
+        );
+        let face = fonts.db().face(shaped.glyphs[0].cache_key.font_id).unwrap();
+        assert!(
+            face.families.iter().any(|(family, _)| family == "Georgia"),
+            "configured fallback not honored: {:?}",
+            face.families
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Metal device; run explicitly on macOS"]
+    fn frame_preflight_growth_keeps_every_uv_valid_and_shapes_bounded() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::METAL,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let config = FontConfig { family: "Menlo".into(), ..FontConfig::default() };
+        let mut renderer = TextRenderer::new(&device, &queue, &config, 1.0);
+        let input: Vec<_> = (0x21..0x180)
+            .chain(0x410..0x460)
+            .filter_map(char::from_u32)
+            .filter(|character| {
+                !character.is_control()
+                    && unicode_script::UnicodeScript::script(character)
+                        != unicode_script::Script::Inherited
+            })
+            .map(|character| RenderCell { character, ..RenderCell::default() })
+            .collect();
+        let shaped = renderer.shape_row(&input, &config);
+        let keys: Vec<_> = shaped.glyphs.iter().map(|glyph| glyph.cache_key).collect();
+        let initial_generation = renderer.atlas_generation();
+        renderer.prepare_glyphs(keys.iter().copied(), &device, &queue).unwrap();
+        assert!(renderer.atlas_generation() > initial_generation);
+        let infos: Vec<_> = keys
+            .iter()
+            .filter_map(|key| renderer.glyph_info(*key).map(|info| (*key, info)))
+            .collect();
+        assert!(infos.len() > 128);
+        let generation = renderer.atlas_generation();
+        for (_, info) in &infos {
+            assert!(info.atlas_uv.iter().all(|value| (0.0..=1.0).contains(value)));
+            assert!(
+                info.glyph_width + (GLYPH_GUTTER * 2) as f32 <= renderer.slot_size as f32
+                    && info.glyph_height + (GLYPH_GUTTER * 2) as f32 <= renderer.slot_size as f32
+            );
+        }
+        renderer.prepare_glyphs(keys.iter().copied(), &device, &queue).unwrap();
+        assert_eq!(renderer.atlas_generation(), generation);
+        for (key, info) in &infos {
+            assert_eq!(renderer.glyph_info(*key).unwrap().atlas_uv, info.atlas_uv);
+        }
+        renderer.prepare_frame(std::slice::from_ref(&shaped), &device, &queue).unwrap();
+        renderer.prepare_frame(std::slice::from_ref(&shaped), &device, &queue).unwrap();
+        assert_eq!(renderer.atlas_generation(), generation);
+        assert!(Arc::ptr_eq(&renderer.prepared_rows[0], &shaped));
+        // A different row identity containing only resident glyphs needs no
+        // atlas rebuild, and replaces the retained current-frame reference.
+        let changed = Arc::new(ShapedRow {
+            glyphs: shaped.glyphs.clone(),
+            visual_cols: shaped.visual_cols.clone(),
+            rtl: shaped.rtl.clone(),
+        });
+        renderer.prepare_frame(std::slice::from_ref(&changed), &device, &queue).unwrap();
+        assert_eq!(renderer.atlas_generation(), generation);
+        assert_eq!(renderer.prepared_rows.len(), 1);
+        assert!(Arc::ptr_eq(&renderer.prepared_rows[0], &changed));
+
+        let new_row = renderer.shape_row(&cells("中"), &config);
+        assert!(new_row.glyphs.iter().any(|glyph| renderer.glyph_info(glyph.cache_key).is_none()));
+        // Simulate the atlas reaching its slot capacity before the new glyph.
+        // Growth must preflight ALL active rows, including unchanged ones.
+        renderer.atlas_capacity_slots = renderer.atlas_next_slot;
+        let frame = [Arc::clone(&shaped), Arc::clone(&new_row)];
+        renderer.prepare_frame(&frame, &device, &queue).unwrap();
+        assert!(renderer.atlas_generation() > generation);
+        assert_eq!(renderer.prepared_rows.len(), 2);
+        assert!(infos.iter().all(|(key, _)| renderer.glyph_info(*key).is_some()));
+        assert!(new_row.glyphs.iter().all(|glyph| renderer.glyph_info(glyph.cache_key).is_some()));
+
+        // A separate atlas rebuild invalidates prior frame-generation proof.
+        // Even identical row Arcs must be checked/prepared again afterward.
+        let other = renderer.shape_row(&cells("語"), &config);
+        renderer.atlas_capacity_slots = renderer.atlas_next_slot;
+        renderer
+            .prepare_glyphs(other.glyphs.iter().map(|glyph| glyph.cache_key), &device, &queue)
+            .unwrap();
+        assert_ne!(renderer.prepared_generation, Some(renderer.atlas_generation()));
+        renderer.prepare_frame(&frame, &device, &queue).unwrap();
+        assert_eq!(renderer.prepared_generation, Some(renderer.atlas_generation()));
+        assert!(infos.iter().all(|(key, _)| renderer.glyph_info(*key).is_some()));
+        assert!(new_row.glyphs.iter().all(|glyph| renderer.glyph_info(glyph.cache_key).is_some()));
+        let mut recolored = input.clone();
+        recolored[0].fg = mechanic_config::theme::palette::BLACK;
+        assert!(
+            Arc::ptr_eq(&renderer.shape_row(&recolored, &config), &shaped),
+            "overlay colors should reuse shaping"
+        );
+        for index in 0..SHAPE_CACHE_ROWS + 32 {
+            renderer.shape_row(&cells(&format!("frame {index}")), &config);
+        }
+        assert!(renderer.shape_cache.len() <= SHAPE_CACHE_ROWS);
+        assert!(renderer.shape_cache_bytes <= SHAPE_CACHE_BYTES);
     }
 
     #[test]

@@ -23,6 +23,19 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Refresh bidi hit testing when input precedes a pending redraw.
+    pub fn prepare_layout(&mut self, grid: &RenderGrid) {
+        self.state.prepare_layout(grid, &mut self.text, &self.font_config);
+    }
+    /// Map terminal columns to the displayed bidi layout.
+    pub fn visual_column(&self, col: usize, row: usize) -> usize {
+        self.state.visual_column(col, row)
+    }
+
+    /// Return the logical column and direction under a displayed cell.
+    pub fn logical_column(&self, col: usize, row: usize) -> (usize, bool) {
+        self.state.logical_column(col, row)
+    }
     /// Construct the renderer for the given window.
     pub async fn new<W>(
         window: W,
@@ -67,8 +80,8 @@ impl Renderer {
     }
 
     /// Render one frame from the given terminal grid.
-    pub fn render(&mut self, grid: &RenderGrid, uniforms: FrameUniforms) {
-        self.state.render(grid, &mut self.text, &self.font_config, uniforms);
+    pub fn render(&mut self, grid: &RenderGrid, uniforms: FrameUniforms) -> bool {
+        self.state.render(grid, &mut self.text, &self.font_config, uniforms)
     }
 
     /// Draw cached instances with new uniforms; false if no full frame is cached.

@@ -1263,8 +1263,13 @@ dependencies = [
  "log",
  "mechanic-config",
  "naga",
+ "pollster",
  "raw-window-handle",
  "resvg",
+ "swash",
+ "unicode-bidi",
+ "unicode-script",
+ "unicode-width",
  "wgpu",
 ]
 
