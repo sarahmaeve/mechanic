@@ -9,6 +9,10 @@ PTY notifications now coalesce until the next parser turn. Failed cached
 presentations return failure, allowing the existing paced redraw retry.
 Lost native surfaces are recreated with the existing device and render resources;
 failed recreation attempts back off for 250 ms.
+OSC 8 links now have underlined labels, native hover previews and context menus,
+Cmd-click browser opening, and exact-address copying. Activation checks the
+release target and cancels on dragging. HTTP/HTTPS are the supported open schemes;
+other destinations are copyable. Plain URLs are not detected automatically.
 
 Text rendering now preserves combining marks, wide-cell backgrounds and concealed
 text. Arabic uses contextual shaping and paragraph bidi across soft-wrapped rows,
@@ -36,7 +40,6 @@ Remaining issues:
 | Priority | Finding | Location |
 | --- | --- | --- |
 | P2 | GPU device loss is detected but requires device/resource recreation. | `renderer/pipeline.rs` |
-| P2 | OSC 8 targets are stored, but link activation, hover previews and context menus are absent. | `app/app.rs` |
 
 Text limits: terminal wrapping is by cells, not words. Ligatures stay within
 physical rows. Offscreen bidi context is bounded to 64 KiB per side;

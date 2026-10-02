@@ -2,7 +2,10 @@
 
 mod app;
 mod convert;
+mod hyperlinks;
 mod input;
+mod link_input;
+mod link_platform;
 mod mouse;
 mod preedit;
 mod scheduling;
@@ -114,6 +117,7 @@ fn print_help() {
     println!("    --no-mouse-tracking    Keep selection and middle-click paste local");
     println!("    -h, --help             Show this help and exit");
     println!("    -V, --version          Show version and exit");
+    println!("\n    Cmd+Shift+A toggles all animations on/off for this session.");
 }
 
 /// Resolve the user's `mechanic.toml` config path using XDG then HOME.

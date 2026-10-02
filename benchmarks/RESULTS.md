@@ -5,6 +5,27 @@ transfer that previously deadlocked. Output batching also improves most tested
 GUI workloads. These are initial observations from one machine, not stable
 cross-terminal rankings.
 
+## Hyperlink lookup — 2026-10-02
+
+Release-build median lookup times in nanoseconds:
+
+| Grid | Linked cell | Unlinked cell |
+| --- | ---: | ---: |
+| 80×24 | 3.17 | 1.98 |
+| 160×100 | 3.16 | 1.98 |
+
+Seven samples of one million lookups after 100 ms warmup per case; case order
+alternates. The 619-byte URI is verified before timing. This measures direct
+grid lookup and shared metadata cloning, not complete hover handling. Bidi
+coordinate mapping, validation, native tooltip work and rendering are excluded.
+No whole-app CPU improvement is claimed.
+[Raw CSV](baselines/2026-10-02/hyperlink-lookup/stabilized.csv).
+
+Validation: 403 workspace tests, strict Clippy and release app build passed.
+The explicit native AppKit check passed tooltip copying/clearing and Open/Copy
+action delivery. Browser launch was stubbed; interactive popup placement was
+coordinate-tested, not manually clicked. No browser or clipboard effects occurred.
+
 ## Surface recovery — 2026-10-02
 
 All 12 native surface replacements resumed cached presentation and retained the

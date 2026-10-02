@@ -141,7 +141,7 @@ fn convert_content(
         if cell.flags.contains(Flags::ITALIC) {
             flags |= CellFlags::ITALIC;
         }
-        if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+        if cell.flags.intersects(Flags::ALL_UNDERLINES) || cell.hyperlink().is_some() {
             flags |= CellFlags::UNDERLINE;
         }
         for (source, target) in [
@@ -376,6 +376,19 @@ mod tests {
     use alacritty_terminal::term::Term;
     use alacritty_terminal::term::test::TermSize;
     use alacritty_terminal::vte::ansi::Processor;
+
+    #[test]
+    fn osc8_labels_are_underlined_without_changing_sgr_styles_or_following_text() {
+        let term = parsed_term(
+            10,
+            2,
+            "\x1b]8;;https://example.com\x1b\\A\x1b[4:3mB\x1b]8;;\x1b\\\x1b[0mC",
+        );
+        let grid = snapshot(&term, &Theme::default(), false);
+        assert!(grid.cells[0].flags.contains(CellFlags::UNDERLINE));
+        assert!(grid.cells[1].flags.contains(CellFlags::UNDERCURL));
+        assert!(!grid.cells[2].flags.contains(CellFlags::UNDERLINE));
+    }
 
     #[test]
     fn osc_palette_changes_and_resets_reach_cells_and_cursor() {

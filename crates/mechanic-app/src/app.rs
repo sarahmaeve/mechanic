@@ -16,8 +16,8 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 /// Target interval between animation frames (~30 FPS).
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -39,6 +39,11 @@ struct AppState {
     cell_metrics: CellMetrics,
     /// Current physical mouse cursor position in pixels.
     mouse_position: (f64, f64),
+    pointer_inside: bool,
+    hovered_link: Option<crate::hyperlinks::LinkTarget>,
+    link_press: crate::link_input::LinkPress,
+    link_menu_release: bool,
+    pointer_cursor: Option<CursorIcon>,
     mouse_pressed: bool,
     held_buttons: mouse_enc::HeldButtons,
     scroll_accumulator: mouse_enc::ScrollAccumulator,
@@ -62,6 +67,7 @@ struct AppState {
     last_mouse_report: Option<(u32, u32, mouse_enc::MouseButton)>,
     /// Rebuild cell instances when true; otherwise reuse the cached frame.
     content_dirty: bool,
+    layout_dirty: bool,
     /// Forced frames after focus changes, to accommodate AppKit redraw coalescing.
     focus_redraw_frames: u8,
     /// Pending focus-gain time; cleared on focus loss or bloom commitment.
@@ -72,6 +78,51 @@ struct AppState {
 }
 
 impl AppState {
+    fn mark_content_dirty(&mut self) {
+        self.content_dirty = true;
+        self.layout_dirty = true;
+    }
+
+    fn link_under_pointer(&self) -> Option<alacritty_terminal::term::cell::Hyperlink> {
+        if !self.pointer_inside || !self.focused || self.preedit.is_some() {
+            return None;
+        }
+        let (col, row) = link_cell(
+            self.mouse_position,
+            &self.cell_metrics,
+            self.terminal.columns(),
+            self.terminal.screen_lines(),
+        )?;
+        let (logical_col, _) = self.renderer.logical_column(col, row);
+        crate::hyperlinks::at(&self.terminal, logical_col, row)
+    }
+
+    fn refresh_link_hover(&mut self) {
+        let target = self.link_under_pointer();
+        let unchanged = match (&self.hovered_link, &target) {
+            (Some(current), Some(target)) => current.matches(target),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            let next = target.map(crate::hyperlinks::LinkTarget::new);
+            let preview = next.as_ref().map(|link| link.preview());
+            if self.hovered_link.as_ref().map(|link| link.preview()) != preview
+                && let Err(error) = crate::link_platform::set_hover(&self.window, preview)
+            {
+                log::warn!("link preview failed: {error}");
+            }
+            self.hovered_link = next;
+        }
+        let clickable = self.modifiers.super_key()
+            && self.hovered_link.as_ref().is_some_and(|link| link.can_open());
+        let icon = if clickable { CursorIcon::Pointer } else { CursorIcon::Text };
+        if self.pointer_cursor != Some(icon) {
+            self.window.set_cursor(icon);
+            self.pointer_cursor = Some(icon);
+        }
+    }
+
     fn request_redraw(&mut self) {
         if self.frame_pacer.request_redraw() {
             self.window.request_redraw();
@@ -117,6 +168,16 @@ impl App {
         make_waker_for(&self.proxy, window_id)
     }
 
+    fn toggle_animations(&mut self) {
+        self.animations = toggled_animations(self.animations, self.config.theme.logo_size > 0);
+        for state in self.windows.values_mut() {
+            state.focus_gain_at = None;
+            state.bloom_start = None;
+            state.focus_redraw_frames = 0;
+            state.request_redraw();
+        }
+    }
+
     /// Remove a window and exit the event loop if no windows remain.
     fn close_window(&mut self, id: WindowId, event_loop: &ActiveEventLoop) {
         self.windows.remove(&id);
@@ -149,7 +210,9 @@ impl App {
         if outcome.child_exit.is_some() || outcome.io_error.is_some() {
             state.preedit = None;
         }
-        state.content_dirty |= outcome.grid_maybe_changed;
+        if outcome.grid_maybe_changed {
+            state.mark_content_dirty();
+        }
 
         // Fatal transport failures freeze the window even if a child exit was
         // delivered with the same final output batch.
@@ -159,7 +222,7 @@ impl App {
                 b"\r\n\x1b[31m[terminal I/O failed; Cmd+R to restart, any key to close]\x1b[0m\r\n",
             );
             state.exit_status = Some(None);
-            state.content_dirty = true;
+            state.mark_content_dirty();
             state.request_redraw();
         }
 
@@ -182,7 +245,7 @@ impl App {
             }
             inject_exit_banner(&mut state.terminal, status);
             state.exit_status = Some(status);
-            state.content_dirty = true;
+            state.mark_content_dirty();
             state.request_redraw();
         }
 
@@ -195,6 +258,7 @@ impl App {
 
     /// Update font metrics and resize the terminal to match.
     fn apply_font_size(state: &mut AppState, new_size: f32) {
+        state.link_press.cancel();
         let new_metrics = state.renderer.set_font_size(new_size);
         state.cell_metrics = new_metrics;
         state.scroll_accumulator.reset();
@@ -205,7 +269,7 @@ impl App {
         let term_size = Self::terminal_size_from_metrics(inner.width, inner.height, &new_metrics);
         state.terminal.resize(term_size);
 
-        state.content_dirty = true;
+        state.mark_content_dirty();
         state.request_redraw();
     }
 
@@ -287,6 +351,11 @@ impl App {
             renderer,
             cell_metrics,
             mouse_position: (0.0, 0.0),
+            pointer_inside: false,
+            hovered_link: None,
+            link_press: crate::link_input::LinkPress::default(),
+            link_menu_release: false,
+            pointer_cursor: None,
             mouse_pressed: false,
             held_buttons: mouse_enc::HeldButtons::default(),
             scroll_accumulator: mouse_enc::ScrollAccumulator::default(),
@@ -301,6 +370,7 @@ impl App {
             exit_status: None,
             last_mouse_report: None,
             content_dirty: true,
+            layout_dirty: true,
             focus_redraw_frames: FOCUS_REDRAW_BURST_FRAMES,
             focus_gain_at: self.animations.logo.then_some(now),
             bloom_start: None,
@@ -372,6 +442,14 @@ impl ApplicationHandler<UserEvent> for App {
             && key_event.state == ElementState::Pressed
         {
             let modifiers_snapshot = self.windows.get(&id).map(|s| s.modifiers);
+            if modifiers_snapshot.is_some_and(|modifiers| {
+                animation_toggle_shortcut(key_event.physical_key, modifiers)
+            }) {
+                if !key_event.repeat {
+                    self.toggle_animations();
+                }
+                return;
+            }
             if let (Some(modifiers), Key::Character(c)) =
                 (modifiers_snapshot, &key_event.logical_key)
                 && modifiers.super_key()
@@ -397,16 +475,20 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
 
-        if state.content_dirty
-            && (matches!(&event, WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. })
-                || (state.mouse_pressed
-                    || state.held_buttons.motion_button() != mouse_enc::MouseButton::None
-                    || state.terminal.mouse_protocol().report_motion)
-                    && matches!(&event, WindowEvent::CursorMoved { .. }))
+        if state.layout_dirty
+            && matches!(
+                &event,
+                WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::ModifiersChanged(_)
+                    | WindowEvent::CursorEntered { .. }
+            )
         {
             let grid =
                 crate::convert::convert_grid(&state.terminal, &self.config.theme, state.focused);
             state.renderer.prepare_layout(&grid);
+            state.layout_dirty = false;
         }
 
         match event {
@@ -416,6 +498,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::Resized(size) => {
+                state.link_press.cancel();
                 state.scroll_accumulator.reset();
                 state.last_mouse_report = None;
                 state.renderer.resize((size.width, size.height));
@@ -424,7 +507,7 @@ impl ApplicationHandler<UserEvent> for App {
                     Self::terminal_size_from_metrics(size.width, size.height, &state.cell_metrics);
                 state.terminal.resize(new_term_size);
 
-                state.content_dirty = true;
+                state.mark_content_dirty();
                 state.request_redraw();
             }
 
@@ -434,18 +517,20 @@ impl ApplicationHandler<UserEvent> for App {
                     state.last_mouse_report = None;
                 }
                 state.modifiers = mods.state();
+                state.refresh_link_hover();
             }
 
             WindowEvent::Focused(focused) => {
                 log::debug!("window {id:?} focused: {focused}");
                 state.focused = focused;
-                state.content_dirty = true;
+                state.mark_content_dirty();
                 state.focus_redraw_frames = FOCUS_REDRAW_BURST_FRAMES;
 
                 if focused {
                     state.focus_gain_at = self.animations.logo.then(Instant::now);
                     state.bloom_start = None;
                 } else {
+                    state.link_press.cancel();
                     state.preedit = None;
                     state.held_buttons.clear();
                     state.mouse_pressed = false;
@@ -456,10 +541,15 @@ impl ApplicationHandler<UserEvent> for App {
                     state.focus_gain_at = None;
                 }
 
+                state.refresh_link_hover();
+
                 state.request_redraw();
             }
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if key_event.state == ElementState::Pressed {
+                    state.link_press.cancel();
+                }
                 if state.exit_status.is_some() && key_event.state == ElementState::Pressed {
                     let key = &key_event.logical_key;
                     let mods = state.modifiers;
@@ -509,19 +599,19 @@ impl ApplicationHandler<UserEvent> for App {
                             {
                                 log::warn!("PTY paste failed: {e}");
                             }
-                            state.content_dirty = true;
+                            state.mark_content_dirty();
                             state.request_redraw();
                             return;
                         }
                         CmdShortcut::ClearScrollback => {
                             state.terminal.clear_history();
-                            state.content_dirty = true;
+                            state.mark_content_dirty();
                             state.request_redraw();
                             return;
                         }
                         CmdShortcut::SelectAll => {
                             state.terminal.select_all();
-                            state.content_dirty = true;
+                            state.mark_content_dirty();
                             state.request_redraw();
                             return;
                         }
@@ -543,7 +633,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Err(e) = state.terminal.write_to_pty(b"\x1f") {
                                 log::warn!("PTY undo write failed: {e}");
                             }
-                            state.content_dirty = true;
+                            state.mark_content_dirty();
                             state.request_redraw();
                             return;
                         }
@@ -563,7 +653,7 @@ impl ApplicationHandler<UserEvent> for App {
                         log::warn!("PTY write failed: {e}");
                     }
                 }
-                state.content_dirty = true;
+                state.mark_content_dirty();
                 state.request_redraw();
             }
 
@@ -601,21 +691,89 @@ impl ApplicationHandler<UserEvent> for App {
                     Ime::Disabled => state.preedit = None,
                     Ime::Enabled => {}
                 }
-                state.content_dirty = true;
+                state.mark_content_dirty();
                 state.request_redraw();
             }
 
             WindowEvent::MouseInput { state: btn_state, button: win_button, .. } => {
-                if let Some(button) = winit_to_mouse_button(win_button) {
-                    state.held_buttons.update(button, btn_state == ElementState::Pressed);
-                    state.last_mouse_report = None;
-                }
                 let route = route_mouse(
                     state.terminal.mouse_protocol(),
                     self.mouse_tracking,
                     state.modifiers.shift_key(),
                     state.exit_status.is_some(),
                 );
+
+                state.refresh_link_hover();
+                if win_button == MouseButton::Left && btn_state == ElementState::Pressed {
+                    state.link_press = crate::link_input::LinkPress::default();
+                } else if btn_state == ElementState::Pressed {
+                    state.link_press.cancel();
+                }
+                if win_button == MouseButton::Left
+                    && btn_state == ElementState::Released
+                    && state.link_press.active()
+                {
+                    state.link_press.moved(state.mouse_position);
+                    let current = state.link_under_pointer();
+                    if let Some(target) = state.link_press.release(current.as_ref()) {
+                        open_link(&crate::hyperlinks::LinkTarget::new(target));
+                    }
+                    return;
+                }
+                if win_button == MouseButton::Right {
+                    if btn_state == ElementState::Released && state.link_menu_release {
+                        state.link_menu_release = false;
+                        return;
+                    }
+                    if btn_state == ElementState::Pressed {
+                        state.link_menu_release = false;
+                    }
+                }
+                if btn_state == ElementState::Pressed
+                    && let Some(link) = state.link_under_pointer()
+                {
+                    let target = crate::hyperlinks::LinkTarget::new(link.clone());
+                    if win_button == MouseButton::Left
+                        && crate::link_input::opens_link(
+                            state.modifiers.super_key(),
+                            target.can_open(),
+                        )
+                    {
+                        state.link_press.begin(link, state.mouse_position);
+                        state.mouse_pressed = false;
+                        state.mouse_press_origin = None;
+                        return;
+                    }
+                    if win_button == MouseButton::Right
+                        && crate::link_input::shows_menu(
+                            state.modifiers.super_key(),
+                            route.is_some(),
+                        )
+                    {
+                        state.link_menu_release = true;
+                        // Keep the clicked target while AppKit runs its menu loop.
+                        match crate::link_platform::context_menu(
+                            &state.window,
+                            state.mouse_position,
+                            target.can_open(),
+                        ) {
+                            Some(crate::link_platform::LinkAction::Open) => open_link(&target),
+                            Some(crate::link_platform::LinkAction::Copy) => {
+                                if let Some(clipboard) = &mut state.clipboard
+                                    && let Err(error) = clipboard.set_text(target.uri().to_owned())
+                                {
+                                    log::warn!("copy link failed: {error}");
+                                }
+                            }
+                            None => {}
+                        }
+                        return;
+                    }
+                }
+                if let Some(button) = winit_to_mouse_button(win_button) {
+                    state.held_buttons.update(button, btn_state == ElementState::Pressed);
+                    state.last_mouse_report = None;
+                }
 
                 if let Some(sgr) = route {
                     if let Some(btn) = winit_to_mouse_button(win_button) {
@@ -643,7 +801,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if matches!(btn_state, ElementState::Released) {
                         state.last_mouse_report = None;
                     }
-                    state.content_dirty = true;
+                    state.mark_content_dirty();
                     state.request_redraw();
                     return;
                 }
@@ -715,7 +873,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                             }
                         }
-                        state.content_dirty = true;
+                        state.mark_content_dirty();
                         state.request_redraw();
                     }
 
@@ -724,7 +882,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Err(e) = state.terminal.paste(text) {
                                 log::warn!("PTY middle-click paste failed: {e}");
                             }
-                            state.content_dirty = true;
+                            state.mark_content_dirty();
                             state.request_redraw();
                         }
                     }
@@ -735,6 +893,12 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_position = (position.x, position.y);
+                state.pointer_inside = true;
+                state.link_press.moved(state.mouse_position);
+                state.refresh_link_hover();
+                if state.link_press.active() {
+                    return;
+                }
 
                 let route = route_mouse(
                     state.terminal.mouse_protocol(),
@@ -796,12 +960,13 @@ impl ApplicationHandler<UserEvent> for App {
                     let (point, side) =
                         logical_selection_point(&state.renderer, point, side, display_offset);
                     state.terminal.update_selection(point, side);
-                    state.content_dirty = true;
+                    state.mark_content_dirty();
                     state.request_redraw();
                 }
             }
 
             WindowEvent::MouseWheel { delta, phase, .. } => {
+                state.link_press.cancel();
                 let route = route_mouse(
                     state.terminal.mouse_protocol(),
                     self.mouse_tracking,
@@ -851,7 +1016,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
-                    state.content_dirty = true;
+                    state.mark_content_dirty();
                     state.request_redraw();
                     return;
                 }
@@ -861,7 +1026,7 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if lines < 0 {
                     state.terminal.scroll_down(lines.unsigned_abs() as usize);
                 }
-                state.content_dirty = true;
+                state.mark_content_dirty();
                 state.request_redraw();
             }
 
@@ -882,6 +1047,17 @@ impl ApplicationHandler<UserEvent> for App {
                     // An outstanding request may have been suppressed while hidden.
                     state.request_redraw();
                 }
+            }
+
+            WindowEvent::CursorEntered { .. } => {
+                state.pointer_inside = true;
+                state.refresh_link_hover();
+            }
+
+            WindowEvent::CursorLeft { .. } => {
+                state.pointer_inside = false;
+                state.link_press.cancel();
+                state.refresh_link_hover();
             }
 
             _ => {}
@@ -1066,6 +1242,19 @@ fn cmd_shortcut(c: &str) -> Option<CmdShortcut> {
     }
 }
 
+fn animation_toggle_shortcut(key: PhysicalKey, modifiers: ModifiersState) -> bool {
+    key == PhysicalKey::Code(KeyCode::KeyA)
+        && modifiers == (ModifiersState::SUPER | ModifiersState::SHIFT)
+}
+
+fn toggled_animations(
+    current: mechanic_config::theme::AnimationConfig,
+    logo_visible: bool,
+) -> mechanic_config::theme::AnimationConfig {
+    let enabled = !current.enabled();
+    mechanic_config::theme::AnimationConfig { background: enabled, logo: enabled && logo_visible }
+}
+
 /// Render one frame for `state` using the current focus / grid state.
 fn render_frame(
     state: &mut AppState,
@@ -1128,6 +1317,8 @@ fn render_frame(
             );
         }
         state.content_dirty = !state.renderer.render(&grid, uniforms);
+        state.layout_dirty = false;
+        state.refresh_link_hover();
     }
 
     if let Some(t) = state.bloom_start
@@ -1143,6 +1334,37 @@ fn render_frame(
         None => base.to_string(),
     };
     state.window.set_title(&title_string);
+}
+
+fn open_link(target: &crate::hyperlinks::LinkTarget) {
+    if let Some(url) = target.web_url()
+        && let Err(error) = crate::link_platform::open_web_url(url)
+    {
+        log::warn!("open link failed: {error}");
+    }
+}
+
+/// Link hits exclude window padding instead of clamping to the nearest cell.
+fn link_cell(
+    (x, y): (f64, f64),
+    metrics: &CellMetrics,
+    cols: usize,
+    rows: usize,
+) -> Option<(usize, usize)> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || !metrics.cell_width.is_finite()
+        || !metrics.cell_height.is_finite()
+        || metrics.cell_width <= 0.0
+        || metrics.cell_height <= 0.0
+    {
+        return None;
+    }
+    let col = (x / f64::from(metrics.cell_width)).floor() as usize;
+    let row = (y / f64::from(metrics.cell_height)).floor() as usize;
+    (col < cols && row < rows).then_some((col, row))
 }
 
 /// Decide whether the focus-gain bloom should commit this frame.
@@ -1237,6 +1459,7 @@ fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId, waker: Pty
     match Terminal::new(config, size, waker) {
         Ok(new_term) => {
             state.terminal = new_term;
+            state.link_press.cancel();
             state.preedit = None;
             state.held_buttons.clear();
             state.scroll_accumulator.reset();
@@ -1244,7 +1467,7 @@ fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId, waker: Pty
             state.mouse_pressed = false;
             state.mouse_press_origin = None;
             state.exit_status = None;
-            state.content_dirty = true;
+            state.mark_content_dirty();
             let occluded = state.frame_pacer.is_occluded();
             state.frame_pacer = FramePacer::new(Instant::now());
             state.frame_pacer.set_occluded(occluded);
@@ -1334,6 +1557,55 @@ fn format_exit_status(status: Option<std::process::ExitStatus>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animation_toggle_does_not_take_select_all_or_extra_modifiers() {
+        let key = PhysicalKey::Code(KeyCode::KeyA);
+        let chord = ModifiersState::SUPER | ModifiersState::SHIFT;
+        assert!(animation_toggle_shortcut(key, chord));
+        assert!(!animation_toggle_shortcut(key, ModifiersState::SUPER));
+        assert!(!animation_toggle_shortcut(key, chord | ModifiersState::ALT));
+        assert!(!animation_toggle_shortcut(key, chord | ModifiersState::CONTROL));
+        assert!(!animation_toggle_shortcut(PhysicalKey::Code(KeyCode::KeyB), chord));
+        assert_eq!(cmd_shortcut("a"), Some(CmdShortcut::SelectAll));
+    }
+
+    #[test]
+    fn animation_switch_unifies_partial_states_and_returns_to_idle() {
+        use mechanic_config::theme::AnimationConfig;
+        let on = toggled_animations(AnimationConfig::default(), true);
+        assert!(on.logo && on.background);
+        for current in [
+            on,
+            AnimationConfig { logo: true, background: false },
+            AnimationConfig { logo: false, background: true },
+        ] {
+            let off = toggled_animations(current, true);
+            assert!(!off.logo && !off.background);
+            let now = Instant::now();
+            assert_eq!(
+                classify_animation(inputs(true, true), off.enabled(), now),
+                AnimationState::Idle
+            );
+            let mut pacer = FramePacer::new(now);
+            pacer.request_redraw();
+            pacer.rendered(now);
+            assert_eq!(pacer.schedule(now, false, None), FrameSchedule::Idle);
+        }
+        let hidden_logo = toggled_animations(AnimationConfig::default(), false);
+        assert!(!hidden_logo.logo && hidden_logo.background);
+        assert!(!toggled_animations(hidden_logo, false).enabled());
+    }
+
+    #[test]
+    fn hyperlink_hits_exclude_padding_and_invalid_coordinates() {
+        let metrics = CellMetrics { cell_width: 10.0, cell_height: 20.0, ascent: 15.0 };
+        assert_eq!(link_cell((19.9, 39.9), &metrics, 2, 2), Some((1, 1)));
+        for point in [(20.0, 1.0), (1.0, 40.0), (-0.1, 0.0), (f64::NAN, 0.0)] {
+            assert!(link_cell(point, &metrics, 2, 2).is_none());
+        }
+        assert!(link_cell((0.0, 0.0), &metrics, 0, 0).is_none());
+    }
 
     #[cfg(unix)]
     fn status_from_code(code: i32) -> std::process::ExitStatus {

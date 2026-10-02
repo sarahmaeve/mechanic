@@ -254,3 +254,28 @@ each sample's mean milliseconds per shape and glyph count. It excludes the
 paragraph cache, atlas rasterization, uploads and presentation. The ASCII case
 does not use the application's faster ASCII path. Compare identical harnesses
 before and after shaping changes; glyph counts may differ when shaping is fixed.
+
+## Hyperlinks
+
+```sh
+MECHANIC_HYPERLINK_CSV=/tmp/hyperlink-lookup.csv \
+  cargo test --release -p mechanic-app hyperlink_lookup_benchmark -- --ignored --nocapture
+```
+
+The lookup benchmark compares linked and unlinked 80×24 and 160×100 grids.
+Each case warms for 100 ms, then runs seven samples of one million lookups,
+reversing case order on alternate samples. A 619-byte URI is verified before
+timing. It measures grid lookup and shared metadata cloning; bidi hit mapping,
+URL validation, tooltip updates, and rendering are outside timing.
+
+The native AppKit smoke check runs explicitly on the main thread:
+
+```sh
+cargo rustc -p mechanic-app --example link_native_smoke --locked -- --cfg test
+./target/debug/examples/link_native_smoke
+```
+
+It uses a hidden temporary window to verify tooltip copying/clearing and native
+Open/Copy menu action delivery, including disabled Open. An eight-second watchdog
+bounds startup failures. It does not display an interactive menu, launch a browser,
+or modify the clipboard. Ordinary workspace tests do not open this window.

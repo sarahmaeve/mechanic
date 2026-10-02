@@ -43,6 +43,8 @@ Restart Mechanic after changing configuration.
 Cmd+N/W opens/closes windows, Cmd+C/V copies/pastes, Cmd+K clears history,
 Cmd+A selects the buffer, and Cmd++/−/0 changes/resets font size. After a
 failed shell exit, Cmd+R restarts the shell.
+Cmd+Shift+A toggles logo and background animations together across all windows.
+If either is on, both turn off. This session-only switch does not change configuration.
 
 `mechanic-core` owns terminal state and PTY I/O; `mechanic-app` routes events
 and converts the grid; `mechanic-renderer` shapes glyphs and draws cells;
@@ -57,8 +59,16 @@ underlined with a selection and caret, clipped to the current visible row.
 Mouse reporting distinguishes hover and held buttons; trackpad scrolling retains
 fractional movement within each gesture.
 
-OSC 8 hyperlink targets are retained in terminal cells. Opening links, hover
-address previews, and link context menus are not implemented.
+OSC 8 hyperlink labels are underlined. Hover to preview the address, Cmd-click
+to open HTTP/HTTPS links in the default browser, or right-click for Open Link
+and Copy Link Address. When a TUI captures the mouse, use Shift-right-click or
+Cmd-right-click for the terminal's menu. Ordinary clicks still select text.
+Other URI schemes remain copyable; Open Link is disabled. Plain URL text is
+not automatically detected.
+
+```sh
+printf '\033]8;;https://example.com\033\\Example link\033]8;;\033\\\n'
+```
 
 PTY writes are queued without waiting for the child. Pending input is limited
 to 8 MiB (including paste markers) and 1,024 queued messages; a full queue
