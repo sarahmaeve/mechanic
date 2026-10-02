@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher, RandomState};
 use std::sync::{Arc, Mutex};
 
 use cosmic_text::{
@@ -40,6 +41,32 @@ impl Fallback for ConfiguredFallback {
 }
 
 fn configured_font_system(config: &FontConfig) -> FontSystem {
+    let system = FontSystem::new();
+    let mut fallback = configured_fallback(config, &system);
+    let available: HashSet<_> = system
+        .db()
+        .faces()
+        .flat_map(|face| face.families.iter().map(|(name, _)| name.as_str()))
+        .collect();
+    fallback.retain_available(&available);
+    FontSystem::new_with_locale_and_db_and_fallback(
+        system.locale().to_owned(),
+        system.db().clone(),
+        fallback,
+    )
+}
+
+impl ConfiguredFallback {
+    fn retain_available(&mut self, available: &HashSet<&str>) {
+        // Match Cosmic's exact family-name comparison and preserve preference order.
+        for names in std::iter::once(&mut self.common).chain(self.scripts.values_mut()) {
+            let mut seen = HashSet::new();
+            names.retain(|name| available.contains(name) && seen.insert(*name));
+        }
+    }
+}
+
+fn configured_fallback(config: &FontConfig, system: &FontSystem) -> ConfiguredFallback {
     let mut common = Vec::new();
     let mut interned = INTERNED_FAMILIES.lock().unwrap_or_else(|error| error.into_inner());
     for family in config.fallback_families.iter().take(32) {
@@ -64,7 +91,6 @@ fn configured_font_system(config: &FontConfig) -> FontSystem {
         common.push(name);
     }
     drop(interned);
-    let system = FontSystem::new();
     let mut scripts = HashMap::new();
     for script in [
         unicode_script::Script::Latin,
@@ -81,11 +107,7 @@ fn configured_font_system(config: &FontConfig) -> FontSystem {
         scripts.insert(script, names);
     }
     common.extend_from_slice(PlatformFallback.common_fallback());
-    FontSystem::new_with_locale_and_db_and_fallback(
-        system.locale().to_owned(),
-        system.db().clone(),
-        ConfiguredFallback { common, scripts },
-    )
+    ConfiguredFallback { common, scripts }
 }
 
 /// Compute the atlas slot size from the cell dimensions.
@@ -199,21 +221,79 @@ struct ParagraphKey {
     suffix: String,
 }
 
+const SHAPING_FLAGS: CellFlags = CellFlags::BOLD
+    .union(CellFlags::ITALIC)
+    .union(CellFlags::WIDE_CHAR)
+    .union(CellFlags::WIDE_CHAR_SPACER)
+    .union(CellFlags::LEADING_WIDE_CHAR_SPACER)
+    .union(CellFlags::HIDDEN);
+
+// Borrowed keys must hash exactly like their owned counterparts.
+struct RowRef<'a>(&'a [RenderCell]);
+
+impl RowRef<'_> {
+    fn matches(&self, key: &RowKey) -> bool {
+        self.0.len() == key.0.len()
+            && self.0.iter().zip(&key.0).all(|(cell, key)| {
+                cell.character == key.character
+                    && cell.zerowidth == key.marks
+                    && (cell.flags & SHAPING_FLAGS).bits() == key.flags
+            })
+    }
+}
+
+impl Hash for RowRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for cell in self.0 {
+            cell.character.hash(state);
+            cell.zerowidth.hash(state);
+            (cell.flags & SHAPING_FLAGS).bits().hash(state);
+        }
+    }
+}
+
+impl hashbrown::Equivalent<Arc<RowKey>> for RowRef<'_> {
+    fn equivalent(&self, key: &Arc<RowKey>) -> bool {
+        self.matches(key)
+    }
+}
+
+struct ParagraphRef<'a> {
+    rows: &'a [&'a [RenderCell]],
+    prefix: &'a str,
+    suffix: &'a str,
+}
+
+impl Hash for ParagraphRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.rows.len().hash(state);
+        for row in self.rows {
+            RowRef(row).hash(state);
+        }
+        self.prefix.hash(state);
+        self.suffix.hash(state);
+    }
+}
+
+impl hashbrown::Equivalent<Arc<ParagraphKey>> for ParagraphRef<'_> {
+    fn equivalent(&self, key: &Arc<ParagraphKey>) -> bool {
+        self.prefix == key.prefix
+            && self.suffix == key.suffix
+            && self.rows.len() == key.rows.len()
+            && self.rows.iter().zip(&key.rows).all(|(cells, key)| RowRef(cells).matches(key))
+    }
+}
+
 impl RowKey {
     fn new(cells: &[RenderCell]) -> Self {
-        let relevant = CellFlags::BOLD
-            | CellFlags::ITALIC
-            | CellFlags::WIDE_CHAR
-            | CellFlags::WIDE_CHAR_SPACER
-            | CellFlags::LEADING_WIDE_CHAR_SPACER
-            | CellFlags::HIDDEN;
         Self(
             cells
                 .iter()
                 .map(|cell| RowCellKey {
                     character: cell.character,
                     marks: cell.zerowidth.clone(),
-                    flags: (cell.flags & relevant).bits(),
+                    flags: (cell.flags & SHAPING_FLAGS).bits(),
                 })
                 .collect(),
         )
@@ -305,11 +385,11 @@ pub struct TextRenderer {
     atlas_map: HashMap<GlyphKey, GlyphInfo>,
     empty_glyphs: HashSet<GlyphKey>,
     ascii_shapes: HashMap<CharStyleKey, Vec<LayoutGlyph>>,
-    shape_cache: HashMap<RowKey, Arc<ShapedRow>>,
-    shape_order: VecDeque<(RowKey, usize)>,
+    shape_cache: hashbrown::HashMap<Arc<RowKey>, Arc<ShapedRow>, RandomState>,
+    shape_order: VecDeque<(Arc<RowKey>, usize)>,
     shape_cache_bytes: usize,
-    paragraph_cache: HashMap<ParagraphKey, Vec<Arc<ShapedRow>>>,
-    paragraph_order: VecDeque<(ParagraphKey, usize)>,
+    paragraph_cache: hashbrown::HashMap<Arc<ParagraphKey>, Vec<Arc<ShapedRow>>, RandomState>,
+    paragraph_order: VecDeque<(Arc<ParagraphKey>, usize)>,
     paragraph_cache_bytes: usize,
     /// Strong references keep identity comparisons valid; retain only the
     /// currently prepared frame, independent of the bounded shaping caches.
@@ -421,10 +501,10 @@ impl TextRenderer {
             atlas_map: HashMap::new(),
             empty_glyphs: HashSet::new(),
             ascii_shapes: HashMap::new(),
-            shape_cache: HashMap::new(),
+            shape_cache: hashbrown::HashMap::default(),
             shape_order: VecDeque::new(),
             shape_cache_bytes: 0,
-            paragraph_cache: HashMap::new(),
+            paragraph_cache: hashbrown::HashMap::default(),
             paragraph_order: VecDeque::new(),
             paragraph_cache_bytes: 0,
             prepared_rows: Vec::new(),
@@ -469,10 +549,10 @@ impl TextRenderer {
     /// Shape complete rows with cell spans independent of proportional fallback
     /// advances. Cached shaping is independent of colors, selection and atlas UVs.
     pub fn shape_row(&mut self, cells: &[RenderCell], config: &FontConfig) -> Arc<ShapedRow> {
-        let key = RowKey::new(cells);
-        if let Some(row) = self.shape_cache.get(&key) {
+        if let Some(row) = self.shape_cache.get(&RowRef(cells)) {
             return Arc::clone(row);
         }
+        let key = Arc::new(RowKey::new(cells));
         let row = Arc::new(
             if cells.iter().all(|cell| {
                 cell.character.is_ascii()
@@ -495,7 +575,7 @@ impl TextRenderer {
                 )
             },
         );
-        let bytes = key.bytes() * 2
+        let bytes = key.bytes()
             + row.glyphs.len() * std::mem::size_of::<ShapedGlyph>()
             + row.visual_cols.len() * (std::mem::size_of::<usize>() + 1);
         if bytes <= SHAPE_CACHE_BYTES {
@@ -530,29 +610,32 @@ impl TextRenderer {
             while end < grid.rows && grid.wrapped.get(end - 1).copied().unwrap_or(false) {
                 end += 1;
             }
-            let rows: Vec<_> = (first..end)
-                .map(|row| &grid.cells[row * grid.cols..(row + 1) * grid.cols])
-                .collect();
             let prefix = if first == 0 { grid.bidi_prefix.as_str() } else { "" };
             let suffix = if end == grid.rows { grid.bidi_suffix.as_str() } else { "" };
             if prefix.is_empty()
                 && suffix.is_empty()
-                && (rows.len() == 1
-                    || rows.iter().all(|row| {
-                        row.iter()
-                            .all(|cell| cell.character.is_ascii() && cell.zerowidth.is_empty())
-                    }))
+                && (end == first + 1
+                    || grid.cells[first * grid.cols..end * grid.cols]
+                        .iter()
+                        .all(|cell| cell.character.is_ascii() && cell.zerowidth.is_empty()))
             {
-                output.extend(rows.iter().map(|row| self.shape_row(row, config)));
+                output.extend((first..end).map(|row| {
+                    self.shape_row(&grid.cells[row * grid.cols..(row + 1) * grid.cols], config)
+                }));
             } else {
-                let key = ParagraphKey {
-                    rows: rows.iter().map(|row| RowKey::new(row)).collect(),
-                    prefix: prefix.to_owned(),
-                    suffix: suffix.to_owned(),
-                };
-                if let Some(cached) = self.paragraph_cache.get(&key) {
+                let rows: Vec<_> = (first..end)
+                    .map(|row| &grid.cells[row * grid.cols..(row + 1) * grid.cols])
+                    .collect();
+                if let Some(cached) =
+                    self.paragraph_cache.get(&ParagraphRef { rows: &rows, prefix, suffix })
+                {
                     output.extend(cached.iter().cloned());
                 } else {
+                    let key = Arc::new(ParagraphKey {
+                        rows: rows.iter().map(|row| RowKey::new(row)).collect(),
+                        prefix: prefix.to_owned(),
+                        suffix: suffix.to_owned(),
+                    });
                     let shaped: Vec<_> = shape_contextual_paragraph(
                         &mut self.font_system,
                         &mut self.shape_buffer,
@@ -565,10 +648,9 @@ impl TextRenderer {
                     .into_iter()
                     .map(Arc::new)
                     .collect();
-                    let bytes = (key.rows.iter().map(RowKey::bytes).sum::<usize>()
+                    let bytes = key.rows.iter().map(RowKey::bytes).sum::<usize>()
                         + prefix.len()
-                        + suffix.len())
-                        * 2
+                        + suffix.len()
                         + shaped
                             .iter()
                             .map(|row| {
@@ -1067,7 +1149,9 @@ fn shape_contextual_paragraph(
     let bidi = unicode_bidi::BidiInfo::new(&text, None);
     let attrs = Attrs::new().family(cosmic_text::Family::Name(&config.family));
     let mut borrow = buffer.borrow_with(font_system);
-    borrow.set_wrap(Wrap::None);
+    // Cosmic 0.19's no-wrap layout drops an initial opposite-direction span.
+    // Unbounded word layout keeps that span without introducing line breaks.
+    borrow.set_wrap(Wrap::Word);
     borrow.set_size(None, None);
     borrow.set_monospace_width(Some(metrics.cell_width));
     borrow.set_rich_text(
@@ -1333,11 +1417,262 @@ mod tests {
         text.chars().map(|character| RenderCell { character, ..RenderCell::default() }).collect()
     }
 
+    #[test]
+    fn borrowed_shape_keys_preserve_text_styles_and_paragraph_boundaries() {
+        use std::hash::BuildHasher;
+
+        let mut source = cells("س日本語 Русский Україна café Straße español português italiano");
+        source[0].zerowidth = "\u{64e}\u{651}".into();
+        let mut rows = hashbrown::HashMap::with_hasher(RandomState::new());
+        for flags in [CellFlags::empty(), SHAPING_FLAGS, CellFlags::all()] {
+            source[0].flags = flags;
+            let key = Arc::new(RowKey::new(&source));
+            assert_eq!(rows.hasher().hash_one(&key), rows.hasher().hash_one(RowRef(&source)));
+            rows.insert(key, 42);
+            assert_eq!(rows.get(&RowRef(&source)), Some(&42));
+            let mut overlay = source.clone();
+            overlay[0].fg = mechanic_config::theme::palette::BLACK;
+            overlay[0].flags.toggle(CellFlags::UNDERLINE);
+            assert_eq!(rows.get(&RowRef(&overlay)), Some(&42));
+            for flags in [
+                CellFlags::BOLD,
+                CellFlags::ITALIC,
+                CellFlags::HIDDEN,
+                CellFlags::WIDE_CHAR,
+                CellFlags::WIDE_CHAR_SPACER,
+                CellFlags::LEADING_WIDE_CHAR_SPACER,
+            ] {
+                let mut changed = source.clone();
+                changed[0].flags.toggle(flags);
+                assert!(rows.get(&RowRef(&changed)).is_none());
+            }
+            let mut changed = source.clone();
+            changed[0].zerowidth.push('\u{301}');
+            assert!(rows.get(&RowRef(&changed)).is_none());
+            assert!(rows.get(&RowRef(&source[1..])).is_none());
+            rows.clear();
+        }
+
+        let slices = [&source[..3], &source[3..], &[]];
+        let key = Arc::new(ParagraphKey {
+            rows: slices.iter().map(|row| RowKey::new(row)).collect(),
+            prefix: "قبل".into(),
+            suffix: "بعد".into(),
+        });
+        let mut paragraphs = hashbrown::HashMap::with_hasher(RandomState::new());
+        let borrowed = ParagraphRef { rows: &slices, prefix: "قبل", suffix: "بعد" };
+        assert_eq!(paragraphs.hasher().hash_one(&key), paragraphs.hasher().hash_one(&borrowed));
+        paragraphs.insert(key, 42);
+        assert_eq!(paragraphs.get(&borrowed), Some(&42));
+        assert!(paragraphs.get(&ParagraphRef { prefix: "", ..borrowed }).is_none());
+        assert!(paragraphs.get(&ParagraphRef { suffix: "", ..borrowed }).is_none());
+        let moved_boundary = [&source[..4], &source[4..], &[]];
+        assert!(paragraphs.get(&ParagraphRef { rows: &moved_boundary, ..borrowed }).is_none());
+        let reordered = [slices[1], slices[0], slices[2]];
+        assert!(paragraphs.get(&ParagraphRef { rows: &reordered, ..borrowed }).is_none());
+    }
+
     fn cpu_shaper() -> (FontSystem, Buffer, FontConfig, CellMetrics) {
         let config = FontConfig { family: "Menlo".into(), ..FontConfig::default() };
         let mut fonts = configured_font_system(&config);
         let buffer = Buffer::new(&mut fonts, Metrics::new(16.0, 24.0));
         (fonts, buffer, config, CellMetrics { cell_width: 10.0, cell_height: 24.0, ascent: 18.0 })
+    }
+
+    #[test]
+    fn numeric_prefix_before_rtl_text_keeps_visible_glyphs() {
+        let (mut fonts, mut buffer, config, metrics) = cpu_shaper();
+        for text in [
+            "0001/0030 تحتفظ اللغة العربية بسياق الفقر ",
+            "123 العربية",
+            "العربية 123",
+            "123 עברית",
+            " 12 345 (67) العربية 89  ",
+            "123 \u{2067}العربية\u{2069} 456",
+            "123 English 日本語 456  ",
+        ] {
+            let input = cells(text);
+            let shaped = shape_contextual_row(&mut fonts, &mut buffer, &input, &config, metrics);
+            assert_permutation(&shaped);
+            for (col, cell) in input.iter().enumerate() {
+                if cell.character.is_ascii_digit() {
+                    assert!(
+                        shaped.glyphs.iter().any(|glyph| glyph.source_col == col),
+                        "lost digit at {col} in {text:?}: {shaped:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_pruning_preserves_exact_names_and_priority() {
+        let mut fallback = ConfiguredFallback {
+            common: vec!["missing", "Alias", "Primary", "Alias", "primary", "Primary"],
+            scripts: HashMap::from([(
+                unicode_script::Script::Arabic,
+                vec!["Alias", "missing", "Alias", "Primary"],
+            )]),
+        };
+        fallback.retain_available(&HashSet::from(["Primary", "Alias"]));
+        assert_eq!(fallback.common, ["Alias", "Primary"]);
+        assert_eq!(
+            fallback.script_fallback(unicode_script::Script::Arabic, "en-US"),
+            ["Alias", "Primary"]
+        );
+        assert_eq!(
+            fallback.script_fallback(unicode_script::Script::Thai, "th-TH"),
+            PlatformFallback.script_fallback(unicode_script::Script::Thai, "th-TH")
+        );
+        assert_eq!(fallback.forbidden_fallback(), PlatformFallback.forbidden_fallback());
+    }
+
+    #[test]
+    fn pruned_fallback_preserves_multilingual_glyphs_and_geometry() {
+        let source = FontSystem::new();
+        let available: HashSet<_> = source
+            .db()
+            .faces()
+            .flat_map(|face| face.families.iter().map(|(name, _)| name.as_str()))
+            .collect();
+        assert!(!available.is_empty(), "differential shaping needs installed fonts");
+        let alias =
+            source.db().faces().find_map(|face| face.families.get(1)).map(|(name, _)| name.clone());
+        let metrics = CellMetrics { cell_width: 10.0, cell_height: 24.0, ascent: 18.0 };
+        for family in ["Menlo", "Geeza Pro", "Missing Mechanic Test Font"] {
+            let mut config = FontConfig { family: family.into(), ..FontConfig::default() };
+            config.fallback_families.insert(0, "Missing Mechanic Test Font".into());
+            config.fallback_families.extend(["Menlo".into(), "menlo".into(), "Geeza Pro".into()]);
+            if let Some(alias) = &alias {
+                config.fallback_families.insert(0, alias.clone());
+            }
+            let mut pruned = configured_fallback(&config, &source);
+            pruned.retain_available(&available);
+            let mut optimized = FontSystem::new_with_locale_and_db_and_fallback(
+                source.locale().to_owned(),
+                source.db().clone(),
+                pruned,
+            );
+            let mut reference = FontSystem::new_with_locale_and_db_and_fallback(
+                source.locale().to_owned(),
+                source.db().clone(),
+                configured_fallback(&config, &source),
+            );
+            let mut optimized_buffer = Buffer::new(&mut optimized, Metrics::new(16.0, 24.0));
+            let mut reference_buffer = Buffer::new(&mut reference, Metrics::new(16.0, 24.0));
+            for text in [
+                "office café cafe\u{301} Straße español português città français",
+                "Русский Українська ї є ґ Й и\u{306}",
+                "中文 日本語 ひらがな カタカナ 한국어",
+                "العربية: السَّلام عليكم 2026 (Paris) لا الله ب\u{200d}ب ب\u{200c}ب",
+                "abc \u{2067}العربية 12 \u{2066}東京\u{2069}\u{2069} \u{202e}xyz\u{202c}",
+                "עברית हिन्दी ภาษาไทย \u{10ffff}",
+            ] {
+                let mut input = Vec::<RenderCell>::new();
+                for character in text.chars() {
+                    let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+                    if width == 0 && !input.is_empty() {
+                        let base = input
+                            .iter_mut()
+                            .rev()
+                            .find(|cell| !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER))
+                            .unwrap();
+                        base.zerowidth.push(character);
+                    } else {
+                        input.push(RenderCell {
+                            character,
+                            flags: if width == 2 {
+                                CellFlags::WIDE_CHAR
+                            } else {
+                                CellFlags::empty()
+                            },
+                            ..Default::default()
+                        });
+                        if width == 2 {
+                            input.push(RenderCell {
+                                flags: CellFlags::WIDE_CHAR_SPACER,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                for styled in [false, true] {
+                    if styled {
+                        for (index, cell) in input.iter_mut().enumerate() {
+                            cell.flags |= match index % 3 {
+                                0 => CellFlags::BOLD,
+                                1 => CellFlags::ITALIC,
+                                _ => CellFlags::BOLD | CellFlags::ITALIC,
+                            };
+                        }
+                    }
+                    for width in [7, 19, 120] {
+                        // Keep wide cells with their spacers at each wrap.
+                        let mut slices = Vec::new();
+                        let mut remaining = input.as_slice();
+                        while !remaining.is_empty() {
+                            let mut end = width.min(remaining.len());
+                            if remaining[end - 1].flags.contains(CellFlags::WIDE_CHAR) {
+                                end -= 1;
+                            }
+                            slices.push(&remaining[..end]);
+                            remaining = &remaining[end..];
+                        }
+                        for (prefix, suffix) in [("", ""), ("قبل \u{2066}abc ", " xyz\u{2069} بعد")]
+                        {
+                            let expected = shape_contextual_paragraph(
+                                &mut reference,
+                                &mut reference_buffer,
+                                &slices,
+                                &config,
+                                metrics,
+                                prefix,
+                                suffix,
+                            );
+                            let actual = shape_contextual_paragraph(
+                                &mut optimized,
+                                &mut optimized_buffer,
+                                &slices,
+                                &config,
+                                metrics,
+                                prefix,
+                                suffix,
+                            );
+                            assert_eq!(actual.len(), expected.len());
+                            for (actual, expected) in actual.iter().zip(&expected) {
+                                assert_permutation(actual);
+                                assert_eq!(
+                                    actual.visual_cols, expected.visual_cols,
+                                    "{family}: {text}"
+                                );
+                                assert_eq!(actual.rtl, expected.rtl, "{family}: {text}");
+                                let signature = |row: &ShapedRow| {
+                                    row.glyphs
+                                        .iter()
+                                        .map(|glyph| {
+                                            (
+                                                glyph.cache_key,
+                                                glyph.source_col,
+                                                glyph.cluster_start,
+                                                glyph.cluster_end,
+                                                glyph.x.to_bits(),
+                                                glyph.y.to_bits(),
+                                                glyph.scale_x.to_bits(),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                };
+                                assert_eq!(
+                                    signature(actual),
+                                    signature(expected),
+                                    "{family}: {text}, width={width}, styled={styled}, prefix={prefix:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn assert_permutation(row: &ShapedRow) {
@@ -2025,6 +2360,86 @@ mod tests {
         }
         assert!(renderer.shape_cache.len() <= SHAPE_CACHE_ROWS);
         assert!(renderer.shape_cache_bytes <= SHAPE_CACHE_BYTES);
+
+        let mut grid = crate::grid::RenderGrid::new(8, 2);
+        for (cell, character) in grid.cells.iter_mut().zip("مرحبا بكم日本語éאבج".chars())
+        {
+            cell.character = character;
+        }
+        grid.wrapped[0] = true;
+        let first = renderer.shape_grid(&grid, &config);
+        let repeated = renderer.shape_grid(&grid, &config);
+        assert!(first.iter().zip(&repeated).all(|(a, b)| Arc::ptr_eq(a, b)));
+
+        for change in 0..8 {
+            match change {
+                0 => grid.cells[0].zerowidth.push('\u{64e}'),
+                1 => grid.cells[1].flags.insert(CellFlags::BOLD),
+                2 => grid.bidi_prefix = "قبل ".into(),
+                3 => grid.bidi_suffix = " بعد".into(),
+                4 => grid.wrapped[0] = false,
+                5 => grid.cells[2].flags.insert(CellFlags::HIDDEN),
+                6 => grid.cells[0].fg = mechanic_config::theme::palette::BLACK,
+                _ => grid.cells[0].character = 'ش',
+            }
+            let cached = renderer.shape_grid(&grid, &config);
+            renderer.shape_cache.clear();
+            renderer.shape_order.clear();
+            renderer.shape_cache_bytes = 0;
+            renderer.paragraph_cache.clear();
+            renderer.paragraph_order.clear();
+            renderer.paragraph_cache_bytes = 0;
+            let fresh = renderer.shape_grid(&grid, &config);
+            for (cached, fresh) in cached.iter().zip(&fresh) {
+                assert_eq!(cached.visual_cols, fresh.visual_cols);
+                assert_eq!(cached.rtl, fresh.rtl);
+                assert_eq!(cached.glyphs.len(), fresh.glyphs.len());
+                for (a, b) in cached.glyphs.iter().zip(&fresh.glyphs) {
+                    assert_eq!(
+                        (
+                            a.cache_key,
+                            a.source_col,
+                            a.x,
+                            a.y,
+                            a.scale_x,
+                            a.cluster_start,
+                            a.cluster_end
+                        ),
+                        (
+                            b.cache_key,
+                            b.source_col,
+                            b.x,
+                            b.y,
+                            b.scale_x,
+                            b.cluster_start,
+                            b.cluster_end
+                        ),
+                        "cached geometry diverged after change {change}",
+                    );
+                }
+            }
+        }
+        grid.wrapped[0] = true;
+        for index in 0..80 {
+            grid.bidi_prefix = format!("paragraph {index} ");
+            renderer.shape_grid(&grid, &config);
+        }
+        // Large contexts exercise the byte limit independently of the entry limit.
+        for index in 0..20 {
+            grid.bidi_prefix = format!("{index} {}", "x".repeat(64 * 1024));
+            renderer.shape_grid(&grid, &config);
+        }
+        assert!(renderer.paragraph_cache.len() < 20);
+        assert_eq!(renderer.paragraph_cache.len(), renderer.paragraph_order.len());
+        assert_eq!(
+            renderer.paragraph_cache_bytes,
+            renderer.paragraph_order.iter().map(|(_, bytes)| bytes).sum::<usize>()
+        );
+        assert!(renderer.paragraph_cache_bytes <= SHAPE_CACHE_BYTES);
+        for (key, _) in &renderer.paragraph_order {
+            let (stored, _) = renderer.paragraph_cache.get_key_value(key).unwrap();
+            assert!(Arc::ptr_eq(key, stored));
+        }
     }
 
     #[test]

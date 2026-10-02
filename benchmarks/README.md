@@ -196,6 +196,34 @@ size stable; failed runs remain marked inconclusive.
 These GUI CPU/stage measurements are Mechanic-specific. Use the terminal workloads
 above for iTerm2/Ghostty comparisons; parser replies do not validate rendered text.
 
+## Native paragraph UI probe (macOS)
+
+```sh
+cargo build --release -p mechanic-bench --example paragraph_ui
+./target/release/examples/paragraph_ui LABEL /tmp/paragraph-ui.jsonl /tmp/emulator.pid
+```
+
+Run this as the command in a new, isolated terminal window. The optional PID
+file must contain that window's GUI process ID, not the login/shell process;
+Ghostty's login wrapper prevented automatic parent identification in our runs.
+Pass the benchmark executable directly to Ghostty's `-e` option. Mechanic's
+single-program shell setting can use `MECHANIC_PARAGRAPH_LABEL` and
+`MECHANIC_PARAGRAPH_REPORT` instead of arguments.
+
+Keep the window frontmost and unchanged until completion (about 50 seconds).
+The title shows progress through ten cases. Use matching font, opacity and
+actual grid dimensions, with animations disabled. Each script has explicit-row
+and soft-wrapped cases; new counter edits arrive at 20 Hz. Twenty warmup edits
+precede 60 measured edits. Idle and wrapped ASCII are controls.
+
+JSONL records GUI-process CPU, raw cursor-report response times, dimensions,
+focus checks and completion status. CPU uses one core as 100% and excludes
+the PTY peer, WindowServer and GPU. Responses acknowledge parsing, not completed
+presentation. Reject incomplete runs and any sample with changed focus or size.
+Raw `TERM_PROGRAM` values can be inherited; the recorded process path identifies
+the measured emulator. Existing result files are never overwritten. The probe
+clears its isolated window's scrollback; no screenshots or recordings are taken.
+
 Metal pixel and atlas checks run explicitly on macOS:
 
 ```sh
@@ -254,6 +282,61 @@ each sample's mean milliseconds per shape and glyph count. It excludes the
 paragraph cache, atlas rasterization, uploads and presentation. The ASCII case
 does not use the application's faster ASCII path. Compare identical harnesses
 before and after shaping changes; glyph counts may differ when shaping is fixed.
+
+## Frame preparation stages
+
+```sh
+MECHANIC_FRAME_PREPARATION_CSV=/tmp/frame-preparation.csv \
+  cargo test --release -p mechanic-app frame_preparation_stages -- --ignored --nocapture --test-threads=1
+```
+
+This offscreen Metal benchmark measures grid conversion, shaping-cache lookup
+and glyph-atlas preparation separately at 121×42, Menlo 16 pt, scale 1. Cases
+cover one-cell, one-row, full ASCII and scroll updates, wrapped Arabic, Chinese,
+Japanese and Korean, and separate multilingual rows. Each case has 20 warmups,
+another 100 ms warmup, and 200 samples. Mutations and viewport assertions run
+outside the timers.
+Existing output files are never replaced.
+
+The workloads alternate two states. Cache hits are expected only when both
+states fit; a large wrapped paragraph may repeatedly evict the other state.
+Use the uncached paragraph benchmark above to study novel Arabic output.
+These timings exclude parsing, geometry construction, actual GPU execution,
+presentation and destruction of the returned grid/row snapshots. Run saved
+before/after binaries sequentially, with no concurrent builds or benchmarks.
+
+To measure new paragraph states rather than alternating two cached states:
+
+```sh
+MECHANIC_FRAME_PREPARATION_NOVEL=1 \
+MECHANIC_FRAME_PREPARATION_CSV=/tmp/frame-preparation-novel.csv \
+  cargo test --release -p mechanic-app frame_preparation_stages -- --ignored --nocapture --test-threads=1
+```
+
+This runs only the four wrapped-script cases, changing a three-digit counter
+in one visible row. CJK uses fullwidth digits and preserves wide-cell spacers.
+The counter advances each iteration; each measured batch has 200 distinct states.
+The CJK fixtures match Arabic's source display width approximately; odd-width
+terminal rows add wide-character wrap padding. Font fallback and paragraph
+contents differ, so this is not an intrinsic comparison of script complexity.
+
+For a broader workload matrix:
+
+```sh
+MECHANIC_FRAME_MATRIX_CSV=/tmp/frame-matrix.csv \
+  cargo test --release -p mechanic-app frame_preparation_matrix -- --ignored --nocapture --test-threads=1
+```
+
+The 90 cases combine 40×12, 81×25 and 121×42 viewports; accented Latin,
+Cyrillic, mixed CJK, Arabic and an LTR viewport with Arabic in scrollback;
+sparse edits, scrolling and dense edits; and hard rows versus soft wraps.
+Each case has eight warmups and 24 samples. Scrolling follows an eight-step
+cycle spanning one viewport at every size, without stationary turning points.
+The CSV records history offsets, context lengths and truncation. Updates use
+the parser outside timing; assertions check changed visible cells, counters,
+sparse counter glyphs and offscreen context. Separate renderer tests check
+glyph geometry and pixels. Stage boundaries and exclusions match the benchmark
+above. Use identical harnesses and font installations for before/after runs.
 
 ## Hyperlinks
 

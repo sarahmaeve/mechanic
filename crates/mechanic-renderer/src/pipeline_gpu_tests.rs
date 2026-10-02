@@ -287,6 +287,60 @@ fn multilingual_pixel_fixture() {
 
 #[test]
 #[ignore = "requires a Metal device; run explicitly on macOS"]
+fn numbers_before_rtl_text_have_visible_pixels() {
+    use mechanic_config::font::FontConfig;
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::METAL,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let config = FontConfig { family: "Menlo".into(), size: 18.0, ..Default::default() };
+    let mut text = TextRenderer::new(&device, &queue, &config, 2.0);
+    let metrics = text.cell_metrics();
+    let cell_size = (metrics.cell_width.ceil(), metrics.cell_height.ceil());
+    for content in ["123 العربية", " 12 345 (67) עברית 89 "] {
+        let mut grid = RenderGrid::new(content.chars().count(), 1);
+        grid.cursor_visible = false;
+        for (cell, character) in grid.cells.iter_mut().zip(content.chars()) {
+            *cell = crate::RenderCell {
+                character,
+                fg: Rgb::new(255, 255, 255),
+                bg: Rgb::new(0, 0, 0),
+                ..Default::default()
+            };
+        }
+        let shaped = text.shape_grid(&grid, &config);
+        text.prepare_frame(&shaped, &device, &queue).unwrap();
+        let (instances, backgrounds) = build_instances(&grid, &shaped, &text, cell_size, true);
+        let width = grid.cols as u32 * cell_size.0 as u32;
+        let height = cell_size.1 as u32;
+        let pixels = render_fixture_pixels(
+            &device,
+            &queue,
+            &text.atlas_view,
+            None,
+            fixture_globals((width, height), cell_size),
+            &instances,
+            backgrounds,
+        );
+        for (col, cell) in grid.cells.iter().enumerate() {
+            if cell.character.is_ascii_digit() {
+                let left = shaped[0].visual_cols[col] as u32 * cell_size.0 as u32;
+                let inset = cell_size.0 as u32 / 4;
+                let has_ink = (0..height).any(|y| {
+                    (left + inset..left + cell_size.0 as u32 - inset)
+                        .any(|x| pixels[((y * width + x) * 4) as usize] > 80)
+                });
+                assert!(has_ink, "missing digit pixels at {col} in {content:?}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal device; run explicitly on macOS"]
 fn wrapped_arabic_pixels_survive_viewport_clipping() {
     use mechanic_config::font::FontConfig;
 

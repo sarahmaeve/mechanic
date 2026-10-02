@@ -1,0 +1,3 @@
+{"cols":121,"interval_ms":50,"label":"ghostty-1.3.1","mach_denom":3,"mach_numer":125,"pid":39016,"process_path":"/Applications/Ghostty.app/Contents/MacOS/ghostty","profile":"release","rows":42,"samples":60,"schema":1,"scope":"Emulator process CPU (one core = 100%) and parser-response latency; excludes GPU, WindowServer, PTY peer, and presentation completion.","term_program":"ghostty","term_program_version":"1.3.1","type":"metadata","warmups":20}
+{"case":"idle","cpu_ns":249315750,"cpu_percent":8.300872468797534,"focus_lost":false,"late_intervals":0,"parser_response_ms":[],"seconds":3.0034885,"size_changed":true,"type":"sample","valid":false}
+{"error":"focus or dimensions changed during sample","success":false,"type":"complete"}

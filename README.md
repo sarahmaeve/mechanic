@@ -53,6 +53,16 @@ wide cells, Arabic paragraph direction and joining across soft wraps. Configured
 platform fallback; macOS supplies Hiragino Sans and Geeza Pro. See
 [review findings](design/REVIEW.md) for remaining rendering limits.
 
+Run the reading demo inside Mechanic:
+
+```sh
+cargo run --release -p mechanic-bench --example paragraph_demo
+```
+
+It scrolls original English, French, Chinese, Arabic and Japanese paragraphs
+using native wrapping. Space pauses/resumes, R replays, and Q/Esc quits.
+The final text stays available for scrollback; `--plain` prints it immediately.
+
 Underline styles, underline colors and strikeout are rendered. OSC palette
 changes affect both display and color-query replies. IME composition appears
 underlined with a selection and caret, clipped to the current visible row.

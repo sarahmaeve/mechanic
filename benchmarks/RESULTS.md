@@ -5,6 +5,183 @@ transfer that previously deadlocked. Output batching also improves most tested
 GUI workloads. These are initial observations from one machine, not stable
 cross-terminal rankings.
 
+## Font fallback and mixed-direction correctness — 2026-10-02
+
+Font fallback now removes absent family names and exact duplicates from each
+configured/platform list at renderer creation. All installed family aliases
+and preference order are preserved. Full-paragraph shaping and bidi remain.
+
+Stronger benchmark assertions exposed a separate Cosmic Text 0.19 bug:
+numeric prefixes before Arabic/Hebrew could disappear in its no-wrap layout.
+Mechanic now uses word layout with unbounded dimensions, retaining every span
+without inserting line breaks. Both final benchmark builds include this
+correctness repair; the comparison below isolates fallback pruning.
+
+Fresh counter edits, 121×42, median shaping time:
+
+| Paragraph | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Arabic | 8.77 ms | 7.22 ms | −18% |
+| Chinese | 38.40 ms | 26.78 ms | −30% |
+| Japanese | 25.75 ms | 21.13 ms | −18% |
+| Korean | 2.79 ms | 2.75 ms | −2% |
+
+One final batch per build, 200 distinct edits per case after 20 warmups and
+100 ms CPU warmup. An earlier independent pair also showed gains for Arabic,
+Chinese and Japanese, with Korean essentially unchanged. The small Korean
+difference does not establish a useful improvement.
+
+The expanded matrix covers 90 combinations: three viewport sizes, five text
+fixtures, three update modes, and hard rows versus soft wrapping. Each case has
+eight warmups and 24 samples. Four serial batches ran before/after/after/before,
+giving 48 observations per build/case. At 121×42, wrapped Arabic shaping improved
+18% and mixed CJK 21–22% across sparse edits, dense edits and scrolling. Latin,
+Cyrillic and hidden-RTL-context workloads were mostly unchanged. Improvements
+are not universal: the 40×12 accented-Latin sparse wrapped case rose from
+305 to 331 µs (+8.5%), and several small cached cases rose about 0.2–1.3 µs.
+The initial large hidden-RTL slowdown did not recur in either revised batch.
+
+Release, Menlo 16 pt, scale 1, Rust 1.99.0, Apple M5 Pro/Metal,
+macOS 26.6.2 arm64, unchanged host font database. Timings cover conversion,
+shaping and atlas CPU preparation/enqueue; parsing, instance construction,
+GPU execution, presentation and application CPU are excluded. These results
+do not establish interactive latency or a comparison with another terminal.
+
+The revised scroll fixtures use an eight-step full-viewport cycle and distinct
+phrase IDs. Assertions require changed visible content, converted counters,
+sparse counter glyphs and retained offscreen context. Initial fixtures had
+unequal scroll cycles, repeated viewports, and missing numeric glyphs; their
+retained observations are exploratory and excluded from the final matrix.
+
+[Fresh-edit summary](baselines/2026-10-02/font-fallback/scripts-final-summary.csv),
+[matrix medians and p95](baselines/2026-10-02/font-fallback/matrix-summary.csv),
+and [build/run metadata](baselines/2026-10-02/font-fallback/metadata.txt).
+Raw samples are adjacent. Percentiles use nearest rank; total times are
+per-sample sums before aggregation.
+
+Validation: 411 workspace/all-target/all-feature tests and nine explicit serial
+offscreen Metal tests passed, along with strict Clippy, formatting and the
+release workspace build. Differential tests compare exact font/glyph keys,
+float geometry, clusters and bidi hit mappings using cloned font databases,
+across primary/fallback fonts, absent/duplicate names, aliases, accents,
+Cyrillic/CJK/Arabic/Hebrew/Indic/Thai text, controls, styles and wrap widths.
+The numeric-prefix regression failed before the repair and now passes CPU and
+pixel checks. Existing joining, viewport clipping, atlas-growth, cursor and
+cached-versus-full geometry checks also pass. Independent review found no
+remaining material issues in these changes.
+
+## Frame preparation — 2026-10-02
+
+Shaping-cache hits now borrow visible cells instead of allocating text keys.
+The cache and eviction queue share each owned key; their existing entry and
+payload limits remain unchanged. Single-row shaping also skips a temporary
+row-slice allocation.
+
+Pooled release medians in microseconds; totals are per-sample sums of conversion,
+shaping and atlas preparation:
+
+| Update | Shaping before | Shaping after | Total before | Total after |
+| --- | ---: | ---: | ---: | ---: |
+| One ASCII cell | 50.25 | 37.08 | 89.87 | 76.58 |
+| One ASCII row | 50.00 | 37.33 | 89.54 | 76.96 |
+| Full ASCII grid | 50.92 | 37.54 | 169.58 | 158.79 |
+| Scroll | 50.25 | 37.58 | 172.87 | 166.17 |
+| One multilingual cell, separate rows | 50.50 | 38.58 | 90.21 | 78.25 |
+| One Arabic cell, 42 wrapped rows | 8922.29 | 8815.88 | 9089.00 | 8984.08 |
+
+Cached shaping improved 24–26%; the three sparse workloads improved 13–15%
+across these stages. Conversion remains about 37–39 µs. Dense atlas preparation
+still scans changed glyphs: full ASCII was 81→83 µs and scrolling 85→91 µs;
+the combined totals improved despite that variation. The approximately 1%
+Arabic difference does not establish a speedup. Its two large paragraph states
+do not remain cached together, so contextual shaping remains the main cost.
+
+121×42 cells, Menlo 16 pt, scale 1, Rust 1.99.0, wgpu 30.0.1/Metal,
+macOS 26.6.2 arm64. Three batches per build, 200 samples per workload per batch,
+after 20 warmups and 100 ms additional warmup. Batch order was before/after,
+after/before, before/after; no concurrent builds or benchmark runs. Baseline
+production code is `33b795d`, using the same stage harness. The workloads
+alternate two states, with mutations and visible-change assertions outside
+timing. These results exclude parsing, geometry construction, GPU execution,
+presentation and final snapshot destruction; they do not measure application
+CPU or comparisons with other terminals.
+
+[Raw batches and per-batch/pooled summary](baselines/2026-10-02/frame-preparation/summary.csv).
+The six raw CSV files are adjacent to the summary. Summary percentiles use
+nearest rank; each pooled group contains 600 samples.
+
+Validation: 395 workspace tests, eight explicit serial offscreen Metal checks,
+strict Clippy, formatting and release app build passed. Cache checks cover
+multilingual text, combining marks, style/hidden flags, color overlays, paragraph
+boundaries and context, fresh-shaping equivalence, and eviction limits.
+
+### Wrapped CJK follow-up
+
+Adding Chinese, Japanese and Korean exposes a broader paragraph-shaping cost.
+All wrapped non-ASCII paragraphs use the same paragraph-level cache. Median
+shaping milliseconds in the optimized build:
+
+| Script | Alternating two states | Fresh counter edits |
+| --- | ---: | ---: |
+| Arabic | 8.844 | 8.935 |
+| Chinese | 0.039 | 39.830 |
+| Japanese | 0.043 | 26.980 |
+| Korean | 0.040 | 2.738 |
+
+The CJK alternating states remain cached; fresh edits expose full-paragraph
+shaping. Arabic is therefore not the general performance bottleneck: this
+fixture's Chinese and Japanese cache misses cost substantially more. The
+earlier mixed-language hard-row test did not exercise this path.
+
+Same grid, font, scale, warmups and 200 samples as above; one batch per mode.
+The long paragraphs extend into history. CJK source display widths approximately
+match Arabic's, with additional padding at odd-width wraps. Fresh edits advance
+a three-digit counter in row 21 (fullwidth digits in CJK); usually one character
+changes, with carries changing two or three. The text and selected fallback
+fonts differ. These observations establish a shared performance problem, not
+an inherent ranking of languages or typical keystroke-to-display latency.
+
+[Alternating raw samples](baselines/2026-10-02/frame-preparation/scripts.csv) /
+[fresh-edit raw samples](baselines/2026-10-02/frame-preparation/scripts-novel.csv).
+Both offscreen benchmark runs passed their visible-update and row-count
+assertions; strict app Clippy and formatting passed. Production code is unchanged
+from the cache optimization above.
+
+### Native UI investigation
+
+Mechanic completed the 20 Hz GUI probe with stable focus and dimensions. CPU
+percent of one core, one three-second sample per case after warmup:
+
+| Script | Explicit rows | Long wrapped paragraph |
+| --- | ---: | ---: |
+| Arabic | 5.27% | 37.95% |
+| Chinese | 8.00% | 71.56% |
+| Japanese | 7.11% | 60.37% |
+| Korean | 4.55% | 20.89% |
+
+Idle was 0.03%; wrapped ASCII was 25.80%. Menlo 14 pt, 121×42, opaque window,
+logo and animations disabled. Each case has 20 warmup counter edits and 60
+measured edits at 50 ms intervals. Wrapped text extends into history; explicit
+rows end with hard newlines. Process CPU includes renderer/driver work but
+excludes the peer, WindowServer and GPU. This is a single exploratory run;
+cursor replies do not establish frame completion. Raw samples:
+[mechanic.jsonl](baselines/2026-10-02/paragraph-ui/mechanic.jsonl).
+
+**No valid Ghostty CPU comparison was obtained.** Ghostty 1.3.1 attempts were
+rejected for process identification failures or changing window dimensions.
+The final attempt remained focused but changed from 121×39 to 121×36 during
+sampling. Its cause is unresolved; it is not attributed to user interaction.
+All attempts are retained beside the Mechanic result and excluded from rankings.
+
+Version-matched source shows a useful architectural difference: Ghostty
+[skips unchanged rows](https://github.com/ghostty-org/ghostty/blob/v1.3.1/src/renderer/generic.zig#L2417)
+and [keeps shaping runs within a row](https://github.com/ghostty-org/ghostty/blob/v1.3.1/src/font/shaper/run.zig#L10).
+Its macOS CoreText shaper also
+[forces left-to-right embedding](https://github.com/ghostty-org/ghostty/blob/v1.3.1/src/font/shaper/coretext.zig#L175),
+so its Arabic work is not equivalent to Mechanic's paragraph bidi support.
+This supports investigating row reuse while preserving paragraph context;
+it does not establish a measured performance ratio against Ghostty.
+
 ## Hyperlink lookup — 2026-10-02
 
 Release-build median lookup times in nanoseconds:

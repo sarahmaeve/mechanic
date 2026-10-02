@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 wgpu.workspace = true
 cosmic-text.workspace = true
+hashbrown = { version = "0.17", default-features = false }
 swash = "0.2"
 unicode-script = "0.5"
 unicode-bidi = "0.3"

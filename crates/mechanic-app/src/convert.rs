@@ -848,3 +848,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "convert_bench.rs"]
+mod convert_bench;

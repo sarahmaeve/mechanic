@@ -1,0 +1,9 @@
+case,stage,samples,before_median_us,after_median_us,change_pct,before_p95_us,after_p95_us
+"arabic_wrapped_cell",shaping,200,8767.167,7218.166,-17.67,9187.167,7309.625
+"arabic_wrapped_cell",total,200,8929.250,7381.833,-17.33,9362.375,7480.875
+"chinese_wrapped_cell",shaping,200,38396.209,26778.542,-30.26,39854.333,28486.916
+"chinese_wrapped_cell",total,200,38493.458,26872.458,-30.19,39962.750,28593.000
+"japanese_wrapped_cell",shaping,200,25752.750,21130.708,-17.95,26661.000,21766.500
+"japanese_wrapped_cell",total,200,25846.334,21227.333,-17.87,26775.250,21857.292
+"korean_wrapped_cell",shaping,200,2788.375,2745.625,-1.53,3069.458,2804.292
+"korean_wrapped_cell",total,200,2878.667,2837.292,-1.44,3183.249,2893.584

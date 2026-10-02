@@ -1,0 +1,49 @@
+Final fallback-pruning comparison: 2026-10-02
+Both builds include the unbounded Word-layout repair for Cosmic Text 0.19's missing initial opposite-direction span. The baseline retains unpruned fallback lists and the prior borrowed-key cache optimization.
+Final harness SHA256: 4a34e0178835b9e42ad0268e5d2f45aad8b4bbfacfd8b9bd2e8f947eed8965b3
+Final baseline text.rs SHA256: 24a6ec66d8c66b5af4acb3f770beddd046490fa8dc55f58659253d6ff1969d44
+Final candidate text.rs SHA256: 75df3f161097c755326035d29e4c7d78bdc4fb0d1bed0aa108d8081c2b7e705a
+Final baseline executable SHA256: 892e0bf3d2656e4fdcb4613092a9051847a47b7e7fff2348210fe9b0b7268ddb
+Final candidate executable SHA256: c1288e7fe9335ac74627bcc320b44f368b8795488d4e5184b17f483aa2a282f4
+Baseline executable: /tmp/mechanic-ltr-matrix-baseline/target/release/deps/mechanic-a1a39fa1d073c737
+Candidate executable: target/release/deps/mechanic-a1a39fa1d073c737
+Matrix order: matrix-before.csv, matrix-after.csv, matrix-after-2.csv, matrix-before-2.csv; serial, no competing builds/timings; all passed.
+Matrix duration per batch: 7.54, 6.63, 6.68, 7.55 seconds respectively.
+Final matrix: 90 cases, 24 samples/case/batch, 8 warmups; pooled 48 observations/build/case.
+Scroll: eight-step cycle, offsets floor(step * rows / 4), step = 1,2,3,4,3,2,1,0; same cycle at every size, no no-op endpoints.
+Softwrap content: each phrase has an epoch and a sequence ID, preventing identical viewports after scrolling.
+Assertions outside timers: changed converted cells, visible sparse/dense counter, sparse counter glyph coverage, row count, context validity.
+Final scripts: scripts-final-before.csv then scripts-final-after.csv; four fresh-counter cases, 200 samples each; 17.41 and 13.45 seconds; all passed.
+Summary percentiles: nearest rank; totals are sums of stages per sample. Matrix summary pools matching cases across two batches per build.
+Font database unchanged between runs. No GUI windows or screen capture.
+Validation: 411 workspace tests; 9 explicit serial Metal tests; strict all-target/all-feature Clippy; formatting; release workspace build. All passed.
+
+Exploratory runs (excluded from final matrix):
+matrix-initial-before.csv / matrix-initial-after.csv used the initial scroll fixture and lacked numeric-glyph assertions. matrix-rejected-missing-digits.csv is incomplete and failed its new glyph assertion. Periodic-viewport diagnostic runs were rejected and retained in /tmp only. scripts-before.csv / scripts-after.csv and scripts-summary.csv preceded the Word-layout repair; scripts-final-* are the final reported pair.
+
+Initial baseline provenance:
+Baseline date: 2026-10-02
+Platform: macOS 26.6.2 (25G83), arm64
+GPU adapter: Apple M5 Pro, Metal, offscreen (no window or presentation)
+Compiler: rustc 1.99.0 (b940084d7 2026-09-28), LLVM 23.1.1
+Workspace HEAD: 33b795d8b5854a3fc3d2f030450572f6abd78b0c (working tree included prior session edits)
+Build: cargo test -p mechanic-app --release --no-run --locked
+Baseline renderer source: /tmp/mechanic-ltr-text-before.rs
+Renderer source SHA256: ec957f518f14e48bb5441c36673cc924df182ebd019ac8cf69a557e6b6ff525c
+Original benchmark executable: /tmp/mechanic-ltr-before
+Original executable SHA256: 9b7ea0e6c91166620308b1c93fef85ac5d7554ece169bbfc7119da39fb8318db
+Matrix executable: /tmp/mechanic-ltr-matrix-before
+Matrix executable SHA256: 45397fd3d238863eac874c889c14e16c525e432e949e8b1f2c9f250ddb16cb9b
+Matrix harness SHA256: 1335779ba751ecea632596fe960c47a556c04210db0ba510f3689ff2816c4a29
+Isolated baseline workspace: /tmp/mechanic-ltr-matrix-baseline
+Command: MECHANIC_FRAME_MATRIX_CSV=/tmp/mechanic-ltr-matrix-before.csv /tmp/mechanic-ltr-matrix-before convert::convert_bench::frame_preparation_matrix --ignored --exact --nocapture --test-threads=1
+Run: serial; no competing parent build/timing; 8.21 seconds; 90 cases; 2160 samples.
+Timing boundaries: grid conversion including bidi context; shape_grid; prepare_frame. GPU presentation and completion excluded.
+Mutations and parsing are outside timing. Each case owns a new terminal and TextRenderer; eight unrecorded warmups precede 24 recorded samples.
+Font: Menlo, 16 pt, scale 1.0. Fallback fonts use the same host font database before/after.
+Viewport sizes: 40x12, 81x25, 121x42.
+Scripts: Latin with precomposed/combining accents; Cyrillic; Chinese/Japanese/Korean; Arabic with digits/Latin; hidden Arabic paragraph start with Latin-only viewport.
+Update modes: unique four-digit sparse edit; history-offset triangle; reset/repopulate with unique counters throughout dense text.
+Wrapping: explicit rows (up to cols-1 display columns) and parser-generated softwrap; source text spans at least three screens with scrollback context.
+CSV metadata includes exact context byte counts, truncation flag, adapter, font, profile, dimensions, warmups and sample count for every sample.
+Metal was unavailable inside sandbox; successful run used authorized sandbox escalation. No native UI launched.
