@@ -1213,6 +1213,7 @@ dependencies = [
  "mechanic-core",
  "mechanic-renderer",
  "pollster",
+ "unicode-width",
  "winit",
 ]
 
@@ -1249,6 +1250,7 @@ dependencies = [
  "libc",
  "log",
  "mechanic-config",
+ "memchr",
  "polling",
  "tempfile",
 ]

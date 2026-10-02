@@ -186,7 +186,7 @@ pub struct ShapedRow {
 struct RowCellKey {
     character: char,
     marks: String,
-    flags: u8,
+    flags: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

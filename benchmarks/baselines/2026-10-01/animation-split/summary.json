@@ -1,0 +1,137 @@
+{
+  "scope": "App CPU only; 100% is one CPU core. Three-second settle, five-second sample, atom logo at 180 physical pixels, Menlo 14, opaque window. No GPU or WindowServer measurement.",
+  "app_sha256": "2ebb9a555cc4b3bb144d8b7adbeb3bbc0915647a8362d1b0f91c45b43d93312e",
+  "groups": [
+    {
+      "workload": "cell",
+      "animation": "both",
+      "sources": [
+        "benchmarks/baselines/2026-10-01/animation-split/cell-both-r1.json",
+        "benchmarks/baselines/2026-10-01/animation-split/cell-both-r2.json"
+      ],
+      "samples": 2,
+      "cpu_percent_one_core": [
+        8.484547018428282,
+        8.700547580138176
+      ],
+      "median_cpu_percent_one_core": 8.592547299283229
+    },
+    {
+      "workload": "cell",
+      "animation": "logo",
+      "sources": [
+        "benchmarks/baselines/2026-10-01/animation-split/cell-logo-r1.json"
+      ],
+      "samples": 1,
+      "cpu_percent_one_core": [
+        8.622013693505016
+      ],
+      "median_cpu_percent_one_core": 8.622013693505016
+    },
+    {
+      "workload": "cell",
+      "animation": "off",
+      "sources": [
+        "benchmarks/baselines/2026-10-01/animation-split/cell-off-r1.json"
+      ],
+      "samples": 1,
+      "cpu_percent_one_core": [
+        6.456628760413917
+      ],
+      "median_cpu_percent_one_core": 6.456628760413917
+    },
+    {
+      "workload": "idle",
+      "animation": "background",
+      "sources": [
+        "benchmarks/baselines/2026-10-01/animation-split/idle-background-r1.json",
+        "benchmarks/baselines/2026-10-01/animation-split/idle-background-r2.json",
+        "benchmarks/baselines/2026-10-01/animation-split/idle-background-r4.json"
+      ],
+      "samples": 3,
+      "cpu_percent_one_core": [
+        4.11020362577762,
+        4.138262375136295,
+        4.2045442028703865
+      ],
+      "median_cpu_percent_one_core": 4.138262375136295
+    },
+    {
+      "workload": "idle",
+      "animation": "both",
+      "sources": [
+        "benchmarks/baselines/2026-10-01/animation-split/idle-both-r1.json",
+        "benchmarks/baselines/2026-10-01/animation-split/idle-both-r2.json",
+        "benchmarks/baselines/2026-10-01/animation-split/idle-both-r3.json"
+      ],
+      "samples": 3,
+      "cpu_percent_one_core": [
+        3.9381099690218706,
+        4.097304704792516,
+        4.10801416376053
+      ],
+      "median_cpu_percent_one_core": 4.097304704792516
+    },
+    {
+      "workload": "idle",
+      "animation": "logo",
+      "sources": [
+        "benchmarks/baselines/2026-10-01/animation-split/idle-logo-r1.json",
+        "benchmarks/baselines/2026-10-01/animation-split/idle-logo-r2.json",
+        "benchmarks/baselines/2026-10-01/animation-split/idle-logo-r3.json"
+      ],
+      "samples": 3,
+      "cpu_percent_one_core": [
+        4.07389696270914,
+        4.149170472399261,
+        4.273664249292416
+      ],
+      "median_cpu_percent_one_core": 4.149170472399261
+    },
+    {
+      "workload": "idle",
+      "animation": "off",
+      "sources": [
+        "benchmarks/baselines/2026-10-01/animation-split/idle-off-r1.json",
+        "benchmarks/baselines/2026-10-01/animation-split/idle-off-r2.json",
+        "benchmarks/baselines/2026-10-01/animation-split/idle-off-r3.json"
+      ],
+      "samples": 3,
+      "cpu_percent_one_core": [
+        0.014298890631990992,
+        0.014966421247341023,
+        0.015714130039218833
+      ],
+      "median_cpu_percent_one_core": 0.014966421247341023
+    }
+  ],
+  "excluded": [
+    {
+      "source": "benchmarks/baselines/2026-10-01/animation-split/idle-background-r3.json",
+      "status": "inconclusive",
+      "error": "focus changed during sampling; keep the launched window's focus stable and rerun",
+      "workload": "idle",
+      "animation": "background",
+      "cpu_percent_one_core": 4.23222697421847,
+      "focused_at_start": true
+    },
+    {
+      "source": "benchmarks/baselines/2026-10-01/animation-split/cell-logo-r2.json",
+      "status": "inconclusive",
+      "error": "focus changed during sampling; keep the launched window's focus stable and rerun",
+      "workload": "cell",
+      "animation": "logo",
+      "cpu_percent_one_core": 4.710581902458029,
+      "focused_at_start": true
+    },
+    {
+      "source": "benchmarks/baselines/2026-10-01/animation-split/cell-logo-r4.json",
+      "status": "inconclusive",
+      "error": "focus changed during sampling; keep the launched window's focus stable and rerun",
+      "workload": "cell",
+      "animation": "logo",
+      "cpu_percent_one_core": 1.3185165442458218,
+      "focused_at_start": true
+    }
+  ]
+}

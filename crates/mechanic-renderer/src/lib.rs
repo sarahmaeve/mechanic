@@ -64,6 +64,7 @@ impl Renderer {
             atlas_gen,
             cell_metrics,
             theme.background,
+            theme.logo,
         )?;
 
         Ok(Self { state, text, font_config, scale_factor })

@@ -114,7 +114,8 @@ fn convert_content(
     theme: &Theme,
     focused: bool,
 ) -> RenderGrid {
-    let RenderableContent { display_iter, selection, cursor, display_offset, .. } = content;
+    let RenderableContent { display_iter, selection, cursor, display_offset, colors, .. } = content;
+    let color = |value: &Color| resolve_with_overrides(value, colors, theme);
 
     let mut render_grid = RenderGrid::new(cols, rows);
 
@@ -148,14 +149,19 @@ fn convert_content(
             (Flags::WIDE_CHAR_SPACER, CellFlags::WIDE_CHAR_SPACER),
             (Flags::LEADING_WIDE_CHAR_SPACER, CellFlags::LEADING_WIDE_CHAR_SPACER),
             (Flags::HIDDEN, CellFlags::HIDDEN),
+            (Flags::DOUBLE_UNDERLINE, CellFlags::DOUBLE_UNDERLINE),
+            (Flags::UNDERCURL, CellFlags::UNDERCURL),
+            (Flags::DOTTED_UNDERLINE, CellFlags::DOTTED_UNDERLINE),
+            (Flags::DASHED_UNDERLINE, CellFlags::DASHED_UNDERLINE),
+            (Flags::STRIKEOUT, CellFlags::STRIKEOUT),
         ] {
             if cell.flags.contains(source) {
                 flags |= target;
             }
         }
 
-        let mut fg = resolve_color(&cell.fg, theme);
-        let mut bg = resolve_color(&cell.bg, theme);
+        let mut fg = color(&cell.fg);
+        let mut bg = color(&cell.bg);
         // Inversion belongs to source text colors. Selection and cursor colors
         // are overlays and must not be inverted again by the renderer.
         if cell.flags.contains(Flags::INVERSE) {
@@ -168,6 +174,7 @@ fn convert_content(
             fg,
             bg,
             flags,
+            underline_color: cell.underline_color().map(|value| color(&value)),
         };
 
         render_grid.cells[row * cols + col] = render_cell;
@@ -179,7 +186,7 @@ fn convert_content(
     render_grid.cursor_position = (cursor_col, cursor_row);
     render_grid.cursor_visible =
         cursor.shape != CursorShape::Hidden && cursor_col < cols && cursor_row < rows;
-    render_grid.cursor_color = theme.cursor;
+    render_grid.cursor_color = color(&Color::Named(NamedColor::Cursor));
     if render_grid
         .get(cursor_col, cursor_row)
         .is_some_and(|cell| cell.flags.contains(CellFlags::WIDE_CHAR))
@@ -205,8 +212,11 @@ fn convert_content(
                 range.contains(Point::new(cursor.point.line, Column(cursor_col + offset)))
             })
         });
-        let cursor_bg =
-            if cursor_in_selection { mechanic_config::theme::palette::AMBER } else { theme.cursor };
+        let cursor_bg = if cursor_in_selection {
+            mechanic_config::theme::palette::AMBER
+        } else {
+            render_grid.cursor_color
+        };
         render_grid.cursor_color = cursor_bg;
         for offset in 0..render_grid.cursor_width {
             if let Some(cell) = render_grid.get_mut(cursor_col + offset, cursor_row) {
@@ -254,6 +264,19 @@ fn apply_selection_highlight(
 }
 
 /// Resolve an alacritty [`Color`] to our [`Rgb`] type using the active [`Theme`].
+fn resolve_with_overrides(
+    color: &Color,
+    colors: &alacritty_terminal::term::color::Colors,
+    theme: &Theme,
+) -> Rgb {
+    let overridden = match color {
+        Color::Named(index) => colors[*index],
+        Color::Indexed(index) => colors[*index as usize],
+        Color::Spec(_) => None,
+    };
+    overridden.map_or_else(|| resolve_color(color, theme), |rgb| Rgb::new(rgb.r, rgb.g, rgb.b))
+}
+
 fn resolve_color(color: &Color, theme: &Theme) -> Rgb {
     match color {
         Color::Named(named) => resolve_named(*named, theme),
@@ -353,6 +376,53 @@ mod tests {
     use alacritty_terminal::term::Term;
     use alacritty_terminal::term::test::TermSize;
     use alacritty_terminal::vte::ansi::Processor;
+
+    #[test]
+    fn osc_palette_changes_and_resets_reach_cells_and_cursor() {
+        let mut term = parsed_term(
+            8,
+            2,
+            "\x1b]4;1;#123456\x07\x1b]10;#abcdef\x07\x1b]11;#112233\x07\x1b]12;#445566\x07\x1b[31mR\x1b[39mF",
+        );
+        let theme = Theme::default();
+        let grid = snapshot(&term, &theme, false);
+        assert_eq!(grid.cells[0].fg, Rgb::from_hex(0x123456));
+        assert_eq!(grid.cells[1].fg, Rgb::from_hex(0xabcdef));
+        assert_eq!(grid.cells[0].bg, Rgb::from_hex(0x112233));
+        assert_eq!(grid.cursor_color, Rgb::from_hex(0x445566));
+        Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new()
+            .advance(&mut term, b"\x1b]104;1\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07");
+        let grid = snapshot(&term, &theme, false);
+        assert_eq!(grid.cells[0].fg, theme.ansi.red);
+        assert_eq!(grid.cells[1].fg, theme.foreground);
+        assert_eq!(grid.cells[0].bg, theme.background);
+        assert_eq!(grid.cursor_color, theme.cursor);
+    }
+
+    #[test]
+    fn sgr_decoration_styles_and_color_are_preserved() {
+        let term = parsed_term(
+            10,
+            2,
+            "\x1b[4:1mA\x1b[4:2mB\x1b[4:3mC\x1b[4:4mD\x1b[4:5mE\x1b[9;58:2::1:2:3mF\x1b[0mG",
+        );
+        let grid = snapshot(&term, &Theme::default(), false);
+        for (col, flag) in [
+            CellFlags::UNDERLINE,
+            CellFlags::DOUBLE_UNDERLINE,
+            CellFlags::UNDERCURL,
+            CellFlags::DOTTED_UNDERLINE,
+            CellFlags::DASHED_UNDERLINE,
+            CellFlags::STRIKEOUT,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(grid.cells[col].flags.contains(flag), "column {col}");
+        }
+        assert_eq!(grid.cells[5].underline_color, Some(Rgb::new(1, 2, 3)));
+        assert!(!grid.cells[6].flags.intersects(CellFlags::UNDERLINE | CellFlags::STRIKEOUT));
+    }
 
     fn parsed_term(cols: usize, rows: usize, source: &str) -> Term<VoidListener> {
         let mut term = Term::new(Default::default(), &TermSize::new(cols, rows), VoidListener);

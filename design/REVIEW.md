@@ -13,22 +13,30 @@ retains logical source order. Atlas uploads are preflighted before instance
 construction, bounded by device limits, and include sampling gutters. Cursor
 visibility and bar/underline/wide-outline geometry are tested.
 
+Content rendering caches row geometry and uploads changed ranges. Cache keys
+include shaping identity, colors, decorations and resolved cursor geometry;
+atlas or cell-size changes invalidate all rows. Full conversion and full-surface
+presentation remain. Sparse updates improve substantially; dense geometry work
+has a measured 9–10% cache overhead (about 16–18 µs in the offscreen benchmark).
+
+Fixed: hover/held-button mouse reporting, fractional trackpad scrolling,
+underline styles and strikeout, OSC palette overrides and color query replies,
+viewport size replies, and visible IME preedit text. IME composition remains a
+display overlay until commit and clips to the current row.
+
 Remaining issues:
 
 | Priority | Finding | Location |
 | --- | --- | --- |
-| P2 | Mode 1003 hover is encoded as left-button drag; other held buttons are untracked. | `app/app.rs` |
-| P2 | SGR underline and other text decorations are not drawn. | `renderer/pipeline.rs` |
-| P2 | Fractional trackpad scroll deltas are discarded per event. | `app/app.rs` |
 | P2 | PTY output posts wake events even when one is pending. | `core/pty.rs` |
-| P2 | Terminal color/size query callbacks remain unimplemented. | `core/terminal.rs` |
 
 Text limits: terminal wrapping is by cells, not words. Shaping breaks joining at
 physical row boundaries. Offscreen bidi context is bounded to 64 KiB per side;
 truncated or discarded scrollback cannot supply full paragraph context. Color
 bitmaps use their alpha as monochrome coverage; emoji typography is not validated.
-IME candidate positioning is mapped, but preedit text is not drawn in the grid.
+IME candidate positioning is mapped; joined emoji composition uses conservative
+per-character widths.
 
-Full conversion, instance construction and uploads still occur on content frames.
 Profiling is opt-in and measures host work, not GPU completion. No new idle timers
-were added for text shaping.
+were added for text shaping or composition. Saturated PTY input queues can reject
+an entire protocol-reply batch with a warning; replies are not partially enqueued.

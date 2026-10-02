@@ -1,0 +1,34 @@
+[
+  {
+    "workload": "cell",
+    "samples": 600,
+    "full_us": 189.625,
+    "cached_us": 9.792,
+    "full_bytes": 894432,
+    "cached_bytes": 21296
+  },
+  {
+    "workload": "full",
+    "samples": 600,
+    "full_us": 176.604,
+    "cached_us": 192.4585,
+    "full_bytes": 894432,
+    "cached_bytes": 894432
+  },
+  {
+    "workload": "row",
+    "samples": 600,
+    "full_us": 189.834,
+    "cached_us": 9.5,
+    "full_bytes": 894432,
+    "cached_bytes": 21296
+  },
+  {
+    "workload": "scroll",
+    "samples": 600,
+    "full_us": 180.2705,
+    "cached_us": 198.708,
+    "full_bytes": 894432,
+    "cached_bytes": 894432
+  }
+]

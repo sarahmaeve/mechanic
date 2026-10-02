@@ -4,15 +4,15 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::Grid;
 use alacritty_terminal::Term;
-use alacritty_terminal::event::WindowSize;
+use alacritty_terminal::event::{Event as AlacrittyEvent, WindowSize};
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::cell::Cell;
-use alacritty_terminal::vte::ansi::{CursorShape, Processor};
-use mechanic_config::Config;
+use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
+use mechanic_config::{Config, Theme};
 
 use crate::PtyWaker;
 use crate::TerminalSize;
@@ -76,9 +76,16 @@ pub struct Terminal {
     pty: PtyHandle,
     event_proxy: EventProxy,
     parser: Processor,
+    /// Detect ST when its ESC and backslash arrive in separate PTY chunks.
+    previous_byte_is_escape: bool,
+    /// Conservative OSC query candidate, carried until the next terminator.
+    question_mark_since_terminator: bool,
+    /// Formatted replies for the current parser chunk, queued as one PTY write.
+    reply_buffer: Vec<u8>,
     /// Cached OSC title; empty means the application supplies its default.
     title: String,
     size: TerminalSize,
+    theme: Theme,
     pending_exit: Option<Option<std::process::ExitStatus>>,
     exit_delivered: bool,
     pending_error: Option<String>,
@@ -113,8 +120,12 @@ impl Terminal {
             pty,
             event_proxy,
             parser: Processor::new(),
+            previous_byte_is_escape: false,
+            question_mark_since_terminator: false,
+            reply_buffer: Vec::new(),
             title: String::new(),
             size,
+            theme: config.theme.clone(),
             pending_exit: None,
             exit_delivered: false,
             pending_error: None,
@@ -152,6 +163,7 @@ impl Terminal {
             self.pending_error = Some(error);
         }
         self.drain_parser_events();
+        self.flush_replies();
         let mut bytes = 0;
         let mut chunks = 0;
         let mut empty = false;
@@ -171,10 +183,8 @@ impl Terminal {
             };
             bytes += chunk.len();
             chunks += 1;
-            self.parser.advance(&mut self.term, &chunk);
+            self.parse_chunk(&chunk);
             outcome.grid_maybe_changed = true;
-            // Include protocol replies and title processing in the time budget.
-            self.drain_parser_events();
         }
         if outcome.grid_maybe_changed {
             self.pty.output_drained();
@@ -198,6 +208,58 @@ impl Terminal {
         outcome
     }
 
+    fn parse_chunk(&mut self, chunk: &[u8]) {
+        // Every OSC color query contains '?'. With no candidate carried from
+        // prior input, chunks without '?' need no intermediate palette read.
+        // This keeps dense title updates on the normal single-advance path.
+        if !self.question_mark_since_terminator && memchr::memchr(b'?', chunk).is_none() {
+            self.parser.advance(&mut self.term, chunk);
+            self.drain_parser_events();
+            if let Some(byte) = chunk.last() {
+                self.previous_byte_is_escape = *byte == b'\x1b';
+            }
+            self.flush_replies();
+            return;
+        }
+        // Resolve OSC queries before a later OSC set/reset in the same chunk
+        // changes the palette. VTE preserves incomplete escapes across slices.
+        // Drain only at BEL or actual ESC-backslash pairs. Literal backslashes
+        // in paths and JSON stay in the same parser slice as ordinary text.
+        let mut start = 0;
+        if self.previous_byte_is_escape && chunk.first() == Some(&b'\\') {
+            self.parser.advance(&mut self.term, &chunk[..1]);
+            if self.event_proxy.has_pending_query() {
+                self.drain_parser_events();
+            }
+            start = 1;
+        }
+        let mut bells = memchr::memchr_iter(b'\x07', chunk).peekable();
+        let mut sts = memchr::memmem::find_iter(chunk, b"\x1b\\").peekable();
+        loop {
+            let end = match (bells.peek(), sts.peek()) {
+                (Some(&bell), Some(&st)) if bell < st => bells.next().unwrap() + 1,
+                (_, Some(_)) => sts.next().unwrap() + 2,
+                (Some(_), None) => bells.next().unwrap() + 1,
+                (None, None) => break,
+            };
+            self.parser.advance(&mut self.term, &chunk[start..end]);
+            if self.event_proxy.has_pending_query() {
+                self.drain_parser_events();
+            }
+            start = end;
+        }
+        if start < chunk.len() {
+            self.parser.advance(&mut self.term, &chunk[start..]);
+        }
+        self.question_mark_since_terminator = (start == 0 && self.question_mark_since_terminator)
+            || memchr::memchr(b'?', &chunk[start..]).is_some();
+        self.drain_parser_events();
+        if let Some(byte) = chunk.last() {
+            self.previous_byte_is_escape = *byte == b'\x1b';
+        }
+        self.flush_replies();
+    }
+
     fn drain_parser_events(&mut self) {
         for event in self.event_proxy.drain() {
             match event {
@@ -207,19 +269,63 @@ impl Terminal {
                     self.pending_exit.get_or_insert(status);
                 }
                 TerminalEvent::PtyWrite(bytes) => {
-                    // Protocol replies must not move a scrolled viewport.
-                    if let Err(error) = self.pty.write(&bytes) {
-                        log::warn!("could not write terminal reply: {error}");
+                    self.write_reply(&bytes);
+                }
+                TerminalEvent::Query(AlacrittyEvent::ColorRequest(index, formatter)) => {
+                    if let Some(color) = self.query_color(index) {
+                        self.write_reply(formatter(color).as_bytes());
                     }
+                }
+                TerminalEvent::Query(AlacrittyEvent::TextAreaSizeRequest(formatter)) => {
+                    // The library formatter multiplies u16 dimensions. Clamp
+                    // cell sizes so unusually large viewports cannot overflow.
+                    let mut size = self.size.to_window_size();
+                    size.cell_width = size.cell_width.min(u16::MAX / size.num_cols.max(1));
+                    size.cell_height = size.cell_height.min(u16::MAX / size.num_lines.max(1));
+                    self.write_reply(formatter(size).as_bytes());
                 }
                 _ => {}
             }
         }
     }
 
+    // Protocol replies must not move a scrolled viewport.
+    fn write_reply(&mut self, bytes: &[u8]) {
+        self.reply_buffer.extend_from_slice(bytes);
+    }
+
+    fn flush_replies(&mut self) {
+        if self.reply_buffer.is_empty() {
+            return;
+        }
+        // The transport accepts or rejects the whole batch. Saturation can
+        // reject replies, just as it rejects user input; never retry a prefix.
+        if let Err(error) = self.pty.write(&self.reply_buffer) {
+            log::warn!("could not write terminal reply: {error}");
+        }
+        self.reply_buffer.clear();
+    }
+
+    /// Update the default palette used for terminal color query replies.
+    /// OSC color overrides remain active until the child resets them.
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.theme = theme.clone();
+    }
+
+    fn query_color(&self, index: usize) -> Option<Rgb> {
+        if index >= alacritty_terminal::term::color::COUNT {
+            return None;
+        }
+        self.term.colors()[index].or_else(|| theme_color(&self.theme, index))
+    }
+
     /// Feed `data` directly to the VTE parser without writing to the PTY.
     pub fn inject_local(&mut self, data: &[u8]) {
         self.parser.advance(&mut self.term, data);
+        self.question_mark_since_terminator |= memchr::memchr(b'?', data).is_some();
+        if let Some(byte) = data.last() {
+            self.previous_byte_is_escape = *byte == b'\x1b';
+        }
     }
 
     /// Send input and return the scrollback viewport to the live screen.
@@ -399,6 +505,51 @@ impl alacritty_terminal::grid::Dimensions for TermDimensions {
     }
 }
 
+/// Default colors matching the configured ANSI palette and xterm 256-color cube.
+fn theme_color(theme: &Theme, index: usize) -> Option<Rgb> {
+    let ansi = &theme.ansi;
+    let named = [
+        ansi.black,
+        ansi.red,
+        ansi.green,
+        ansi.yellow,
+        ansi.blue,
+        ansi.magenta,
+        ansi.cyan,
+        ansi.white,
+        ansi.bright_black,
+        ansi.bright_red,
+        ansi.bright_green,
+        ansi.bright_yellow,
+        ansi.bright_blue,
+        ansi.bright_magenta,
+        ansi.bright_cyan,
+        ansi.bright_white,
+    ];
+    let color = match index {
+        0..=15 => named[index],
+        16..=231 => {
+            let index = index - 16;
+            let component = |value| if value == 0 { 0 } else { 55 + value as u8 * 40 };
+            return Some(Rgb {
+                r: component(index / 36),
+                g: component(index / 6 % 6),
+                b: component(index % 6),
+            });
+        }
+        232..=255 => {
+            let value = 8 + (index - 232) as u8 * 10;
+            return Some(Rgb { r: value, g: value, b: value });
+        }
+        256 | 267 | 268 => theme.foreground,
+        257 => theme.background,
+        258 => theme.cursor,
+        259..=266 => named[index - 259],
+        _ => return None,
+    };
+    Some(Rgb { r: color.r, g: color.g, b: color.b })
+}
+
 /// Issue `TIOCSWINSZ` on the PTY master fd.
 fn winsize_from_window_size(window_size: WindowSize) -> libc::winsize {
     let ws_row = window_size.num_lines as libc::c_ushort;
@@ -437,8 +588,12 @@ mod tests {
                 pty,
                 event_proxy,
                 parser: Processor::new(),
+                previous_byte_is_escape: false,
+                question_mark_since_terminator: false,
+                reply_buffer: Vec::new(),
                 title: String::new(),
                 size,
+                theme: Theme::default(),
                 pending_exit: None,
                 exit_delivered: false,
                 pending_error: None,
@@ -450,6 +605,125 @@ mod tests {
 
     fn parse_one_chunk(terminal: &mut Terminal) -> ProcessOutcome {
         terminal.process_input_with_budget(Instant::now(), Duration::ZERO, PARSE_BYTE_BUDGET)
+    }
+
+    #[test]
+    fn color_queries_reply_with_theme_palette_and_preserve_terminators() {
+        let (mut terminal, peer) = buffered_terminal();
+        let theme = Theme {
+            foreground: mechanic_config::Rgb::new(1, 2, 3),
+            background: mechanic_config::Rgb::new(4, 5, 6),
+            cursor: mechanic_config::Rgb::new(7, 8, 9),
+            ..Theme::default()
+        };
+        terminal.set_theme(&theme);
+        peer.send(
+            b"\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07\x1b]4;1;?;16;?;231;?;232;?;255;?\x07"
+                .to_vec(),
+        );
+        terminal.process_input();
+        let expected = [
+            "\x1b]10;rgb:0101/0202/0303\x07",
+            "\x1b]11;rgb:0404/0505/0606\x1b\\",
+            "\x1b]12;rgb:0707/0808/0909\x07",
+            "\x1b]4;1;rgb:cccc/2222/0000\x07",
+            "\x1b]4;16;rgb:0000/0000/0000\x07",
+            "\x1b]4;231;rgb:ffff/ffff/ffff\x07",
+            "\x1b]4;232;rgb:0808/0808/0808\x07",
+            "\x1b]4;255;rgb:eeee/eeee/eeee\x07",
+        ]
+        .concat();
+        assert_eq!(peer.reply(), expected.as_bytes());
+    }
+
+    #[test]
+    fn color_queries_observe_osc_overrides_and_resets_in_arrival_order() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(b"\x1b]10;?\x07\x1b]10;#123456\x07\x1b]10;?\x07\x1b]110\x07\x1b]10;?\x07\x1b]4;1;#abcdef\x1b\\\x1b]4;1;?\x1b\\\x1b]104;1\x1b\\\x1b]4;1;?\x1b\\".to_vec());
+        terminal.process_input();
+        let expected = [
+            "\x1b]10;rgb:5252/e8e8/ffff\x07",
+            "\x1b]10;rgb:1212/3434/5656\x07",
+            "\x1b]10;rgb:5252/e8e8/ffff\x07",
+            "\x1b]4;1;rgb:abab/cdcd/efef\x1b\\",
+            "\x1b]4;1;rgb:cccc/2222/0000\x1b\\",
+        ]
+        .concat();
+        assert_eq!(peer.reply(), expected.as_bytes());
+    }
+
+    #[test]
+    fn color_query_preserves_parser_state_across_pty_chunks() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(b"\x1b]4;1;#1234".to_vec());
+        terminal.process_input();
+        peer.send(b"56\x07\x1b]4;1;?\x1b".to_vec());
+        terminal.process_input();
+        // ST crosses the chunk boundary; the following reset must not change
+        // the outstanding query's reply.
+        peer.send(b"\\\x1b]104;1\x07\x1b]4;1;?\x07".to_vec());
+        terminal.process_input();
+        assert_eq!(peer.reply(), b"\x1b]4;1;rgb:1212/3434/5656\x1b\\");
+        assert_eq!(peer.reply(), b"\x1b]4;1;rgb:cccc/2222/0000\x07");
+    }
+
+    #[test]
+    fn dense_queries_batch_replies_without_exhausting_pty_message_queue() {
+        let (mut terminal, peer) = buffered_terminal();
+        // More queries than the transport's 1024-message capacity still occupy
+        // one queue entry, with every reply intact and in arrival order.
+        peer.send(b"\x1b]10;?\x07\x1b[6n".repeat(1100));
+        terminal.process_input();
+        assert_eq!(peer.reply(), b"\x1b]10;rgb:5252/e8e8/ffff\x07\x1b[1;1R".repeat(1100));
+        assert!(terminal.reply_buffer.is_empty());
+    }
+
+    #[test]
+    fn query_candidate_survives_chunks_without_new_question_marks() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(b"\x1b]10;?".to_vec());
+        terminal.process_input();
+        assert!(terminal.question_mark_since_terminator);
+        peer.send(b"\x07\x1b]10;#123456\x07".to_vec());
+        terminal.process_input();
+        assert_eq!(peer.reply(), b"\x1b]10;rgb:5252/e8e8/ffff\x07");
+        assert!(!terminal.question_mark_since_terminator);
+        peer.send(b"\x1b]10;?\x07".to_vec());
+        terminal.process_input();
+        assert_eq!(peer.reply(), b"\x1b]10;rgb:1212/3434/5656\x07");
+        terminal.inject_local(b"\x1b]10;?");
+        peer.send(b"\x07\x1b]110\x07".to_vec());
+        terminal.process_input();
+        assert_eq!(peer.reply(), b"\x1b]10;rgb:1212/3434/5656\x07");
+        assert!(!terminal.question_mark_since_terminator);
+    }
+
+    #[test]
+    fn size_queries_use_resized_terminal_cell_dimensions() {
+        let (mut terminal, peer) = buffered_terminal();
+        peer.send(b"\x1b[14t\x1b[18t".to_vec());
+        terminal.process_input();
+        assert_eq!(peer.reply(), b"\x1b[4;384;640t\x1b[8;24;80t");
+        // The buffered peer has no PTY fd for the resize ioctl; update its
+        // viewport directly. The real resize path is exercised below.
+        terminal.size = TerminalSize { columns: 100, rows: 30, cell_width: 11, cell_height: 19 };
+        terminal.term.resize(TermDimensions { columns: 100, screen_lines: 30 });
+        peer.send(b"\x1b[14t\x1b[18t".to_vec());
+        terminal.process_input();
+        assert_eq!(peer.reply(), b"\x1b[4;570;1100t\x1b[8;30;100t");
+    }
+
+    #[test]
+    fn query_reply_keeps_scrollback_viewport_position() {
+        let (mut terminal, peer) = buffered_terminal();
+        terminal.inject_local(&b"line\r\n".repeat(50));
+        terminal.term.scroll_display(Scroll::Delta(5));
+        let offset = terminal.term.grid().display_offset();
+        assert!(offset > 0);
+        peer.send(b"\x1b]10;?\x07\x1b[14t".to_vec());
+        terminal.process_input();
+        assert_eq!(peer.reply(), b"\x1b]10;rgb:5252/e8e8/ffff\x07\x1b[4;384;640t");
+        assert_eq!(terminal.term.grid().display_offset(), offset);
     }
 
     #[test]

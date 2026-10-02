@@ -13,6 +13,10 @@ use crate::{
 };
 use mechanic_config::theme::Rgb;
 
+#[path = "instance_cache.rs"]
+mod instance_cache;
+use instance_cache::InstanceCache;
+
 /// Instanced vertex data. Field offsets must match the shader attributes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -110,20 +114,28 @@ const HOLLOW_CURSOR_BORDER_PX: f32 = 1.5;
 /// Per-frame shader inputs.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameUniforms {
+    /// Logo square size in physical pixels; zero hides it.
+    pub logo_size: u16,
     /// Surface opacity, from 0 (transparent) to 1 (opaque).
     pub content_opacity: f32,
     /// Glyph coverage multiplier; does not affect backgrounds.
     pub text_opacity: f32,
     /// Seconds since window creation.
     pub time: f32,
-    /// Enables continuous animation when focused and --hot-cpu is set.
-    pub shader_focused: bool,
+    pub animate_background: bool,
+    pub animate_logo: bool,
     /// OS keyboard focus, independent of the animation flag.
     pub window_focused: bool,
     /// Focus bloom progress in [0, 1]; zero when inactive.
     pub bloom_progress: f32,
     /// Logo opacity multiplier at the bloom's midpoint.
     pub bloom_peak_multiplier: f32,
+}
+
+impl FrameUniforms {
+    fn animation_flags(self) -> u32 {
+        u32::from(self.animate_background) | (u32::from(self.animate_logo) << 1)
+    }
 }
 
 /// GPU-side mirror of [`FrameUniforms`], laid out to match the `Globals` struct in `cell.wgsl`.
@@ -134,16 +146,16 @@ struct Globals {
     cell_size: [f32; 2],
     time: f32,
     content_opacity: f32,
-    /// Float representation of [`FrameUniforms::shader_focused`].
-    shader_focused: f32,
+    /// Bit 0: background; bit 1: logo.
+    animation_flags: u32,
     /// Glyph-coverage multiplier for the text path.  1.0 for focused windows; configurable idle value for blurred windows.  See [`FrameUniforms::text_opacity`].
     text_opacity: f32,
     /// Progress through the focus-gain bloom in `[0, 1]`.  See [`FrameUniforms::bloom_progress`].
     bloom_progress: f32,
     /// Peak multiplier applied to logo opacity at bloom midpoint. See [`FrameUniforms::bloom_peak_multiplier`].
     bloom_peak_multiplier: f32,
-    /// Padding to match WGSL uniform alignment.
-    _pad: [f32; 2],
+    logo_size: f32,
+    logo_style: u32,
 }
 
 /// Intermediate result of `init_surface`: device/queue/surface ready, but no pipeline or atlas yet.
@@ -182,6 +194,7 @@ pub struct RenderState {
     last_instance_count: u32,
     last_background_count: u32,
     shaped_rows: Vec<std::sync::Arc<crate::text::ShapedRow>>,
+    instance_cache: InstanceCache,
 }
 
 /// Initialise the wgpu instance, adapter, device, queue, and configured surface — without building any pipelines or textures.
@@ -282,6 +295,7 @@ impl RenderState {
         atlas_generation: u64,
         cell_metrics: CellMetrics,
         bg: Rgb,
+        logo_style: mechanic_config::theme::LogoStyle,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let size = (surface_config.width, surface_config.height);
         let surface_format = surface_config.format;
@@ -310,11 +324,12 @@ impl RenderState {
             cell_size: [cell_size.0, cell_size.1],
             time: 0.0,
             content_opacity: 1.0,
-            shader_focused: 1.0,
+            animation_flags: 0,
             text_opacity: 1.0,
             bloom_progress: 0.0,
             bloom_peak_multiplier: 1.0,
-            _pad: [0.0; 2],
+            logo_size: f32::from(mechanic_config::theme::DEFAULT_LOGO_SIZE),
+            logo_style: logo_style as u32,
         };
 
         let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -342,7 +357,7 @@ impl RenderState {
             mapped_at_creation: false,
         });
 
-        let logo = Logo::new(&device, &queue);
+        let logo = Logo::new(&device, &queue, logo_style);
 
         let bind_group = Self::make_bind_group(
             &device,
@@ -374,6 +389,7 @@ impl RenderState {
             last_instance_count: 0,
             last_background_count: 0,
             shaped_rows: Vec::new(),
+            instance_cache: InstanceCache::default(),
         })
     }
 
@@ -438,16 +454,18 @@ impl RenderState {
             cell_size: [self.cell_size.0, self.cell_size.1],
             time: 0.0,
             content_opacity: 1.0,
-            shader_focused: 1.0,
+            animation_flags: 0,
             text_opacity: 1.0,
             bloom_progress: 0.0,
             bloom_peak_multiplier: 1.0,
-            _pad: [0.0; 2],
+            logo_size: f32::from(mechanic_config::theme::DEFAULT_LOGO_SIZE),
+            logo_style: self.logo.style as u32,
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         self.last_instance_count = 0;
         self.shaped_rows.clear();
+        self.instance_cache.invalidate();
     }
 
     /// Update the cell size used by the pipeline's globals uniform.
@@ -455,6 +473,7 @@ impl RenderState {
         self.cell_size = cell_size;
         self.last_instance_count = 0;
         self.shaped_rows.clear();
+        self.instance_cache.invalidate();
     }
 
     /// Render a single frame.
@@ -474,11 +493,12 @@ impl RenderState {
             cell_size: [self.cell_size.0, self.cell_size.1],
             time: uniforms.time,
             content_opacity: uniforms.content_opacity,
-            shader_focused: if uniforms.shader_focused { 1.0 } else { 0.0 },
+            animation_flags: uniforms.animation_flags(),
             text_opacity: uniforms.text_opacity,
             bloom_progress: uniforms.bloom_progress,
             bloom_peak_multiplier: uniforms.bloom_peak_multiplier,
-            _pad: [0.0; 2],
+            logo_size: f32::from(uniforms.logo_size),
+            logo_style: self.logo.style as u32,
         };
         let uniform_upload_started = profiling.then(Instant::now);
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
@@ -489,23 +509,42 @@ impl RenderState {
 
         let atlas_started = profiling.then(Instant::now);
         self.prepare_layout(grid, text_renderer, font_config);
-        if let Err(error) =
-            text_renderer.prepare_frame(&self.shaped_rows, &self.device, &self.queue)
-        {
+        let atlas_result =
+            text_renderer.prepare_frame(&self.shaped_rows, &self.device, &self.queue);
+        if let Err(error) = &atlas_result {
             log::error!("glyph atlas preparation failed: {error}");
+            self.instance_cache.invalidate();
         }
         if let (Some(profile), Some(started)) = (&mut profile, atlas_started) {
             profile.atlas_ns = started.elapsed().as_nanos();
         }
 
         let instances_started = profiling.then(Instant::now);
-        let (instances, background_count) = build_instances(
+        let current_gen = text_renderer.atlas_generation();
+        let mut uploads = self.instance_cache.update(
             grid,
             &self.shaped_rows,
-            text_renderer,
-            self.cell_size,
+            (current_gen, self.cell_size),
             uniforms.window_focused,
+            |row, reusable| {
+                build_instances_for_rows(
+                    grid,
+                    &self.shaped_rows,
+                    text_renderer,
+                    self.cell_size,
+                    uniforms.window_focused,
+                    row..row + 1,
+                    reusable,
+                )
+                .0
+            },
         );
+        if atlas_result.is_err() {
+            self.instance_cache.invalidate();
+        }
+        let instances = &self.instance_cache.instances;
+        let background_count = self.instance_cache.background_count;
+        let instance_count = instances.len();
 
         if let (Some(profile), Some(started)) = (&mut profile, instances_started) {
             profile.instances_ns = started.elapsed().as_nanos();
@@ -513,7 +552,6 @@ impl RenderState {
         }
 
         let atlas_binding_started = profiling.then(Instant::now);
-        let current_gen = text_renderer.atlas_generation();
         let atlas_changed = current_gen != self.last_atlas_generation;
         if atlas_changed {
             self.update_atlas_bind_group(&text_renderer.atlas_view);
@@ -525,10 +563,9 @@ impl RenderState {
         }
 
         let instance_upload_started = profiling.then(Instant::now);
-        let instance_bytes = bytemuck::cast_slice::<GpuInstance, u8>(&instances);
 
-        if instances.len() > self.instance_capacity {
-            let new_cap = instances.len().next_power_of_two();
+        if instance_count > self.instance_capacity {
+            let new_cap = instance_count.next_power_of_two();
             self.instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("instance_buf"),
                 size: (new_cap * mem::size_of::<GpuInstance>()) as u64,
@@ -536,12 +573,25 @@ impl RenderState {
                 mapped_at_creation: false,
             });
             self.instance_capacity = new_cap;
+            uploads.clear();
+            uploads.push(0..instance_count);
         }
 
-        self.queue.write_buffer(&self.instance_buf, 0, instance_bytes);
+        let mut uploaded_bytes = 0;
+        for range in uploads {
+            let bytes = bytemuck::cast_slice::<GpuInstance, u8>(
+                &self.instance_cache.instances[range.clone()],
+            );
+            self.queue.write_buffer(
+                &self.instance_buf,
+                (range.start * mem::size_of::<GpuInstance>()) as u64,
+                bytes,
+            );
+            uploaded_bytes += bytes.len();
+        }
         if let (Some(profile), Some(started)) = (&mut profile, instance_upload_started) {
             profile.upload_ns += started.elapsed().as_nanos();
-            profile.upload_bytes += instance_bytes.len();
+            profile.upload_bytes += uploaded_bytes;
         }
 
         let surface_started = profiling.then(Instant::now);
@@ -604,7 +654,7 @@ impl RenderState {
             pass.set_vertex_buffer(0, self.instance_buf.slice(..));
             pass.draw(0..6, 0..background_count);
             pass.set_pipeline(&self.foreground_pipeline);
-            pass.draw(0..6, background_count..instances.len() as u32);
+            pass.draw(0..6, background_count..instance_count as u32);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -614,7 +664,7 @@ impl RenderState {
             profile.log(true);
         }
 
-        self.last_instance_count = instances.len() as u32;
+        self.last_instance_count = instance_count as u32;
         self.last_background_count = background_count;
         true
     }
@@ -630,11 +680,12 @@ impl RenderState {
             cell_size: [self.cell_size.0, self.cell_size.1],
             time: uniforms.time,
             content_opacity: uniforms.content_opacity,
-            shader_focused: if uniforms.shader_focused { 1.0 } else { 0.0 },
+            animation_flags: uniforms.animation_flags(),
             text_opacity: uniforms.text_opacity,
             bloom_progress: uniforms.bloom_progress,
             bloom_peak_multiplier: uniforms.bloom_peak_multiplier,
-            _pad: [0.0; 2],
+            logo_size: f32::from(uniforms.logo_size),
+            logo_style: self.logo.style as u32,
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
@@ -768,6 +819,7 @@ mod tests {
 #[path = "pipeline_gpu_tests.rs"]
 mod gpu_tests;
 
+#[cfg(test)]
 fn build_instances(
     grid: &RenderGrid,
     shaped_rows: &[std::sync::Arc<crate::text::ShapedRow>],
@@ -775,10 +827,32 @@ fn build_instances(
     cell_size: (f32, f32),
     focused: bool,
 ) -> (Vec<GpuInstance>, u32) {
-    let total_cells = grid.cols * grid.rows;
-    let mut instances: Vec<GpuInstance> = Vec::with_capacity(total_cells * 2);
+    build_instances_for_rows(
+        grid,
+        shaped_rows,
+        text_renderer,
+        cell_size,
+        focused,
+        0..grid.rows,
+        Vec::new(),
+    )
+}
 
-    for (row, shaped) in shaped_rows.iter().enumerate().take(grid.rows) {
+fn build_instances_for_rows(
+    grid: &RenderGrid,
+    shaped_rows: &[std::sync::Arc<crate::text::ShapedRow>],
+    text_renderer: &TextRenderer,
+    cell_size: (f32, f32),
+    focused: bool,
+    rows: std::ops::Range<usize>,
+    mut instances: Vec<GpuInstance>,
+) -> (Vec<GpuInstance>, u32) {
+    let total_cells = grid.cols * rows.len();
+    let include_cursor = rows.end == grid.rows;
+    instances.clear();
+    instances.reserve(total_cells * 2);
+
+    for (row, shaped) in shaped_rows.iter().enumerate().take(rows.end).skip(rows.start) {
         for col in 0..grid.cols {
             let Some(cell) = grid.get(col, row) else {
                 continue;
@@ -807,7 +881,7 @@ fn build_instances(
     let background_count = instances.len() as u32;
 
     // Paint every background first so wide glyphs and combining marks survive.
-    for (row, shaped) in shaped_rows.iter().enumerate() {
+    for (row, shaped) in shaped_rows.iter().enumerate().take(rows.end).skip(rows.start) {
         let mut logical_cols = vec![0; grid.cols];
         for (logical, &visual) in shaped.visual_cols.iter().enumerate() {
             logical_cols[visual] = logical;
@@ -868,12 +942,26 @@ fn build_instances(
                 col = next;
             }
         }
+        for col in 0..grid.cols {
+            let cell = &grid.cells[row * grid.cols + col];
+            if cell.flags.intersects(
+                crate::grid::CellFlags::HIDDEN | crate::grid::CellFlags::LEADING_WIDE_CHAR_SPACER,
+            ) {
+                continue;
+            }
+            append_decorations(
+                &mut instances,
+                cell,
+                [shaped.visual_cols[col] as u32, row as u32],
+                cell_size,
+            );
+        }
     }
 
     {
         use crate::grid::CursorStyle;
         let (cx, cy) = grid.cursor_position;
-        if grid.cursor_visible && grid.get(cx, cy).is_some() {
+        if include_cursor && grid.cursor_visible && grid.get(cx, cy).is_some() {
             let cursor_color = grid.cursor_color;
             let cell_w = cell_size.0 * grid.cursor_width as f32;
             let cell_h = cell_size.1;
@@ -908,6 +996,50 @@ fn build_instances(
     }
 
     (instances, background_count)
+}
+
+fn append_decorations(
+    instances: &mut Vec<GpuInstance>,
+    cell: &crate::grid::RenderCell,
+    position: [u32; 2],
+    size: (f32, f32),
+) {
+    use crate::grid::CellFlags;
+    let thickness = (size.1 / 18.0).max(1.0);
+    let mut push = |y: f32, height: f32, kind, color| {
+        instances.push(GpuInstance {
+            cell_pos: position,
+            atlas_uv: [0.0; 4],
+            fg_color: rgb_to_f32(color),
+            bg_color: [0.0; 4],
+            glyph_offset: [0.0, y.max(0.0)],
+            glyph_size: [size.0, height],
+            use_atlas: kind,
+            _pad: [0; 3],
+        })
+    };
+    if cell.flags.contains(CellFlags::UNDERLINE) {
+        let color = cell.underline_color.unwrap_or_else(|| effective_fg(cell));
+        let y = size.1 - thickness * 2.0;
+        if cell.flags.contains(CellFlags::DOUBLE_UNDERLINE) {
+            push(y - thickness * 2.0, thickness, 4, color);
+            push(y, thickness, 4, color);
+        } else if cell.flags.contains(CellFlags::UNDERCURL) {
+            push(size.1 - thickness * 4.0, thickness * 3.0, 7, color);
+        } else {
+            let kind = if cell.flags.contains(CellFlags::DOTTED_UNDERLINE) {
+                5
+            } else if cell.flags.contains(CellFlags::DASHED_UNDERLINE) {
+                6
+            } else {
+                4
+            };
+            push(y, thickness, kind, color);
+        }
+    }
+    if cell.flags.contains(CellFlags::STRIKEOUT) {
+        push(size.1 * 0.5, thickness, 4, effective_fg(cell));
+    }
 }
 
 fn create_cell_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {

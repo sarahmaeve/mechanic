@@ -20,3 +20,4 @@ mechanic-core.workspace = true
 mechanic-renderer.workspace = true
 mechanic-config.workspace = true
 arboard.workspace = true
+unicode-width = "0.2"

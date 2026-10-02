@@ -296,3 +296,80 @@ Release binary SHA-256:
 Validation: 339 workspace/all-target tests, three explicit Metal checks, strict
 Clippy, formatting and release build. PTY tests need native terminal access;
 sandbox-denied runs were rerun successfully without weakening assertions.
+
+## Independent logo and background animation (2026-10-01)
+
+Logo and background animation can be controlled independently; both now default off.
+These measurements use the shaded atom logo at 180 physical pixels, Menlo 14,
+opaque content, the default window size, and one release binary. Each sample
+settles for three seconds and measures five seconds of app process CPU. Every
+accepted sample stayed focused. Modes ran sequentially in rotated order.
+
+| Animation | Idle CPU, median of 3 | CPU during 20 Hz cell updates | Update samples |
+| --- | ---: | ---: | ---: |
+| Off (default) | 0.015% | 6.46% | 1 |
+| Logo only | 4.15% | 8.62% | 1 |
+| Background only | 4.14% | Not measured | 0 |
+| Both | 4.10% | 8.59% | 2 |
+
+Percentages are fractions of one CPU core. Logo-only and combined animation
+show no useful app CPU difference in these short samples. Disabling the
+background controls appearance but does not remove the cost of presenting
+animation frames. GPU time, WindowServer CPU, energy and achieved frame rate
+were not measured, so these numbers cannot establish GPU savings.
+
+The update measurements are preliminary: two logo runs lost focus, leaving
+only one accepted logo sample. One idle background attempt also lost focus.
+All three rejected runs remain marked inconclusive and excluded from the table.
+Window dimensions were not instrumented; no resize was requested. Render-stage
+tracing was off. Update samples measure app CPU while changing a cell at 20 Hz,
+not presentation latency or frame-stage durations.
+
+[Raw samples and summary](baselines/2026-10-01/animation-split/summary.json).
+Measured release binary SHA-256:
+`2ebb9a555cc4b3bb144d8b7adbeb3bbc0915647a8362d1b0f91c45b43d93312e`.
+
+## Row geometry cache and terminal correctness fixes (2026-10-01)
+
+Row caching reuses unchanged geometry and only uploads changed buffer ranges.
+When a row's glyph count changes, shifted foreground ranges are uploaded too.
+All backgrounds still draw before foregrounds, with the cursor last, preserving
+glyph overhangs and cursor visibility. Full snapshot conversion and whole-surface
+presentation remain.
+
+Three release offscreen runs used a 121×42 grid, Menlo 14 at 2× scale, 20 warmup
+iterations and 200 measured iterations per workload per run. Full and cached
+construction alternated order on identical shaped input, with byte-for-byte
+geometry verification each iteration. Medians below pool 600 observations.
+
+| Workload | Full geometry | Cached geometry | Full upload bytes | Cached upload bytes |
+| --- | ---: | ---: | ---: | ---: |
+| One cell | 189.6 µs | 9.8 µs | 894,432 | 21,296 |
+| One row | 189.8 µs | 9.5 µs | 894,432 | 21,296 |
+| Full repaint | 176.6 µs | 192.5 µs | 894,432 | 894,432 |
+| Scroll | 180.3 µs | 198.7 µs | 894,432 | 894,432 |
+
+Sparse geometry is about 19–20× faster with 42× fewer upload bytes for these
+fixed-glyph-count ASCII updates. Dense geometry has 9–10% overhead, approximately
+16–18 µs, from maintaining and assembling cached rows. This is a deliberate
+tradeoff for small updates; it is not an improvement in full-screen geometry.
+Upload counts are planned byte ranges, not timed GPU transfers. Shaping, grid
+conversion, presentation, GPU completion and app CPU are outside these timings.
+
+The GUI baseline attempt was inconclusive: its window stopped presenting before
+the CPU sample, leaving no complete profiled frames. It is retained as
+`before-cell.json` and excluded from comparisons. No app CPU speedup is claimed.
+`geometry-initial.csv` and `geometry-reuse.csv` retain the allocation-tuning runs;
+the table uses only `geometry-final-1.csv` through `geometry-final-3.csv`.
+
+[Raw timings and summary](baselines/2026-10-01/row-cache/summary.json).
+Release app SHA-256:
+`d942f61d10018b360d2a255cc1192b7acfd36f5ca4a1354af1f230e68954d5b8`.
+
+Correctness coverage now includes mouse hover/held-button reporting, fractional
+scrolling, underline styles/color and strikeout, OSC palette display/query/reset
+ordering, viewport replies, IME composition, and partial-upload equivalence after
+cursor, bidi, text, decoration and dimension changes. Independent review caught
+and fixed cursor visual-position invalidation and wide IME selection coloring.
+Validation: 368 workspace/all-target tests, eight explicit serial Metal checks,
+strict Clippy, formatting and release build.

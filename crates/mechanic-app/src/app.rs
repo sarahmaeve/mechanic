@@ -14,7 +14,7 @@ use crate::mouse as mouse_enc;
 use crate::scheduling::{FramePacer, FrameSchedule, ParseQueue};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -40,12 +40,15 @@ struct AppState {
     /// Current physical mouse cursor position in pixels.
     mouse_position: (f64, f64),
     mouse_pressed: bool,
+    held_buttons: mouse_enc::HeldButtons,
+    scroll_accumulator: mouse_enc::ScrollAccumulator,
     /// Press position in physical pixels, used to distinguish clicks from drags.
     mouse_press_origin: Option<(f64, f64)>,
     /// Last drag selection, pasted by middle-click independently of the clipboard.
     primary_selection: Option<String>,
     /// Current keyboard modifier state (updated via `ModifiersChanged`).
     modifiers: ModifiersState,
+    preedit: Option<crate::preedit::Preedit>,
     clipboard: Option<arboard::Clipboard>,
     /// Instant when this window was created (used to compute the `time` uniform).
     start_time: std::time::Instant,
@@ -56,7 +59,7 @@ struct AppState {
     /// `None` while running; `Some(None)` means exited without a known status.
     exit_status: Option<Option<std::process::ExitStatus>>,
     /// Last reported mouse cell, used to deduplicate motion events.
-    last_mouse_report: Option<(u32, u32)>,
+    last_mouse_report: Option<(u32, u32, mouse_enc::MouseButton)>,
     /// Rebuild cell instances when true; otherwise reuse the cached frame.
     content_dirty: bool,
     /// Forced frames after focus changes, to accommodate AppKit redraw coalescing.
@@ -86,8 +89,7 @@ pub struct App {
     windows: HashMap<WindowId, AppState>,
     /// Wakes the main loop from PTY reader threads.
     proxy: EventLoopProxy<UserEvent>,
-    /// Enables continuous shader animation via `--hot-cpu`.
-    hot_cpu: bool,
+    animations: mechanic_config::theme::AnimationConfig,
     /// Allows forwarding mouse events when the terminal program requests them.
     mouse_tracking: bool,
     pending_parsers: ParseQueue<WindowId>,
@@ -97,14 +99,15 @@ impl App {
     pub fn new(
         config: Config,
         proxy: EventLoopProxy<UserEvent>,
-        hot_cpu: bool,
+        mut animations: mechanic_config::theme::AnimationConfig,
         mouse_tracking: bool,
     ) -> Self {
+        animations.logo &= config.theme.logo_size > 0;
         Self {
             config,
             windows: HashMap::new(),
             proxy,
-            hot_cpu,
+            animations,
             mouse_tracking,
             pending_parsers: ParseQueue::new(),
         }
@@ -134,7 +137,18 @@ impl App {
         if state.exit_status.is_some() {
             return;
         }
+        let mouse_protocol = state.terminal.mouse_protocol();
         let outcome = state.terminal.process_input();
+        if state.terminal.mouse_protocol() != mouse_protocol
+            || outcome.child_exit.is_some()
+            || outcome.io_error.is_some()
+        {
+            state.scroll_accumulator.reset();
+            state.last_mouse_report = None;
+        }
+        if outcome.child_exit.is_some() || outcome.io_error.is_some() {
+            state.preedit = None;
+        }
         state.content_dirty |= outcome.grid_maybe_changed;
 
         // Fatal transport failures freeze the window even if a child exit was
@@ -183,6 +197,8 @@ impl App {
     fn apply_font_size(state: &mut AppState, new_size: f32) {
         let new_metrics = state.renderer.set_font_size(new_size);
         state.cell_metrics = new_metrics;
+        state.scroll_accumulator.reset();
+        state.last_mouse_report = None;
         state.current_font_size = new_size;
 
         let inner = state.window.inner_size();
@@ -272,9 +288,12 @@ impl App {
             cell_metrics,
             mouse_position: (0.0, 0.0),
             mouse_pressed: false,
+            held_buttons: mouse_enc::HeldButtons::default(),
+            scroll_accumulator: mouse_enc::ScrollAccumulator::default(),
             mouse_press_origin: None,
             primary_selection: None,
             modifiers: ModifiersState::empty(),
+            preedit: None,
             clipboard,
             start_time: now,
             focused: true,
@@ -283,7 +302,7 @@ impl App {
             last_mouse_report: None,
             content_dirty: true,
             focus_redraw_frames: FOCUS_REDRAW_BURST_FRAMES,
-            focus_gain_at: self.hot_cpu.then_some(now),
+            focus_gain_at: self.animations.logo.then_some(now),
             bloom_start: None,
             frame_pacer: FramePacer::new(now),
         };
@@ -379,13 +398,11 @@ impl ApplicationHandler<UserEvent> for App {
         };
 
         if state.content_dirty
-            && (matches!(
-                &event,
-                WindowEvent::MouseInput { .. }
-                    | WindowEvent::MouseWheel { .. }
-                    | WindowEvent::Ime(Ime::Preedit(..))
-            ) || (state.mouse_pressed || state.terminal.mouse_protocol().report_motion)
-                && matches!(&event, WindowEvent::CursorMoved { .. }))
+            && (matches!(&event, WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. })
+                || (state.mouse_pressed
+                    || state.held_buttons.motion_button() != mouse_enc::MouseButton::None
+                    || state.terminal.mouse_protocol().report_motion)
+                    && matches!(&event, WindowEvent::CursorMoved { .. }))
         {
             let grid =
                 crate::convert::convert_grid(&state.terminal, &self.config.theme, state.focused);
@@ -399,6 +416,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::Resized(size) => {
+                state.scroll_accumulator.reset();
+                state.last_mouse_report = None;
                 state.renderer.resize((size.width, size.height));
 
                 let new_term_size =
@@ -410,6 +429,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::ModifiersChanged(mods) => {
+                if state.modifiers != mods.state() {
+                    state.scroll_accumulator.reset();
+                    state.last_mouse_report = None;
+                }
                 state.modifiers = mods.state();
             }
 
@@ -420,9 +443,15 @@ impl ApplicationHandler<UserEvent> for App {
                 state.focus_redraw_frames = FOCUS_REDRAW_BURST_FRAMES;
 
                 if focused {
-                    state.focus_gain_at = self.hot_cpu.then(Instant::now);
+                    state.focus_gain_at = self.animations.logo.then(Instant::now);
                     state.bloom_start = None;
                 } else {
+                    state.preedit = None;
+                    state.held_buttons.clear();
+                    state.mouse_pressed = false;
+                    state.mouse_press_origin = None;
+                    state.last_mouse_report = None;
+                    state.scroll_accumulator.reset();
                     // Cancel pending bloom; let an already committed animation finish.
                     state.focus_gain_at = None;
                 }
@@ -541,36 +570,46 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Ime(ime_event) => {
                 match ime_event {
                     Ime::Commit(text) => {
+                        state.preedit = None;
                         if let Err(e) = state.terminal.write_to_pty(text.as_bytes()) {
                             log::warn!("PTY IME commit failed: {e}");
                         }
                     }
                     Ime::Preedit(text, cursor) => {
-                        let (cx, cy) = {
-                            let content = state.terminal.renderable_content();
-                            let cp = content.cursor.point;
-                            (cp.column.0, cp.line.0 + content.display_offset as i32)
-                        };
+                        state.preedit = crate::preedit::Preedit::new(text, cursor);
+                        let mut grid = crate::convert::convert_grid(
+                            &state.terminal,
+                            &self.config.theme,
+                            state.focused && state.preedit.is_none(),
+                        );
+                        if let Some(preedit) = &state.preedit {
+                            preedit.overlay(&mut grid, &self.config.theme);
+                        }
+                        state.renderer.prepare_layout(&grid);
+                        let (cx, cy) = grid.cursor_position;
                         let cw = state.cell_metrics.cell_width;
                         let ch = state.cell_metrics.cell_height;
-                        if cy >= 0 && (cy as usize) < state.terminal.screen_lines() {
-                            let px =
-                                state.renderer.visual_column(cx, cy as usize) as f64 * cw as f64;
+                        if cx < grid.cols && cy < grid.rows {
+                            let px = state.renderer.visual_column(cx, cy) as f64 * cw as f64;
                             let py = cy as f64 * ch as f64;
                             state.window.set_ime_cursor_area(
                                 winit::dpi::PhysicalPosition::new(px, py),
                                 winit::dpi::PhysicalSize::new(cw as f64, ch as f64),
                             );
                         }
-                        let _ = (text, cursor);
                     }
-                    Ime::Enabled | Ime::Disabled => {}
+                    Ime::Disabled => state.preedit = None,
+                    Ime::Enabled => {}
                 }
                 state.content_dirty = true;
                 state.request_redraw();
             }
 
             WindowEvent::MouseInput { state: btn_state, button: win_button, .. } => {
+                if let Some(button) = winit_to_mouse_button(win_button) {
+                    state.held_buttons.update(button, btn_state == ElementState::Pressed);
+                    state.last_mouse_report = None;
+                }
                 let route = route_mouse(
                     state.terminal.mouse_protocol(),
                     self.mouse_tracking,
@@ -598,9 +637,8 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Err(e) = state.terminal.write_to_pty(&bytes) {
                             log::warn!("PTY mouse write failed: {e}");
                         }
-                        if matches!(win_button, MouseButton::Left) {
-                            state.mouse_pressed = matches!(btn_state, ElementState::Pressed);
-                        }
+                        state.mouse_pressed = false;
+                        state.mouse_press_origin = None;
                     }
                     if matches!(btn_state, ElementState::Released) {
                         state.last_mouse_report = None;
@@ -631,6 +669,9 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             ElementState::Released => {
                                 state.mouse_pressed = false;
+                                if state.mouse_press_origin.is_none() {
+                                    return;
+                                }
                                 const CLICK_DRAG_THRESHOLD_PX: f64 = 5.0;
                                 let was_drag = state
                                     .mouse_press_origin
@@ -704,8 +745,9 @@ impl ApplicationHandler<UserEvent> for App {
 
                 if let Some(sgr) = route {
                     let proto = state.terminal.mouse_protocol();
-                    let emit = proto.report_motion || (proto.report_drag && state.mouse_pressed);
-                    if emit {
+                    if let Some(btn) =
+                        state.held_buttons.report_button(proto.report_motion, proto.report_drag)
+                    {
                         let (col, row) = grid_coords_1based(
                             state.mouse_position,
                             &state.cell_metrics,
@@ -716,9 +758,8 @@ impl ApplicationHandler<UserEvent> for App {
                             state.renderer.logical_column((col - 1) as usize, (row - 1) as usize).0
                                 as u32
                                 + 1;
-                        if state.last_mouse_report != Some((col, row)) {
-                            state.last_mouse_report = Some((col, row));
-                            let btn = mouse_enc::MouseButton::Left;
+                        if state.last_mouse_report != Some((col, row, btn)) {
+                            state.last_mouse_report = Some((col, row, btn));
                             let bytes = mouse_enc::encode(
                                 sgr,
                                 btn,
@@ -734,6 +775,8 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
+
+                state.last_mouse_report = None;
 
                 if state.mouse_pressed {
                     let cw = state.cell_metrics.cell_width;
@@ -758,19 +801,23 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
-            WindowEvent::MouseWheel { delta, .. } => {
-                let cell_height = state.cell_metrics.cell_height;
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as i32,
-                    MouseScrollDelta::PixelDelta(pos) => (pos.y / cell_height as f64) as i32,
-                };
-
+            WindowEvent::MouseWheel { delta, phase, .. } => {
                 let route = route_mouse(
                     state.terminal.mouse_protocol(),
                     self.mouse_tracking,
                     state.modifiers.shift_key(),
                     state.exit_status.is_some(),
                 );
+                let lines = state.scroll_accumulator.lines(
+                    delta,
+                    phase,
+                    route,
+                    state.modifiers,
+                    state.cell_metrics.cell_height,
+                );
+                if lines == 0 {
+                    return;
+                }
 
                 if let Some(sgr) = route {
                     if lines != 0 {
@@ -812,7 +859,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if lines > 0 {
                     state.terminal.scroll_up(lines as usize);
                 } else if lines < 0 {
-                    state.terminal.scroll_down((-lines) as usize);
+                    state.terminal.scroll_down(lines.unsigned_abs() as usize);
                 }
                 state.content_dirty = true;
                 state.request_redraw();
@@ -822,7 +869,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.frame_pacer.is_occluded() {
                     return;
                 }
-                render_frame(state, &self.config, self.hot_cpu);
+                render_frame(state, &self.config, self.animations);
                 // Renderer reports no presentation result. Pace from the end
                 // of each render attempt, including a skipped surface frame.
                 state.frame_pacer.rendered(Instant::now());
@@ -856,12 +903,16 @@ impl ApplicationHandler<UserEvent> for App {
                 focus_redraw_frames: state.focus_redraw_frames,
                 bloom_start: state.bloom_start,
             };
-            let anim = classify_animation(input, self.hot_cpu, state.frame_pacer.last_render());
+            let anim = classify_animation(
+                input,
+                self.animations.enabled(),
+                state.frame_pacer.last_render(),
+            );
             let mut animation_deadline = match anim {
                 AnimationState::Active { next_frame } => Some(next_frame),
                 AnimationState::Idle => None,
             };
-            if self.hot_cpu
+            if self.animations.logo
                 && state.exit_status.is_none()
                 && let Some(gain) = state.focus_gain_at
             {
@@ -1016,32 +1067,39 @@ fn cmd_shortcut(c: &str) -> Option<CmdShortcut> {
 }
 
 /// Render one frame for `state` using the current focus / grid state.
-fn render_frame(state: &mut AppState, config: &Config, hot_cpu: bool) {
+fn render_frame(
+    state: &mut AppState,
+    config: &Config,
+    animations: mechanic_config::theme::AnimationConfig,
+) {
     let now = Instant::now();
 
     let dwell = Duration::from_millis(config.theme.opacity.bloom_dwell_ms as u64);
     let duration = Duration::from_millis(config.theme.opacity.bloom_duration_ms as u64);
-    if hot_cpu
+    if animations.logo
         && let Some(start) = maybe_commit_bloom(state.focus_gain_at, state.bloom_start, dwell, now)
     {
         state.bloom_start = Some(start);
         state.focus_gain_at = None;
     }
-    let bloom_progress =
-        if hot_cpu { compute_bloom_progress(state.bloom_start, duration, now) } else { 0.0 };
+    let bloom_progress = if animations.logo {
+        compute_bloom_progress(state.bloom_start, duration, now)
+    } else {
+        0.0
+    };
 
     let opacity = opacity_for_focus(state.focused, &config.theme.opacity);
     let text_opacity = text_opacity_for_focus(state.focused, &config.theme.opacity);
 
     let time = state.start_time.elapsed().as_secs_f32();
 
-    let shader_focused = state.focused && hot_cpu;
-
     let uniforms = FrameUniforms {
+        logo_size: config.theme.logo_size,
         content_opacity: opacity,
         text_opacity,
         time,
-        shader_focused,
+        animate_background: state.focused && animations.background,
+        animate_logo: state.focused && animations.logo,
         window_focused: state.focused,
         bloom_progress,
         bloom_peak_multiplier: config.theme.opacity.bloom_peak_multiplier,
@@ -1054,7 +1112,14 @@ fn render_frame(state: &mut AppState, config: &Config, hot_cpu: bool) {
         let conversion_started =
             log::log_enabled!(target: "mechanic_render_profile", log::Level::Trace)
                 .then(Instant::now);
-        let grid = crate::convert::convert_grid(&state.terminal, &config.theme, state.focused);
+        let mut grid = crate::convert::convert_grid(
+            &state.terminal,
+            &config.theme,
+            state.focused && state.preedit.is_none(),
+        );
+        if let Some(preedit) = &state.preedit {
+            preedit.overlay(&mut grid, &config.theme);
+        }
         if let Some(started) = conversion_started {
             let conversion_ns = started.elapsed().as_nanos();
             log::trace!(target: "mechanic_render_profile",
@@ -1123,24 +1188,28 @@ enum AnimationState {
 struct AnimationInputs {
     is_alive: bool,
     focused: bool,
-    /// Forced redraws remaining after a focus change, independent of `hot_cpu`.
+    /// Forced redraws remaining after a focus change, independent of animation settings.
     focus_redraw_frames: u8,
     /// Keep scheduling until a final frame clears even an expired bloom.
     bloom_start: Option<Instant>,
 }
 
-/// Frozen windows are idle; focus bursts, bloom, and focused `hot_cpu` need frames.
-fn classify_animation(input: AnimationInputs, hot_cpu: bool, now: Instant) -> AnimationState {
+/// Frozen windows are idle; focus bursts, bloom, and enabled effects need frames.
+fn classify_animation(
+    input: AnimationInputs,
+    animations_enabled: bool,
+    now: Instant,
+) -> AnimationState {
     if !input.is_alive {
         return AnimationState::Idle;
     }
     if input.focus_redraw_frames > 0 {
         return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
-    if hot_cpu && input.bloom_start.is_some() {
+    if animations_enabled && input.bloom_start.is_some() {
         return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
-    if input.focused && hot_cpu {
+    if input.focused && animations_enabled {
         return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
     AnimationState::Idle
@@ -1168,6 +1237,12 @@ fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId, waker: Pty
     match Terminal::new(config, size, waker) {
         Ok(new_term) => {
             state.terminal = new_term;
+            state.preedit = None;
+            state.held_buttons.clear();
+            state.scroll_accumulator.reset();
+            state.last_mouse_report = None;
+            state.mouse_pressed = false;
+            state.mouse_press_origin = None;
             state.exit_status = None;
             state.content_dirty = true;
             let occluded = state.frame_pacer.is_occluded();
@@ -1394,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn anim_focused_quiet_default_is_idle() {
+    fn anim_focused_with_animations_disabled_is_idle() {
         assert_eq!(
             classify_animation(inputs(true, true), false, Instant::now()),
             AnimationState::Idle
@@ -1506,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn quiet_default_ignores_bloom_state() {
+    fn disabled_animations_ignore_bloom_state() {
         assert_eq!(
             classify_animation(inputs_with_bloom(true, true), false, Instant::now()),
             AnimationState::Idle

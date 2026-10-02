@@ -1,5 +1,5 @@
 //! macOS GUI process CPU measurement with a controlled Rust PTY peer.
-//! Usage: app_cpu APP_BINARY OUTPUT.json [--animate] [--settle-secs N]
+//! Usage: app_cpu APP_BINARY OUTPUT.json [--animation off|logo|background|both] [--settle-secs N]
 //!        [--sample-secs N] [--label LABEL]
 //!        [--workload idle|cell|row|full|scroll|unicode|atlas|text-fixture]
 //!        [--render-profile] [--fixture-cursor block|bar|underline|hidden]
@@ -100,6 +100,8 @@ mod macos {
         app: PathBuf,
         output: PathBuf,
         animate: bool,
+        animation: &'static str,
+        logo: &'static str,
         settle: u64,
         sample: u64,
         label: Option<String>,
@@ -111,7 +113,7 @@ mod macos {
     impl Options {
         fn parse() -> Result<Self> {
             let mut args = env::args_os().skip(1);
-            let usage = "usage: app_cpu APP_BINARY OUTPUT.json [--animate] [--settle-secs N] [--sample-secs N] [--label LABEL] [--workload idle|cell|row|full|scroll|unicode|atlas|text-fixture] [--render-profile] [--fixture-cursor block|bar|underline|hidden]";
+            let usage = "usage: app_cpu APP_BINARY OUTPUT.json [--animation off|logo|background|both] [--logo triangle|atom] [--animate] [--settle-secs N] [--sample-secs N] [--label LABEL] [--workload idle|cell|row|full|scroll|unicode|atlas|text-fixture] [--render-profile] [--fixture-cursor block|bar|underline|hidden]";
             let app = args.next().ok_or(usage)?;
             if app == "--help" || app == "-h" {
                 println!(
@@ -123,6 +125,8 @@ mod macos {
                 app: fs::canonicalize(app)?,
                 output: args.next().ok_or(usage)?.into(),
                 animate: false,
+                animation: "off",
+                logo: "triangle",
                 settle: 3,
                 sample: 5,
                 label: None,
@@ -132,7 +136,31 @@ mod macos {
             };
             while let Some(arg) = args.next() {
                 match arg.to_str().ok_or("non-UTF8 option")? {
-                    "--animate" => options.animate = true,
+                    "--animate" => {
+                        options.animate = true;
+                        options.animation = "both";
+                    }
+                    "--animation" => {
+                        options.animation = match args.next().as_deref().and_then(|v| v.to_str()) {
+                            Some("off") => "off",
+                            Some("logo") => "logo",
+                            Some("background") => "background",
+                            Some("both") => "both",
+                            _ => {
+                                return Err(
+                                    "animation must be off, logo, background, or both".into()
+                                );
+                            }
+                        };
+                        options.animate = options.animation != "off";
+                    }
+                    "--logo" => {
+                        options.logo = match args.next().as_deref().and_then(|v| v.to_str()) {
+                            Some("triangle") => "triangle",
+                            Some("atom") => "atom",
+                            _ => return Err("logo must be triangle or atom".into()),
+                        };
+                    }
                     "--render-profile" => options.render_profile = true,
                     "--fixture-cursor" => {
                         options.fixture_cursor = Some(FixtureCursor::parse(
@@ -180,11 +208,8 @@ mod macos {
             if !(1..=20).contains(&options.settle) || !(1..=30).contains(&options.sample) {
                 return Err("settle seconds must be 1..=20; sample seconds must be 1..=30".into());
             }
-            if options.animate && (options.workload != Workload::Idle || options.render_profile) {
-                return Err(
-                    "--animate requires idle workload and cannot be combined with --render-profile"
-                        .into(),
-                );
+            if options.animate && options.render_profile {
+                return Err("animation cannot be combined with --render-profile".into());
             }
             if options.fixture_cursor.is_some() && options.workload != Workload::TextFixture {
                 return Err("--fixture-cursor applies only to --workload text-fixture".into());
@@ -425,7 +450,10 @@ mod macos {
         fs::write(
             config_dir.join("mechanic.toml"),
             format!(
-                "[font]\nfamily = \"Menlo\"\nsize = 14.0\n[shell]\nprogram = {peer_string}\n[theme.opacity]\ntitle_bar_opacity = 1.0\ncontent_active_opacity = 1.0\ncontent_idle_opacity = 1.0\ntext_idle_opacity = 1.0\n"
+                "[font]\nfamily = \"Menlo\"\nsize = 14.0\n[shell]\nprogram = {peer_string}\n[theme]\nlogo = \"{}\"\nlogo_size = 180\n[theme.animation]\nlogo = {}\nbackground = {}\n[theme.opacity]\ntitle_bar_opacity = 1.0\ncontent_active_opacity = 1.0\ncontent_idle_opacity = 1.0\ntext_idle_opacity = 1.0\n",
+                options.logo,
+                matches!(options.animation, "logo" | "both"),
+                matches!(options.animation, "background" | "both"),
             ),
         )?;
         let mut command = Command::new(&options.app);
@@ -446,7 +474,7 @@ mod macos {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(File::create(log_path)?);
-        if options.animate {
+        if options.animation == "both" {
             command.arg("--hot-cpu");
         }
         let mut app = OwnedApp(command.spawn()?);
@@ -795,6 +823,9 @@ mod macos {
                 "font_family": "Menlo", "font_size_points": 14,
                 "opacity": 1.0, "pty_peer": "controlled Rust peer",
                 "workload": options.workload.name(),
+                "animation": options.animation,
+                "logo": options.logo,
+                "logo_size_physical_pixels": 180,
                 "workload_update_interval_ms": if options.workload == Workload::Idle { None } else { Some(50) },
                 "workload_alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
                 "fixture_cursor": if options.workload == Workload::TextFixture { Some(options.fixture_cursor.unwrap_or(FixtureCursor::Block).name()) } else { None },

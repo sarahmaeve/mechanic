@@ -4,6 +4,7 @@ mod app;
 mod convert;
 mod input;
 mod mouse;
+mod preedit;
 mod scheduling;
 
 use app::UserEvent;
@@ -26,7 +27,8 @@ fn main() {
         .expect("failed to build event loop");
     let proxy = event_loop.create_proxy();
 
-    let mut app = app::App::new(config, proxy, cli.hot_cpu, cli.mouse_tracking);
+    let animations = cli.animations(config.theme.animation);
+    let mut app = app::App::new(config, proxy, animations, cli.mouse_tracking);
     event_loop.run_app(&mut app).expect("event loop exited with error");
 }
 
@@ -35,13 +37,27 @@ fn main() {
 struct Cli {
     /// Enable continuous shader animation while focused.
     hot_cpu: bool,
+    animate_background: Option<bool>,
+    animate_logo: Option<bool>,
     /// Forward mouse events when requested by the terminal program.
     mouse_tracking: bool,
 }
 
 impl Default for Cli {
     fn default() -> Self {
-        Self { hot_cpu: false, mouse_tracking: true }
+        Self { hot_cpu: false, animate_background: None, animate_logo: None, mouse_tracking: true }
+    }
+}
+
+impl Cli {
+    fn animations(
+        self,
+        config: mechanic_config::theme::AnimationConfig,
+    ) -> mechanic_config::theme::AnimationConfig {
+        mechanic_config::theme::AnimationConfig {
+            background: self.animate_background.unwrap_or(config.background || self.hot_cpu),
+            logo: self.animate_logo.unwrap_or(config.logo || self.hot_cpu),
+        }
     }
 }
 
@@ -53,7 +69,15 @@ where
     let mut cli = Cli::default();
     for arg in args {
         match arg.as_str() {
-            "--animate" | "--hot-cpu" => cli.hot_cpu = true,
+            "--animate" | "--hot-cpu" => {
+                cli.hot_cpu = true;
+                cli.animate_background = Some(true);
+                cli.animate_logo = Some(true);
+            }
+            "--animate-background" => cli.animate_background = Some(true),
+            "--animate-logo" => cli.animate_logo = Some(true),
+            "--no-animate-background" => cli.animate_background = Some(false),
+            "--no-animate-logo" => cli.animate_logo = Some(false),
             "--no-mouse-tracking" => cli.mouse_tracking = false,
             "-h" | "--help" => {
                 print_help();
@@ -81,8 +105,12 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("    --animate              Animate the gradient and logo while focused");
-    println!("                           (paced at about 30 FPS; off by default)");
+    println!("                           (paced at about 30 FPS; animations off by default)");
     println!("    --hot-cpu              Alias for --animate");
+    println!("    --animate-background   Animate background lighting while focused");
+    println!("    --animate-logo         Animate the logo while focused");
+    println!("    --no-animate-background Disable background animation");
+    println!("    --no-animate-logo      Disable logo animation and focus glow");
     println!("    --no-mouse-tracking    Keep selection and middle-click paste local");
     println!("    -h, --help             Show this help and exit");
     println!("    -V, --version          Show version and exit");
@@ -106,6 +134,28 @@ fn config_path(
 mod tests {
     use super::{Cli, config_path, parse_args};
     use std::ffi::OsString;
+
+    #[test]
+    fn animation_overrides_are_independent_and_last_flag_wins() {
+        let defaults = mechanic_config::theme::AnimationConfig::default();
+        let effective = Cli::default().animations(defaults);
+        assert!(!effective.logo);
+        assert!(!effective.background);
+        for (flags, logo, background) in [
+            (vec!["--no-animate-logo", "--animate-background"], false, true),
+            (vec!["--animate", "--no-animate-background"], true, false),
+            (vec!["--no-animate-logo", "--animate"], true, true),
+            (vec!["--no-animate-logo"], false, false),
+        ] {
+            let effective = parse_args(flags.into_iter().map(str::to_owned)).animations(defaults);
+            assert_eq!(effective.logo, logo);
+            assert_eq!(effective.background, background);
+        }
+        let configured = mechanic_config::theme::AnimationConfig { logo: false, background: true };
+        let effective = Cli::default().animations(configured);
+        assert!(!effective.logo);
+        assert!(effective.background);
+    }
 
     #[test]
     fn xdg_takes_priority() {

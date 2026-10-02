@@ -1,5 +1,6 @@
 //! Terminal event handling.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener as AlacrittyEventListener};
@@ -19,29 +20,45 @@ pub enum TerminalEvent {
     Exit(Option<std::process::ExitStatus>),
     /// Protocol response bytes to write back to the PTY.
     PtyWrite(Vec<u8>),
+    /// Color or viewport query, carrying the parser's protocol formatter.
+    Query(AlacrittyEvent),
 }
 
 /// Cloneable queue for events emitted by the terminal parser.
 #[derive(Clone)]
 pub struct EventProxy {
     events: Arc<Mutex<Vec<TerminalEvent>>>,
+    query_pending: Arc<AtomicBool>,
 }
 
 impl EventProxy {
     pub fn new() -> Self {
-        Self { events: Arc::new(Mutex::new(Vec::new())) }
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+            query_pending: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Drain all pending events, returning them in arrival order.
     pub fn drain(&self) -> Vec<TerminalEvent> {
         // Poison recovery is safe: push/take leave the event Vec valid.
         let mut guard = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        // Clear under the queue mutex so a concurrent query push cannot be
+        // erased after it has set the flag for its newly queued event.
+        self.query_pending.store(false, Ordering::Release);
         std::mem::take(&mut *guard)
+    }
+
+    pub(crate) fn has_pending_query(&self) -> bool {
+        self.query_pending.load(Ordering::Acquire)
     }
 
     fn push(&self, event: TerminalEvent) {
         let mut guard = self.events.lock().unwrap_or_else(|p| p.into_inner());
         guard.push(event);
+        if matches!(guard.last(), Some(TerminalEvent::Query(_))) {
+            self.query_pending.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -61,6 +78,10 @@ impl AlacrittyEventListener for EventProxy {
             AlacrittyEvent::Exit => self.push(TerminalEvent::Exit(None)),
             AlacrittyEvent::ChildExit(status) => self.push(TerminalEvent::Exit(Some(status))),
             AlacrittyEvent::PtyWrite(text) => self.push(TerminalEvent::PtyWrite(text.into_bytes())),
+            event
+            @ (AlacrittyEvent::ColorRequest(..) | AlacrittyEvent::TextAreaSizeRequest(..)) => {
+                self.push(TerminalEvent::Query(event))
+            }
             _ => {}
         }
     }
@@ -143,6 +164,48 @@ mod tests {
         proxy.push(TerminalEvent::Bell);
         let events = clone.drain();
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn pending_query_flag_is_shared_and_cleared_by_drain() {
+        let proxy = EventProxy::new();
+        let clone = proxy.clone();
+        proxy.send_event(AlacrittyEvent::Title("title".into()));
+        proxy.send_event(AlacrittyEvent::PtyWrite("reply".into()));
+        assert!(!clone.has_pending_query());
+        clone.send_event(AlacrittyEvent::ColorRequest(256, Arc::new(|_| "color".into())));
+        assert!(proxy.has_pending_query());
+        assert_eq!(proxy.drain().len(), 3);
+        assert!(!clone.has_pending_query());
+        proxy.send_event(AlacrittyEvent::TextAreaSizeRequest(Arc::new(|_| "size".into())));
+        assert!(clone.has_pending_query());
+        clone.drain();
+        assert!(!proxy.has_pending_query());
+    }
+
+    #[test]
+    fn concurrent_query_push_and_drain_keep_flag_consistent() {
+        let proxy = EventProxy::new();
+        let clone = proxy.clone();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                clone.send_event(AlacrittyEvent::ColorRequest(256, Arc::new(|_| String::new())));
+                std::thread::yield_now();
+            }
+        });
+        let mut count = 0;
+        while !producer.is_finished() {
+            {
+                let guard = proxy.events.lock().unwrap();
+                assert_eq!(proxy.has_pending_query(), !guard.is_empty());
+            }
+            count += proxy.drain().len();
+            std::thread::yield_now();
+        }
+        producer.join().unwrap();
+        count += proxy.drain().len();
+        assert_eq!(count, 1000);
+        assert!(!proxy.has_pending_query());
     }
 
     #[test]

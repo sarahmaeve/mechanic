@@ -46,11 +46,12 @@ fn cursor_geometry_and_overlapping_glyph_coverage() {
         cell_size: [16.0, 16.0],
         time: 0.0,
         content_opacity: 0.5,
-        shader_focused: 0.0,
+        animation_flags: 0,
         text_opacity: 1.0,
         bloom_progress: 0.0,
         bloom_peak_multiplier: 1.0,
-        _pad: [0.0; 2],
+        logo_size: 270.0,
+        logo_style: 0,
     };
     let globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
@@ -293,7 +294,7 @@ fn triangle_logo_is_static_by_default_and_pulses_when_enabled() {
     });
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
-    let logo = crate::logo::Logo::new(&device, &queue);
+    let logo = crate::logo::Logo::new(&device, &queue, mechanic_config::theme::LogoStyle::Triangle);
     let instances = [GpuInstance {
         cell_pos: [0, 0],
         atlas_uv: [0.0; 4],
@@ -304,38 +305,403 @@ fn triangle_logo_is_static_by_default_and_pulses_when_enabled() {
         use_atlas: 0,
         _pad: [0; 3],
     }];
-    let render = |time, enabled| {
-        let mut globals = fixture_globals((320, 320), (320.0, 320.0));
-        globals.time = time;
-        globals.shader_focused = if enabled { 1.0 } else { 0.0 };
-        render_fixture_pixels(&device, &queue, &logo.view, Some(&logo.view), globals, &instances, 1)
-    };
-    let quiet = render(0.0, false);
-    assert_eq!(quiet, render(1.0, false), "quiet logo changed with time");
-    let first = render(0.0, true);
-    let next = render(1.0, true);
-    let center = (135 * 320 + 169) * 4 + 1;
-    let glow = i16::from(first[center]) - i16::from(quiet[center]);
-    assert!((5..=15).contains(&glow), "central glow missing or too bright: {glow}");
-    // Pulse positions on each perimeter at t=0 and t=1, in SVG coordinates.
-    for (pixels, other, positions) in [
-        (&first, &next, [(24.0, 36.0), (154.0, 111.0)]),
-        (&next, &first, [(180.0, 36.0), (128.0, 66.0)]),
-    ] {
-        for (x, y) in positions {
-            let x = (34.0 + x * 270.0 / 256.0) as usize;
-            let y = (34.0 + y * 270.0 / 256.0) as usize;
-            let index = (y * 320 + x) * 4;
-            assert!(
-                i16::from(pixels[index]) - i16::from(other[index]) > 100,
-                "pulse missing or stationary at {x},{y}"
-            );
+    for logo_size in [270.0, f32::from(mechanic_config::theme::DEFAULT_LOGO_SIZE)] {
+        let coordinate =
+            |value: f32| (320.0 - 16.0 - logo_size + value * logo_size / 256.0) as usize;
+        let render = |time, enabled| {
+            let mut globals = fixture_globals((320, 320), (320.0, 320.0));
+            globals.logo_size = logo_size;
+            globals.time = time;
+            globals.animation_flags = if enabled { 2 } else { 0 };
+            render_fixture_pixels(
+                &device,
+                &queue,
+                &logo.view,
+                Some(&logo.view),
+                globals,
+                &instances,
+                1,
+            )
+        };
+        let quiet = render(0.0, false);
+        assert_eq!(quiet, render(1.0, false), "quiet logo changed with time");
+        let first = render(0.0, true);
+        let next = render(1.0, true);
+        let center = (coordinate(96.0) * 320 + coordinate(128.0)) * 4 + 1;
+        let glow = i16::from(first[center]) - i16::from(quiet[center]);
+        assert!((5..=15).contains(&glow), "central glow missing or too bright: {glow}");
+        // Pulse positions on each perimeter at t=0 and t=1, in SVG coordinates.
+        for (pixels, other, positions) in [
+            (&first, &next, [(24.0, 36.0), (154.0, 111.0)]),
+            (&next, &first, [(180.0, 36.0), (128.0, 66.0)]),
+        ] {
+            for (x, y) in positions {
+                let x = coordinate(x);
+                let y = coordinate(y);
+                let index = (y * 320 + x) * 4;
+                assert!(
+                    i16::from(pixels[index]) - i16::from(other[index]) > 100,
+                    "pulse missing or stationary at {x},{y}"
+                );
+            }
+        }
+        if let Some(path) = std::env::var_os("MECHANIC_LOGO_FIXTURE_PNG") {
+            let size = resvg::tiny_skia::IntSize::from_wh(320, 320).unwrap();
+            resvg::tiny_skia::Pixmap::from_vec(first, size).unwrap().save_png(path).unwrap();
         }
     }
-    if let Some(path) = std::env::var_os("MECHANIC_LOGO_FIXTURE_PNG") {
-        let size = resvg::tiny_skia::IntSize::from_wh(320, 320).unwrap();
-        resvg::tiny_skia::Pixmap::from_vec(first, size).unwrap().save_png(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a Metal device; run explicitly on macOS"]
+fn atom_logo_keeps_three_electrons_on_their_orbits() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::METAL,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let logo = crate::logo::Logo::new(&device, &queue, mechanic_config::theme::LogoStyle::Atom);
+    let instances = [GpuInstance {
+        cell_pos: [0, 0],
+        atlas_uv: [0.0; 4],
+        fg_color: [0.0; 4],
+        bg_color: [0.02, 0.03, 0.04, 1.0],
+        glyph_offset: [0.0; 2],
+        glyph_size: [0.0; 2],
+        use_atlas: 0,
+        _pad: [0; 3],
+    }];
+    for logo_size in [270.0, f32::from(mechanic_config::theme::DEFAULT_LOGO_SIZE)] {
+        let coordinate = |value: f32| (304.0 - logo_size + value * logo_size / 256.0) as usize;
+        let render_flags = |time, animation_flags, size| {
+            let mut globals = fixture_globals((320, 320), (320.0, 320.0));
+            globals.logo_style = logo.style as u32;
+            globals.logo_size = size;
+            globals.time = time;
+            globals.animation_flags = animation_flags;
+            render_fixture_pixels(
+                &device,
+                &queue,
+                &logo.view,
+                Some(&logo.view),
+                globals,
+                &instances,
+                1,
+            )
+        };
+        let render = |time, enabled, size| render_flags(time, if enabled { 2 } else { 0 }, size);
+        let quiet = render(0.0, false, logo_size);
+        assert_eq!(quiet, render(2.0, false, logo_size), "quiet atom changed with time");
+        let first = render(0.0, true, logo_size);
+        let next = render(1.0, true, logo_size);
+        let hidden = render(0.0, false, 0.0);
+        let background_only = render_flags(1.0, 1, logo_size);
+        let corner = (310 * 320 + 310) * 4;
+        assert_eq!(
+            &first[corner..corner + 3],
+            &next[corner..corner + 3],
+            "logo animation changed background lighting"
+        );
+        assert_ne!(
+            &quiet[corner..corner + 3],
+            &background_only[corner..corner + 3],
+            "background animation did not change lighting"
+        );
+        let center = (coordinate(128.0) * 320 + coordinate(128.0)) * 4 + 1;
+        assert!(quiet[center] > hidden[center] + 50, "nucleus missing");
+        for (time, pixels, other) in [(0.0, &first, &next), (1.0, &next, &first)] {
+            for (phase, angle) in [
+                (time * 1.2_f32, 0.0_f32),
+                (2.1 - time, std::f32::consts::FRAC_PI_3),
+                (4.2 + time * 0.85, -std::f32::consts::FRAC_PI_3),
+            ] {
+                let x = 104.0 * phase.cos();
+                let y = 38.0 * phase.sin();
+                let px = coordinate(128.0 + x * angle.cos() - y * angle.sin());
+                let py = coordinate(128.0 + x * angle.sin() + y * angle.cos());
+                let index = (py * 320 + px) * 4;
+                if time == 1.0 {
+                    assert!(
+                        (i16::from(background_only[index]) - i16::from(quiet[index])).abs() <= 5,
+                        "background animation moved an electron"
+                    );
+                }
+                assert!(
+                    i16::from(pixels[index]) - i16::from(other[index]) > 65,
+                    "electron missing or stationary at {px},{py}"
+                );
+            }
+        }
+        if let Some(path) = std::env::var_os("MECHANIC_ATOM_FIXTURE_PNG") {
+            let size = resvg::tiny_skia::IntSize::from_wh(320, 320).unwrap();
+            resvg::tiny_skia::Pixmap::from_vec(first, size).unwrap().save_png(path).unwrap();
+        }
     }
+}
+
+#[test]
+#[ignore = "requires a Metal device; run explicitly on macOS"]
+fn decorations_render_and_conceal_with_text() {
+    use crate::grid::CellFlags;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::METAL,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let config = mechanic_config::FontConfig::default();
+    let mut text = TextRenderer::new(&device, &queue, &config, 1.0);
+    let mut grid = RenderGrid::new(6, 2);
+    grid.cursor_visible = false;
+    for (col, style) in [
+        CellFlags::UNDERLINE,
+        CellFlags::DOUBLE_UNDERLINE,
+        CellFlags::UNDERCURL,
+        CellFlags::DOTTED_UNDERLINE,
+        CellFlags::DASHED_UNDERLINE,
+        CellFlags::STRIKEOUT,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for row in 0..2 {
+            let cell = grid.get_mut(col, row).unwrap();
+            cell.flags = style | if col == 5 { CellFlags::empty() } else { CellFlags::UNDERLINE };
+            if row == 1 {
+                cell.flags |= CellFlags::HIDDEN;
+            }
+            cell.fg = Rgb::new(255, 0, 0);
+            if col == 0 {
+                cell.underline_color = Some(Rgb::new(0, 255, 0));
+            }
+        }
+    }
+    let shaped = text.shape_grid(&grid, &config);
+    text.prepare_frame(&shaped, &device, &queue).unwrap();
+    let (instances, backgrounds) = build_instances(&grid, &shaped, &text, (32.0, 36.0), true);
+    let pixels = render_fixture_pixels(
+        &device,
+        &queue,
+        &text.atlas_view,
+        None,
+        fixture_globals((192, 72), (32.0, 36.0)),
+        &instances,
+        backgrounds,
+    );
+    for col in 0usize..6 {
+        let channel = if col == 0 { 1 } else { 0 };
+        let count = |row: usize| {
+            (row * 36..(row + 1) * 36)
+                .flat_map(|y| (col * 32..(col + 1) * 32).map(move |x| (y * 192 + x) * 4 + channel))
+                .filter(|index| pixels[*index] > 100)
+                .count()
+        };
+        assert!(count(0) > 8, "decoration {col} missing");
+        assert_eq!(count(1), 0, "concealed decoration {col} visible");
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal device; run explicitly on macOS"]
+fn row_cache_matches_full_rebuild_after_layout_and_cursor_changes() {
+    use crate::grid::{CellFlags, CursorStyle};
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::METAL,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let config = mechanic_config::FontConfig { family: "Menlo".into(), ..Default::default() };
+    let mut text = TextRenderer::new(&device, &queue, &config, 1.0);
+    let metrics = text.cell_metrics();
+    let mut cell_size = (metrics.cell_width, metrics.cell_height);
+    let mut cache = InstanceCache::default();
+    let mut uploaded = Vec::new();
+    let mut grid = RenderGrid::new(16, 5);
+    for (row, sample) in
+        ["السلام عليكم", "café Straße", "Україна Россия", "日本語", "abc"].iter().enumerate()
+    {
+        let mut col = 0;
+        for ch in sample.chars() {
+            let wide = unicode_width::UnicodeWidthChar::width(ch) == Some(2);
+            let cell = grid.get_mut(col, row).unwrap();
+            cell.character = ch;
+            if wide {
+                cell.flags = CellFlags::WIDE_CHAR;
+                grid.get_mut(col + 1, row).unwrap().flags = CellFlags::WIDE_CHAR_SPACER;
+            }
+            col += if wide { 2 } else { 1 };
+        }
+    }
+    let mut saved_cells = grid.cells.clone();
+    for frame in 0..16 {
+        match frame {
+            1 => grid.cells[18].fg = Rgb::new(255, 0, 0),
+            2 => grid.cells[18].zerowidth.push('\u{301}'),
+            3 => grid.cells[18].character = ' ',
+            4 => grid.cells[18].character = 'Ж',
+            5 => {
+                grid.cursor_style = CursorStyle::Bar;
+                grid.cursor_position = (2, 2);
+            }
+            6 => grid.cursor_position = (2, 1),
+            7 => grid.cursor_visible = false,
+            8 => {
+                grid.wrapped[0] = true;
+                grid.bidi_prefix = "عربي ".into();
+            }
+            9 => {
+                grid.cells[18].flags |=
+                    CellFlags::UNDERLINE | CellFlags::DOUBLE_UNDERLINE | CellFlags::STRIKEOUT
+            }
+            10 => {
+                grid.cells[18].underline_color = Some(Rgb::new(0, 255, 0));
+            }
+            11 => {
+                saved_cells.clone_from(&grid.cells);
+                cache.invalidate();
+            }
+            12 => {
+                cell_size.0 += 1.0;
+            }
+            13 => grid = RenderGrid::new(8, 3),
+            14 => {
+                grid.cursor_style = CursorStyle::Bar;
+                grid.cursor_position = (0, 0);
+                for (col, ch) in "العربية".chars().enumerate() {
+                    grid.cells[col].character = ch;
+                }
+            }
+            15 => grid.cells[0].character = 'X',
+            _ => {}
+        }
+        let shaped = text.shape_grid(&grid, &config);
+        text.prepare_frame(&shaped, &device, &queue).unwrap();
+        let epoch = (text.atlas_generation(), cell_size);
+        let ranges = cache.update(&grid, &shaped, epoch, true, |row, reusable| {
+            build_instances_for_rows(&grid, &shaped, &text, cell_size, true, row..row + 1, reusable)
+                .0
+        });
+        uploaded.resize(cache.instances.len(), GpuInstance::zeroed());
+        for range in &ranges {
+            uploaded[range.clone()].copy_from_slice(&cache.instances[range.clone()]);
+        }
+        let (expected, backgrounds) = build_instances(&grid, &shaped, &text, cell_size, true);
+        assert_eq!(cache.background_count, backgrounds);
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&uploaded),
+            bytemuck::cast_slice::<_, u8>(&expected),
+            "frame {frame}"
+        );
+        assert!(
+            cache
+                .update(&grid, &shaped, epoch, true, |_, _| panic!("unchanged row rebuilt"))
+                .is_empty()
+        );
+        if frame == 11 {
+            assert_eq!(grid.cells, saved_cells);
+        }
+    }
+}
+
+#[test]
+#[ignore = "offscreen geometry benchmark; run explicitly with --release on macOS"]
+fn row_cache_geometry_benchmark() {
+    use std::io::Write;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::METAL,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let config = mechanic_config::FontConfig { family: "Menlo".into(), ..Default::default() };
+    let mut text = TextRenderer::new(&device, &queue, &config, 2.0);
+    let metrics = text.cell_metrics();
+    let cell_size = (metrics.cell_width, metrics.cell_height);
+    let path = std::env::var_os("MECHANIC_ROW_CACHE_BENCH_CSV")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("mechanic-row-cache.csv"));
+    let mut csv = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    writeln!(csv, "workload,iteration,full_ns,cached_ns,full_upload_bytes,cached_upload_bytes")
+        .unwrap();
+    for workload in ["cell", "row", "full", "scroll"] {
+        let mut grid = RenderGrid::new(121, 42);
+        grid.cursor_visible = false;
+        for (index, cell) in grid.cells.iter_mut().enumerate() {
+            cell.character = (b'A' + (index % 26) as u8) as char;
+        }
+        let mut cache = InstanceCache::default();
+        for iteration in 0..220 {
+            let ch = (b'A' + (iteration % 26) as u8) as char;
+            match workload {
+                "cell" => grid.cells[21 * 121 + 60].character = ch,
+                "row" => {
+                    for cell in &mut grid.cells[21 * 121..22 * 121] {
+                        cell.character = ch;
+                    }
+                }
+                "full" => {
+                    for cell in &mut grid.cells {
+                        cell.character = ch;
+                    }
+                }
+                "scroll" => {
+                    grid.cells.rotate_left(121);
+                    for cell in &mut grid.cells[41 * 121..] {
+                        cell.character = ch;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let shaped = text.shape_grid(&grid, &config);
+            text.prepare_frame(&shaped, &device, &queue).unwrap();
+            let epoch = (text.atlas_generation(), cell_size);
+            let full = || {
+                let start = Instant::now();
+                let instances = build_instances(&grid, &shaped, &text, cell_size, true).0;
+                let ns = start.elapsed().as_nanos();
+                (ns, std::hint::black_box(instances))
+            };
+            let mut cached = || {
+                let start = Instant::now();
+                let ranges = cache.update(&grid, &shaped, epoch, true, |row, reusable| {
+                    build_instances_for_rows(
+                        &grid,
+                        &shaped,
+                        &text,
+                        cell_size,
+                        true,
+                        row..row + 1,
+                        reusable,
+                    )
+                    .0
+                });
+                (start.elapsed().as_nanos(), ranges)
+            };
+            let ((full_ns, expected), (cached_ns, ranges)) = if iteration % 2 == 0 {
+                (full(), cached())
+            } else {
+                let result = cached();
+                (full(), result)
+            };
+            assert_eq!(
+                bytemuck::cast_slice::<_, u8>(&cache.instances),
+                bytemuck::cast_slice::<_, u8>(&expected)
+            );
+            if iteration >= 20 {
+                writeln!(
+                    csv,
+                    "{workload},{iteration},{full_ns},{cached_ns},{},{}",
+                    expected.len() * mem::size_of::<GpuInstance>(),
+                    ranges.iter().map(|r| r.len()).sum::<usize>() * mem::size_of::<GpuInstance>()
+                )
+                .unwrap();
+            }
+        }
+    }
+    csv.flush().unwrap();
+    eprintln!("row-cache geometry timings: {}", path.display());
 }
 
 fn fixture_globals(size: (u32, u32), cell_size: (f32, f32)) -> Globals {
@@ -344,11 +710,12 @@ fn fixture_globals(size: (u32, u32), cell_size: (f32, f32)) -> Globals {
         cell_size: [cell_size.0, cell_size.1],
         time: 0.0,
         content_opacity: 1.0,
-        shader_focused: 0.0,
+        animation_flags: 0,
         text_opacity: 1.0,
         bloom_progress: 0.0,
         bloom_peak_multiplier: 1.0,
-        _pad: [0.0; 2],
+        logo_size: 270.0,
+        logo_style: 0,
     }
 }
 

@@ -2,6 +2,30 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_LOGO_SIZE: u16 = 180;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u32)]
+pub enum LogoStyle {
+    #[default]
+    Triangle = 0,
+    Atom = 1,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnimationConfig {
+    pub background: bool,
+    pub logo: bool,
+}
+
+impl AnimationConfig {
+    pub fn enabled(self) -> bool {
+        self.background || self.logo
+    }
+}
+
 /// A 24-bit RGB color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rgb {
@@ -145,6 +169,10 @@ impl Default for OpacityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Theme {
+    pub animation: AnimationConfig,
+    pub logo: LogoStyle,
+    /// Logo square size in physical pixels; zero hides it.
+    pub logo_size: u16,
     /// Default foreground (text) color.
     pub foreground: Rgb,
     /// Default background color.
@@ -163,6 +191,9 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
+            logo_size: DEFAULT_LOGO_SIZE,
+            animation: AnimationConfig::default(),
+            logo: LogoStyle::default(),
             foreground: palette::ELECTRIC,
             background: palette::BLACK,
             cursor: palette::CELESTE,
@@ -177,6 +208,24 @@ impl Default for Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logo_selection_roundtrips_with_size() {
+        let theme: Theme = toml::from_str("logo = 'atom'\nlogo_size = 240").unwrap();
+        assert_eq!(theme.logo, LogoStyle::Atom);
+        assert_eq!(theme.logo_size, 240);
+        let restored: Theme = toml::from_str(&toml::to_string(&theme).unwrap()).unwrap();
+        assert_eq!(restored.logo, LogoStyle::Atom);
+        assert_eq!(Theme::default().logo, LogoStyle::Triangle);
+        assert!(toml::from_str::<Theme>("logo = 'unknown'").is_err());
+        let defaults: Theme = toml::from_str("").unwrap();
+        assert!(!defaults.animation.logo);
+        assert!(!defaults.animation.background);
+        let configured: Theme =
+            toml::from_str("[animation]\nlogo = false\nbackground = true").unwrap();
+        assert!(!configured.animation.logo);
+        assert!(configured.animation.background);
+    }
 
     #[test]
     fn rgb_from_hex_roundtrip() {

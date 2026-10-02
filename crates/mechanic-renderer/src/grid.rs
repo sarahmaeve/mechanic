@@ -3,12 +3,12 @@ use mechanic_config::theme::Rgb;
 bitflags::bitflags! {
     /// Text-decoration and rendering flags for a single terminal cell.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct CellFlags: u8 {
+    pub struct CellFlags: u16 {
         /// Bold text weight.
         const BOLD      = 1 << 0;
         /// Italic text style.
         const ITALIC    = 1 << 1;
-        /// Underline requested; decoration rendering is not implemented.
+        /// Underline requested; single unless a style flag is set.
         const UNDERLINE = 1 << 2;
         /// Swap foreground and background colors.
         const INVERSE   = 1 << 3;
@@ -20,6 +20,11 @@ bitflags::bitflags! {
         const HIDDEN = 1 << 6;
         /// Padding before a wide character wrapped to the next row.
         const LEADING_WIDE_CHAR_SPACER = 1 << 7;
+        const DOUBLE_UNDERLINE = 1 << 8;
+        const UNDERCURL = 1 << 9;
+        const DOTTED_UNDERLINE = 1 << 10;
+        const DASHED_UNDERLINE = 1 << 11;
+        const STRIKEOUT = 1 << 12;
     }
 }
 
@@ -38,7 +43,7 @@ pub enum CursorStyle {
 }
 
 /// Renderer-side representation of one terminal cell.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderCell {
     /// The Unicode character occupying this cell, or `' '` for an empty cell.
     pub character: char,
@@ -50,6 +55,7 @@ pub struct RenderCell {
     pub bg: Rgb,
     /// Rendering flags (bold, italic, underline, inverse).
     pub flags: CellFlags,
+    pub underline_color: Option<Rgb>,
 }
 
 impl Default for RenderCell {
@@ -61,6 +67,7 @@ impl Default for RenderCell {
             fg: palette::ELECTRIC,
             bg: palette::BLACK,
             flags: CellFlags::empty(),
+            underline_color: None,
         }
     }
 }

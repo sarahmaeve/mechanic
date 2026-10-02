@@ -20,7 +20,7 @@ Use the same machine, font, size, opacity, display, and power settings.
 Match scrollback capacity where possible: Mechanic and iTerm2 use lines,
 while Ghostty uses bytes, so record both limits and treat history comparisons
 as approximate. Keep the window visible and focused; disable Mechanic's
-`--animate` / `--hot-cpu` mode. Do not type or resize during a run. The scrollback case
+animations with `--no-animate-logo --no-animate-background`. Do not type or resize during a run. The scrollback case
 clears the window's history. `--cols` and `--rows` select another shared
 size. Record terminal versions and settings with `--notes "..."`; environment
 version strings are also saved but may be absent or inherited from the shell.
@@ -147,7 +147,13 @@ cargo build --release -p mechanic-app
 cargo build --release -p mechanic-bench --example app_cpu
 ./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cpu-idle.json
 ./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cpu-animated.json --animate
+./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cpu-logo.json --animation logo --logo atom
+./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cpu-background.json --animation background --logo atom
 ```
+
+`--animation off|logo|background|both` selects effects independently; the benchmark
+defaults to `off` and writes both settings explicitly to isolate the run. `--animate`
+remains an alias for `both`. `--logo triangle|atom` chooses the logo (180 pixels).
 
 The example launches an isolated window with Menlo 14 pt, opaque content and
 an idle Rust PTY peer. After three seconds it samples five seconds of native
@@ -161,7 +167,8 @@ are never overwritten; only the launched app is terminated afterward.
 Percentages use one CPU core as 100%. They exclude the peer, WindowServer,
 GPU activity and energy use. Actual window dimensions are not instrumented.
 Compare identical window/display conditions and release builds. The example
-passes the legacy `--hot-cpu` alias so it can also measure older app binaries.
+passes the legacy `--hot-cpu` alias for `both`, so it can also measure older app
+binaries. Independent `logo` and `background` modes require the updated app.
 
 ## Render stages and multilingual text
 
@@ -182,7 +189,8 @@ cursor; unfocus the fixture to inspect its hollow outline.
 actual terminal dimensions. Fields are conversion, shaping/atlas preparation,
 instance construction, host buffer upload, surface acquisition and submit/present
 nanoseconds. Upload time excludes GPU completion; tracing affects CPU totals.
-Animation and profiling/output workloads cannot be combined. Keep focus and window
+Animation and render profiling cannot be combined; output workloads support either.
+Keep focus and window
 size stable; failed runs remain marked inconclusive.
 
 These GUI CPU/stage measurements are Mechanic-specific. Use the terminal workloads
@@ -199,3 +207,18 @@ directory; `MECHANIC_TEXT_FIXTURE_PNG` chooses another path. It uses the product
 instance builder and shaders and reads the GPU target directly. It does not capture
 the screen. Tests cover cursor geometry, overlapping glyph coverage, surface opacity
 and atlas growth. Inspect the image for language typography as well as running tests.
+
+## Row geometry cache
+
+```sh
+MECHANIC_ROW_CACHE_BENCH_CSV=/tmp/row-cache.csv \
+  cargo test --release -p mechanic-renderer row_cache_geometry_benchmark -- --ignored --nocapture
+```
+
+This offscreen Metal test compares full geometry construction with row caching
+on the same shaped 121×42 grid. It alternates measurement order, warms up for
+20 iterations and records 200 iterations per cell/row/full/scroll workload.
+CSV records host geometry time and planned upload byte counts; shaping, actual
+GPU uploads, presentation and whole-app CPU are outside timing. An absolute
+output path is required; the selected CSV is replaced. Every iteration also
+checks that cached geometry exactly matches a full rebuild.

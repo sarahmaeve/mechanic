@@ -1,16 +1,19 @@
 //! Rasterize the bundled corner logo and upload it once at startup.
 
+use mechanic_config::theme::LogoStyle;
 use resvg::tiny_skia::{Pixmap, Transform};
 use resvg::usvg;
 
 /// SVG source bundled into the binary at compile time.
 const LOGO_SVG: &str = include_str!("../assets/logo.svg");
+const ATOM_SVG: &str = include_str!("../assets/atom.svg");
 
 /// Texture resolution for the rasterized logo, in pixels.
 pub const LOGO_SIZE: u32 = 256;
 
 /// The rasterized logo, living on the GPU as a texture.
 pub struct Logo {
+    pub style: LogoStyle,
     /// Owning handle to the texture.  Kept alive alongside the view.
     #[allow(dead_code)]
     pub texture: wgpu::Texture,
@@ -20,8 +23,11 @@ pub struct Logo {
 
 impl Logo {
     /// Rasterize the bundled SVG and upload the result to a new GPU texture.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let rgba = rasterize_svg();
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, style: LogoStyle) -> Self {
+        let rgba = rasterize_svg(match style {
+            LogoStyle::Triangle => LOGO_SVG,
+            LogoStyle::Atom => ATOM_SVG,
+        });
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("logo_texture"),
@@ -51,15 +57,14 @@ impl Logo {
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Self { texture, view }
+        Self { texture, view, style }
     }
 }
 
-/// Parse `LOGO_SVG` and rasterize it into an RGBA byte buffer at `LOGO_SIZE × LOGO_SIZE`.  The SVG's viewBox is mapped uniformly onto the square output.
-fn rasterize_svg() -> Vec<u8> {
+/// Rasterize the selected SVG into premultiplied RGBA pixels.
+fn rasterize_svg(svg: &str) -> Vec<u8> {
     let opts = usvg::Options::default();
-    let tree =
-        usvg::Tree::from_str(LOGO_SVG, &opts).expect("bundled logo SVG must parse at startup");
+    let tree = usvg::Tree::from_str(svg, &opts).expect("bundled logo SVG must parse at startup");
 
     let mut pixmap =
         Pixmap::new(LOGO_SIZE, LOGO_SIZE).expect("LOGO_SIZE must be a valid Pixmap dimension");
