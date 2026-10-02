@@ -20,7 +20,7 @@ Use the same machine, font, size, opacity, display, and power settings.
 Match scrollback capacity where possible: Mechanic and iTerm2 use lines,
 while Ghostty uses bytes, so record both limits and treat history comparisons
 as approximate. Keep the window visible and focused; disable Mechanic's
-`--hot-cpu` mode. Do not type or resize during a run. The scrollback case
+`--animate` / `--hot-cpu` mode. Do not type or resize during a run. The scrollback case
 clears the window's history. `--cols` and `--rows` select another shared
 size. Record terminal versions and settings with `--notes "..."`; environment
 version strings are also saved but may be absent or inherited from the shell.
@@ -139,3 +139,26 @@ runs. `--mib`, `--samples`, `--timeout`, and `--case ascii|sgr` select a subset.
 The default 20-second peer watchdog bounds failed/blocking runs; finite output
 also ensures an old unbounded parser eventually finishes. Incomplete setup
 removes its result file; completed observations retain verification failures.
+
+## App CPU and animations (macOS)
+
+```sh
+cargo build --release -p mechanic-app
+cargo build --release -p mechanic-bench --example app_cpu
+./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cpu-idle.json
+./target/release/examples/app_cpu ./target/release/mechanic benchmarks/results/cpu-animated.json --animate
+```
+
+The example launches an isolated window with Menlo 14 pt, opaque content and
+an idle Rust PTY peer. After three seconds it samples five seconds of native
+process user/system CPU counters, converted with the native Mach timebase.
+Keep the window size and focus unchanged. Animation runs require confirmed
+focus; idle runs accept either stable focus state. Unknown focus or any focus
+transition marks the report inconclusive.
+`--settle-secs`, `--sample-secs`, and `--label` customize a run. Existing reports
+are never overwritten; only the launched app is terminated afterward.
+
+Percentages use one CPU core as 100%. They exclude the peer, WindowServer,
+GPU activity and energy use. Actual window dimensions are not instrumented.
+Compare identical window/display conditions and release builds. The example
+passes the legacy `--hot-cpu` alias so it can also measure older app binaries.

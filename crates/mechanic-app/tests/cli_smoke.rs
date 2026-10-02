@@ -55,7 +55,7 @@ fn help_flag_prints_usage_with_known_flags() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("USAGE"), "help output should include a USAGE section: {stdout:?}");
-    for expected in ["--hot-cpu", "--no-mouse-tracking", "--help", "--version"] {
+    for expected in ["--animate", "--hot-cpu", "--no-mouse-tracking", "--help", "--version"] {
         assert!(stdout.contains(expected), "help output missing flag {expected:?}:\n{stdout}");
     }
 }

@@ -1,0 +1,50 @@
+{
+  "schema_version": 2,
+  "status": "ok",
+  "error": null,
+  "app_binary": "/private/tmp/mechanic-before-decoupled",
+  "app_binary_bytes": 13184928,
+  "app_binary_modified_unix_seconds": 1790907951,
+  "label": "e31e89a-before-decoupling",
+  "benchmark_version": "0.1.0",
+  "benchmark_debug_assertions": false,
+  "mode": "focused_animation",
+  "settle_seconds": 3,
+  "requested_sample_seconds": 5,
+  "pid": 7550,
+  "cpu_start": {
+    "user_mach_ticks": 6906125,
+    "system_mach_ticks": 5461143,
+    "user_ns": 287755208,
+    "system_ns": 227547625
+  },
+  "cpu_end": {
+    "user_mach_ticks": 15687798,
+    "system_mach_ticks": 13190981,
+    "user_ns": 653658250,
+    "system_ns": 549624208
+  },
+  "elapsed_seconds": 5.004979417,
+  "cpu_percent_one_core": 13.745903183201841,
+  "focused_at_start": true,
+  "focus_events_during_sample": [],
+  "settings": {
+    "actual_window_dimensions": "not measured; keep window unchanged",
+    "app_build_revision": "not inferred; use --label to identify the build",
+    "font_family": "Menlo",
+    "font_size_points": 14,
+    "opacity": 1,
+    "pty_peer": "idle Rust peer",
+    "requested_default_window_logical_height": 768,
+    "requested_default_window_logical_width": 1024
+  },
+  "scope": "App process user + system CPU only; 100% is one CPU core. Excludes PTY peer, WindowServer, GPU usage and energy. Compare identical hardware, display, window size and app build profile.",
+  "app_stderr": "[2026-10-02T02:33:51Z INFO  mechanic::app] spawned window WindowId(45240926848) (total: 1)\n[2026-10-02T02:33:51Z DEBUG mechanic::app] window WindowId(45240926848) focused: false\n[2026-10-02T02:33:51Z DEBUG mechanic::app] window WindowId(45240926848) focused: true\n",
+  "cpu_timebase": {
+    "numerator": 125,
+    "denominator": 3
+  },
+  "cpu_delta_mach_ticks": 16511511,
+  "cpu_delta_ns": 687979625,
+  "correction": "Recalculated from the original valid focused sample: schema 1 mislabeled native Mach ticks as nanoseconds. Raw counter values and elapsed time are preserved; conversion uses the verified native timebase 125/3."
+}

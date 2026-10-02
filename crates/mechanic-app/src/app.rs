@@ -11,6 +11,7 @@ use mechanic_core::{
 use mechanic_renderer::{CellMetrics, FrameUniforms, Renderer};
 
 use crate::mouse as mouse_enc;
+use crate::scheduling::{FramePacer, FrameSchedule, ParseQueue};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -64,6 +65,15 @@ struct AppState {
     focus_gain_at: Option<Instant>,
     /// Start of the committed bloom; cleared after its configured duration.
     bloom_start: Option<Instant>,
+    frame_pacer: FramePacer,
+}
+
+impl AppState {
+    fn request_redraw(&mut self) {
+        if self.frame_pacer.request_redraw() {
+            self.window.request_redraw();
+        }
+    }
 }
 
 /// Brief redraw burst after focus changes so opacity updates reach the compositor.
@@ -80,6 +90,7 @@ pub struct App {
     hot_cpu: bool,
     /// Allows forwarding mouse events when the terminal program requests them.
     mouse_tracking: bool,
+    pending_parsers: ParseQueue<WindowId>,
 }
 
 impl App {
@@ -89,7 +100,14 @@ impl App {
         hot_cpu: bool,
         mouse_tracking: bool,
     ) -> Self {
-        Self { config, windows: HashMap::new(), proxy, hot_cpu, mouse_tracking }
+        Self {
+            config,
+            windows: HashMap::new(),
+            proxy,
+            hot_cpu,
+            mouse_tracking,
+            pending_parsers: ParseQueue::new(),
+        }
     }
 
     fn make_waker(&self, window_id: WindowId) -> PtyWaker {
@@ -99,9 +117,65 @@ impl App {
     /// Remove a window and exit the event loop if no windows remain.
     fn close_window(&mut self, id: WindowId, event_loop: &ActiveEventLoop) {
         self.windows.remove(&id);
+        self.pending_parsers.remove(&id);
         if self.windows.is_empty() {
             log::info!("all windows closed — exiting");
             event_loop.exit();
+        }
+    }
+
+    fn pump_parser(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(id) = self.pending_parsers.pop() else {
+            return;
+        };
+        let Some(state) = self.windows.get_mut(&id) else {
+            return;
+        };
+        if state.exit_status.is_some() {
+            return;
+        }
+        let outcome = state.terminal.process_input();
+        state.content_dirty |= outcome.grid_maybe_changed;
+
+        // Fatal transport failures freeze the window even if a child exit was
+        // delivered with the same final output batch.
+        if let Some(error) = outcome.io_error {
+            log::error!("window {id:?} PTY transport failed: {error}");
+            state.terminal.inject_local(
+                b"\r\n\x1b[31m[terminal I/O failed; Cmd+R to restart, any key to close]\x1b[0m\r\n",
+            );
+            state.exit_status = Some(None);
+            state.content_dirty = true;
+            state.request_redraw();
+        }
+
+        if let Some(status) = outcome.child_exit
+            && state.exit_status.is_none()
+        {
+            let should_close = match self.config.terminal.close_on_exit {
+                mechanic_config::CloseOnExitPolicy::Always => true,
+                mechanic_config::CloseOnExitPolicy::Success => status.is_none_or(|s| s.success()),
+                mechanic_config::CloseOnExitPolicy::Never => false,
+            };
+            log::info!(
+                "window {id:?} shell exited with {} — {}",
+                format_exit_status(status),
+                if should_close { "closing" } else { "freezing" },
+            );
+            if should_close {
+                self.close_window(id, event_loop);
+                return;
+            }
+            inject_exit_banner(&mut state.terminal, status);
+            state.exit_status = Some(status);
+            state.content_dirty = true;
+            state.request_redraw();
+        }
+
+        if state.exit_status.is_some() {
+            self.pending_parsers.remove(&id);
+        } else if outcome.more_output {
+            self.pending_parsers.enqueue(id);
         }
     }
 
@@ -116,7 +190,7 @@ impl App {
         state.terminal.resize(term_size);
 
         state.content_dirty = true;
-        state.window.request_redraw();
+        state.request_redraw();
     }
 
     /// Compute [`TerminalSize`] from a physical pixel surface size and real cell metrics.
@@ -191,7 +265,7 @@ impl App {
         window.set_ime_allowed(true);
 
         let now = std::time::Instant::now();
-        let state = AppState {
+        let mut state = AppState {
             window: window.clone(),
             terminal,
             renderer,
@@ -211,10 +285,12 @@ impl App {
             focus_redraw_frames: FOCUS_REDRAW_BURST_FRAMES,
             focus_gain_at: Some(now),
             bloom_start: None,
+            frame_pacer: FramePacer::new(now),
         };
 
+        state.request_redraw();
         self.windows.insert(window_id, state);
-        window.request_redraw();
+        self.pending_parsers.enqueue(window_id);
 
         log::info!("spawned window {window_id:?} (total: {})", self.windows.len());
         Some(window_id)
@@ -298,7 +374,7 @@ impl ApplicationHandler<UserEvent> for App {
                 state.terminal.resize(new_term_size);
 
                 state.content_dirty = true;
-                state.window.request_redraw();
+                state.request_redraw();
             }
 
             WindowEvent::ModifiersChanged(mods) => {
@@ -319,7 +395,7 @@ impl ApplicationHandler<UserEvent> for App {
                     state.focus_gain_at = None;
                 }
 
-                state.window.request_redraw();
+                state.request_redraw();
             }
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
@@ -330,6 +406,9 @@ impl ApplicationHandler<UserEvent> for App {
                     if mods.super_key() && matches!(key, Key::Character(c) if c.as_str() == "r") {
                         let waker = make_waker_for(&self.proxy, id);
                         respawn_shell(state, &self.config, id, waker);
+                        if state.exit_status.is_none() {
+                            self.pending_parsers.enqueue(id);
+                        }
                         return;
                     }
 
@@ -370,19 +449,19 @@ impl ApplicationHandler<UserEvent> for App {
                                 log::warn!("PTY paste failed: {e}");
                             }
                             state.content_dirty = true;
-                            state.window.request_redraw();
+                            state.request_redraw();
                             return;
                         }
                         CmdShortcut::ClearScrollback => {
                             state.terminal.clear_history();
                             state.content_dirty = true;
-                            state.window.request_redraw();
+                            state.request_redraw();
                             return;
                         }
                         CmdShortcut::SelectAll => {
                             state.terminal.select_all();
                             state.content_dirty = true;
-                            state.window.request_redraw();
+                            state.request_redraw();
                             return;
                         }
                         CmdShortcut::FontSizeIncrease => {
@@ -404,7 +483,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 log::warn!("PTY undo write failed: {e}");
                             }
                             state.content_dirty = true;
-                            state.window.request_redraw();
+                            state.request_redraw();
                             return;
                         }
                     }
@@ -424,7 +503,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 state.content_dirty = true;
-                state.window.request_redraw();
+                state.request_redraw();
             }
 
             WindowEvent::Ime(ime_event) => {
@@ -453,7 +532,7 @@ impl ApplicationHandler<UserEvent> for App {
                     Ime::Enabled | Ime::Disabled => {}
                 }
                 state.content_dirty = true;
-                state.window.request_redraw();
+                state.request_redraw();
             }
 
             WindowEvent::MouseInput { state: btn_state, button: win_button, .. } => {
@@ -488,7 +567,7 @@ impl ApplicationHandler<UserEvent> for App {
                         state.last_mouse_report = None;
                     }
                     state.content_dirty = true;
-                    state.window.request_redraw();
+                    state.request_redraw();
                     return;
                 }
 
@@ -555,7 +634,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         state.content_dirty = true;
-                        state.window.request_redraw();
+                        state.request_redraw();
                     }
 
                     (ElementState::Pressed, MouseButton::Middle) => {
@@ -564,7 +643,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 log::warn!("PTY middle-click paste failed: {e}");
                             }
                             state.content_dirty = true;
-                            state.window.request_redraw();
+                            state.request_redraw();
                         }
                     }
 
@@ -628,7 +707,7 @@ impl ApplicationHandler<UserEvent> for App {
                     );
                     state.terminal.update_selection(point, side);
                     state.content_dirty = true;
-                    state.window.request_redraw();
+                    state.request_redraw();
                 }
             }
 
@@ -675,7 +754,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     state.content_dirty = true;
-                    state.window.request_redraw();
+                    state.request_redraw();
                     return;
                 }
 
@@ -685,57 +764,25 @@ impl ApplicationHandler<UserEvent> for App {
                     state.terminal.scroll_down((-lines) as usize);
                 }
                 state.content_dirty = true;
-                state.window.request_redraw();
+                state.request_redraw();
             }
 
             WindowEvent::RedrawRequested => {
-                let outcome = state.terminal.process_input();
-
-                if outcome.grid_maybe_changed {
-                    state.content_dirty = true;
+                if state.frame_pacer.is_occluded() {
+                    return;
                 }
-
-                if let Some(error) = outcome.io_error {
-                    log::error!("window {id:?} PTY transport failed: {error}");
-                    state.terminal.inject_local(b"\r\n\x1b[31m[terminal I/O failed; Cmd+R to restart, any key to close]\x1b[0m\r\n");
-                    state.exit_status = Some(None);
-                    state.content_dirty = true;
-                }
-
-                if let Some(status) = outcome.child_exit
-                    && state.exit_status.is_none()
-                {
-                    let should_close = match self.config.terminal.close_on_exit {
-                        mechanic_config::CloseOnExitPolicy::Always => true,
-                        mechanic_config::CloseOnExitPolicy::Success => {
-                            status.is_none_or(|s| s.success())
-                        }
-                        mechanic_config::CloseOnExitPolicy::Never => false,
-                    };
-
-                    log::info!(
-                        "window {id:?} shell exited with {} — {}",
-                        format_exit_status(status),
-                        if should_close { "closing" } else { "freezing" },
-                    );
-
-                    if should_close {
-                        self.close_window(id, event_loop);
-                        return;
-                    }
-
-                    inject_exit_banner(&mut state.terminal, status);
-                    state.exit_status = Some(status);
-                    state.content_dirty = true;
-                    state.window.request_redraw();
-                }
-
                 render_frame(state, &self.config, self.hot_cpu);
-
+                // Renderer reports no presentation result. Pace from the end
+                // of each render attempt, including a skipped surface frame.
+                state.frame_pacer.rendered(Instant::now());
                 state.focus_redraw_frames = state.focus_redraw_frames.saturating_sub(1);
-                if outcome.more_output {
-                    // Yield to window events before parsing the next batch.
-                    state.window.request_redraw();
+            }
+
+            WindowEvent::Occluded(occluded) => {
+                state.frame_pacer.set_occluded(occluded);
+                if !occluded {
+                    // An outstanding request may have been suppressed while hidden.
+                    state.request_redraw();
                 }
             }
 
@@ -744,35 +791,47 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // One bounded parse batch globally per turn, independent of rendering.
+        // Requeue continuations rather than self-posting user events: macOS
+        // drains those events before it can dispatch native input events.
+        self.pump_parser(event_loop);
         let now = Instant::now();
         let mut earliest_deadline: Option<Instant> = None;
 
-        let bloom_duration =
-            Duration::from_millis(self.config.theme.opacity.bloom_duration_ms as u64);
-
-        for state in self.windows.values() {
-            let bloom_active = state
-                .bloom_start
-                .is_some_and(|t| now.saturating_duration_since(t) < bloom_duration);
+        for state in self.windows.values_mut() {
             let input = AnimationInputs {
                 is_alive: state.exit_status.is_none(),
                 focused: state.focused,
                 focus_redraw_frames: state.focus_redraw_frames,
-                bloom_active,
+                bloom_start: state.bloom_start,
             };
-            let anim = classify_animation(input, self.hot_cpu, now);
-            match anim {
-                AnimationState::Active { next_frame } => {
-                    state.window.request_redraw();
-                    merge_deadline(&mut earliest_deadline, next_frame);
+            let anim = classify_animation(input, self.hot_cpu, state.frame_pacer.last_render());
+            let mut animation_deadline = match anim {
+                AnimationState::Active { next_frame } => Some(next_frame),
+                AnimationState::Idle => None,
+            };
+            if state.exit_status.is_none()
+                && let Some(gain) = state.focus_gain_at
+            {
+                let dwell = Duration::from_millis(self.config.theme.opacity.bloom_dwell_ms as u64);
+                merge_deadline(&mut animation_deadline, gain + dwell);
+            }
+            match state.frame_pacer.schedule(now, state.content_dirty, animation_deadline) {
+                FrameSchedule::Redraw => state.window.request_redraw(),
+                FrameSchedule::WaitUntil(deadline) => {
+                    merge_deadline(&mut earliest_deadline, deadline);
                 }
-                AnimationState::Idle => {}
+                FrameSchedule::Idle => {}
             }
         }
 
-        event_loop.set_control_flow(match earliest_deadline {
-            Some(t) => ControlFlow::WaitUntil(t),
-            None => ControlFlow::Wait,
+        event_loop.set_control_flow(if !self.pending_parsers.is_empty() {
+            ControlFlow::Poll
+        } else {
+            match earliest_deadline {
+                Some(t) => ControlFlow::WaitUntil(t),
+                None => ControlFlow::Wait,
+            }
         });
     }
 
@@ -782,7 +841,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(state) = self.windows.get(&id)
                     && state.exit_status.is_none()
                 {
-                    state.window.request_redraw();
+                    self.pending_parsers.enqueue(id);
                 }
             }
         }
@@ -989,7 +1048,7 @@ fn compute_bloom_progress(bloom_start: Option<Instant>, duration: Duration, now:
 /// What a window needs from the event-loop scheduler for the next tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnimationState {
-    /// Window has active animation.  Redraw now; next frame at `next_frame`.
+    /// Window has active animation; its next frame is due at `next_frame`.
     Active { next_frame: Instant },
     /// Sleep until input or PTY output arrives.
     Idle,
@@ -1002,8 +1061,8 @@ struct AnimationInputs {
     focused: bool,
     /// Forced redraws remaining after a focus change, independent of `hot_cpu`.
     focus_redraw_frames: u8,
-    /// Whether the caller considers the bloom within its configured duration.
-    bloom_active: bool,
+    /// Keep scheduling until a final frame clears even an expired bloom.
+    bloom_start: Option<Instant>,
 }
 
 /// Frozen windows are idle; focus bursts, bloom, and focused `hot_cpu` need frames.
@@ -1014,7 +1073,7 @@ fn classify_animation(input: AnimationInputs, hot_cpu: bool, now: Instant) -> An
     if input.focus_redraw_frames > 0 {
         return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
-    if input.bloom_active {
+    if input.bloom_start.is_some() {
         return AnimationState::Active { next_frame: now + FRAME_INTERVAL };
     }
     if input.focused && hot_cpu {
@@ -1047,7 +1106,10 @@ fn respawn_shell(state: &mut AppState, config: &Config, id: WindowId, waker: Pty
             state.terminal = new_term;
             state.exit_status = None;
             state.content_dirty = true;
-            state.window.request_redraw();
+            let occluded = state.frame_pacer.is_occluded();
+            state.frame_pacer = FramePacer::new(Instant::now());
+            state.frame_pacer.set_occluded(occluded);
+            state.request_redraw();
             log::info!("window {id:?} shell respawned");
         }
         Err(e) => {
@@ -1235,7 +1297,7 @@ mod tests {
     }
 
     fn inputs(is_alive: bool, focused: bool) -> AnimationInputs {
-        AnimationInputs { is_alive, focused, focus_redraw_frames: 0, bloom_active: false }
+        AnimationInputs { is_alive, focused, focus_redraw_frames: 0, bloom_start: None }
     }
 
     fn inputs_with_burst(
@@ -1243,11 +1305,16 @@ mod tests {
         focused: bool,
         focus_redraw_frames: u8,
     ) -> AnimationInputs {
-        AnimationInputs { is_alive, focused, focus_redraw_frames, bloom_active: false }
+        AnimationInputs { is_alive, focused, focus_redraw_frames, bloom_start: None }
     }
 
     fn inputs_with_bloom(is_alive: bool, focused: bool) -> AnimationInputs {
-        AnimationInputs { is_alive, focused, focus_redraw_frames: 0, bloom_active: true }
+        AnimationInputs {
+            is_alive,
+            focused,
+            focus_redraw_frames: 0,
+            bloom_start: Some(Instant::now()),
+        }
     }
 
     #[test]
@@ -1348,6 +1415,30 @@ mod tests {
             classify_animation(inputs_with_bloom(true, false), false, Instant::now()),
             AnimationState::Active { .. }
         ));
+    }
+
+    #[test]
+    fn expired_bloom_keeps_a_final_frame_scheduled_until_cleared() {
+        let now = Instant::now();
+        let last_render = now - Duration::from_millis(20);
+        let mut input = inputs(true, false);
+        input.bloom_start = Some(now - Duration::from_secs(1));
+        assert_eq!(compute_bloom_progress(input.bloom_start, Duration::from_millis(100), now), 1.0,);
+        let AnimationState::Active { next_frame } = classify_animation(input, false, last_render)
+        else {
+            panic!("expired bloom still needs a frame to restore baseline brightness");
+        };
+        let mut pacer = FramePacer::new(last_render);
+        assert_eq!(
+            pacer.schedule(now, false, Some(next_frame)),
+            FrameSchedule::WaitUntil(next_frame),
+        );
+        assert_eq!(pacer.schedule(next_frame, false, Some(next_frame)), FrameSchedule::Redraw);
+        // render_frame clears the completed animation after drawing progress1.
+        input.bloom_start = None;
+        pacer.rendered(next_frame);
+        assert_eq!(classify_animation(input, false, next_frame), AnimationState::Idle);
+        assert_eq!(pacer.schedule(next_frame, false, None), FrameSchedule::Idle);
     }
 
     #[test]

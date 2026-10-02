@@ -17,8 +17,10 @@ input ordering, queue limits, output backpressure, exit delivery, and shutdown.
 See [measured results](../benchmarks/RESULTS.md) for before/after timings.
 
 Parsing now yields between chunks at a soft 4 ms budget with a 4 MiB hard
-limit. Budget exhaustion schedules another redraw even without a producer
-wake. Exits and transport errors wait for preceding output to drain.
+limit. One pending window parses per event-loop turn; continuations rotate
+through the queue independently of presentation. Exits and transport errors
+wait for preceding output to drain. Presentation uses fixed deadlines,
+suspends while hidden, and renders the final frame of a focus glow.
 
 | Priority | Finding and trigger | Location / direction |
 | --- | --- | --- |
@@ -32,10 +34,8 @@ wake. Exits and transport errors wait for preceding output to drain.
 | P2 | Color glyph data is uploaded as one-byte coverage without checking Swash content. | `renderer/text.rs`: handle RGBA/color glyphs and bitmap stride explicitly. |
 | P2 | SGR underline is unused and concealed text remains visible. | `app/convert.rs`, `renderer/pipeline.rs`: implement decorations and concealment. |
 | P2 | Fractional scroll deltas are truncated separately, losing slow trackpad scrolling. | `app/app.rs`: accumulate remainders per window. |
-| P2 | Active animations request immediate redraws before the nominal 33 ms deadline. | `app/app.rs`: retain deadlines and request only when due. |
 | P2 | Selection highlighting scans all selected history rows before rejecting invisible ones. | `app/convert.rs`: intersect selection with viewport first. |
 | P2 | PTY output batches post wake events even if one is pending. | `core/pty.rs`: coalesce notifications with a clear/recheck protocol. |
-| P2 | Budgeted parser continuations wait for redraws; scroll-region and sparse benchmarks slowed about 85% in one batch. | `app/app.rs`: schedule bounded parsing independently of presentation. |
 
 Paths above are under `crates/mechanic-*`. Full-grid allocation and upload on
 every content change are additional profiling targets, not measured

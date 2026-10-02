@@ -136,10 +136,9 @@ and 121×42 settings as above. Median milliseconds:
 
 Most cases changed little. Scrollback was 22% slower; scroll-region and sparse
 updates were about 85% slower. Parser continuation currently waits for another
-redraw, so throughput can pay for extra presentation turns. Decoupling parsing
-continuations from presentation is the next scheduling improvement; the
-4 ms budget favors shorter UI parsing stalls. No keyboard-to-pixel result is
-claimed.
+redraw, so throughput can pay for extra presentation turns. At this stage the
+4 ms budget favors shorter UI parsing stalls; the next section measures the
+subsequent scheduling change. No keyboard-to-pixel result is claimed.
 
 Raw reports: [call durations before](baselines/2026-10-01/parse-calls-before.json),
 [after](baselines/2026-10-01/parse-calls-after.json),
@@ -152,3 +151,72 @@ Validation after this follow-up: 309 workspace tests, strict Clippy, formatting,
 and release builds pass. Tests cover continuation without a producer wake,
 split UTF-8/escape sequences, expired budgets, the byte cap, and final-output /
 error / exit ordering.
+
+## Parsing independent of presentation
+
+One pending window now parses per event-loop turn, rotating fairly through a
+deduplicated queue. Redraws only render the current grid. The existing soft
+4 ms / hard 4 MiB parser limits are unchanged. Content presentation uses a
+16 ms deadline, animations a 33 ms deadline; hidden windows keep parsing but
+suspend rendering. Focus glow receives its final frame before becoming idle.
+
+A fresh GUI pair used the same runner and settings as the preceding tests.
+Median milliseconds:
+
+| Case | Parsing on redraw | Independent parsing |
+| --- | ---: | ---: |
+| ascii | 35.988 | 32.405 |
+| wrap | 36.753 | 32.217 |
+| unicode | 36.575 | 32.506 |
+| sgr | 36.514 | 32.739 |
+| scrollback | 42.299 | 33.756 |
+| scroll-region | 60.129 | 31.700 |
+| repaint | 36.254 | 32.218 |
+| sparse | 61.845 | 31.448 |
+| query-roundtrip | 8.344 | 0.018 |
+
+The two cases slowed by the parsing budget recover their earlier throughput.
+Query replies no longer wait for presentation. These remain DSR completion
+measurements, not visible frame latency. Explicit input/resize redraws remain
+immediate; paced PTY updates can wait for their 16 ms deadline plus rendering.
+
+### Animation CPU
+
+`--animate` enables the existing gradient and logo effects while focused;
+`--hot-cpu` remains an alias. Continuous effects are opt-in. Animation redraws
+now honor their deadline, use cached terminal instances, and stop while hidden.
+
+The Rust `app_cpu` example sampled app-process CPU for five seconds after a
+three-second settle, with an idle PTY peer, Menlo 14 pt and opaque content.
+All four accepted samples remained focused. Percent of one CPU core:
+
+| Mode | Before scheduling change | After |
+| --- | ---: | ---: |
+| Focused continuous effects | 13.746% | 3.966% |
+| Focused idle | 2.815% | 2.984% |
+
+Continuous effects used about 71% less app CPU in this small comparison.
+Idle CPU was similar, around 3%; the change does not eliminate native/runtime
+background work. These are single samples on this machine, excluding the
+peer, WindowServer, GPU use and energy. Actual window dimensions were not
+instrumented. No general battery-life or GPU-cost claim is made.
+
+The animated reports are corrected versions of initially valid focused
+samples: native `proc_pid_rusage` counters had been mislabeled as nanoseconds.
+Raw counter values and elapsed times are preserved. The host's Mach timebase
+is 125/3; a 250 ms CPU probe matched POSIX `getrusage` after conversion
+(249.9085 ms versus 249.909 ms). Conversion tests now cover fractional scaling
+and overflow. Later focus-interrupted attempts were excluded.
+
+Raw [GUI before](baselines/2026-10-01/mechanic-decoupled-before.json) /
+[after](baselines/2026-10-01/mechanic-decoupled-after.json),
+[animated CPU before](baselines/2026-10-01/cpu-animated-before-corrected.json) /
+[after](baselines/2026-10-01/cpu-animated-after-corrected.json), and
+[idle CPU before](baselines/2026-10-01/cpu-idle-before.json) /
+[after](baselines/2026-10-01/cpu-idle-after.json) retain the observations.
+
+Validation: 313 workspace tests plus three CPU-conversion tests pass, with
+strict Clippy, formatting and release builds. Scheduler tests cover fairness,
+continuation without presentation, fixed deadlines, pending redraws,
+occlusion/restoration, and the final bloom frame. Multi-window native input
+latency and GPU frame timing were not measured.

@@ -4,6 +4,7 @@ mod app;
 mod convert;
 mod input;
 mod mouse;
+mod scheduling;
 
 use app::UserEvent;
 
@@ -52,7 +53,7 @@ where
     let mut cli = Cli::default();
     for arg in args {
         match arg.as_str() {
-            "--hot-cpu" => cli.hot_cpu = true,
+            "--animate" | "--hot-cpu" => cli.hot_cpu = true,
             "--no-mouse-tracking" => cli.mouse_tracking = false,
             "-h" | "--help" => {
                 print_help();
@@ -79,8 +80,9 @@ fn print_help() {
     println!("    mechanic [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    --hot-cpu              Animate the gradient and logo while focused");
-    println!("                           (off by default; increases CPU usage)");
+    println!("    --animate              Animate the gradient and logo while focused");
+    println!("                           (paced at about 30 FPS; off by default)");
+    println!("    --hot-cpu              Alias for --animate");
     println!("    --no-mouse-tracking    Keep selection and middle-click paste local");
     println!("    -h, --help             Show this help and exit");
     println!("    -V, --version          Show version and exit");
@@ -133,9 +135,11 @@ mod tests {
 
     #[test]
     fn cli_hot_cpu_enables() {
-        let cli = parse_args(vec!["--hot-cpu".to_string()]);
-        assert!(cli.hot_cpu);
-        assert!(cli.mouse_tracking);
+        for flag in ["--animate", "--hot-cpu"] {
+            let cli = parse_args(vec![flag.to_string()]);
+            assert!(cli.hot_cpu);
+            assert!(cli.mouse_tracking);
+        }
     }
 
     #[test]

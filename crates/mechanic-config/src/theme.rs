@@ -218,20 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn bloom_dwell_fits_within_focus_redraw_burst() {
-        const FOCUS_REDRAW_BURST_MS: u32 = 5 * 33;
-        let op = OpacityConfig::default();
-        assert!(
-            op.bloom_dwell_ms <= FOCUS_REDRAW_BURST_MS,
-            "bloom_dwell_ms ({}) must be ≤ focus-redraw-burst duration ({} ms) \
-             — otherwise the bloom-commit check never fires.  See OpacityConfig \
-             docs for the invariant.",
-            op.bloom_dwell_ms,
-            FOCUS_REDRAW_BURST_MS
-        );
-    }
-
-    #[test]
     fn theme_serializes_and_deserializes() {
         let original = Theme::default();
         let serialized = toml::to_string(&original).expect("serialize theme");

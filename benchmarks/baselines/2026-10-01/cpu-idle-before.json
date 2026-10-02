@@ -1,0 +1,49 @@
+{
+  "schema_version": 2,
+  "status": "ok",
+  "error": null,
+  "app_binary": "/private/tmp/mechanic-before-decoupled",
+  "app_binary_bytes": 13184928,
+  "app_binary_modified_unix_seconds": 1790907951,
+  "label": "e31e89a-before-decoupling",
+  "benchmark_version": "0.1.0",
+  "benchmark_debug_assertions": false,
+  "mode": "idle",
+  "settle_seconds": 3,
+  "requested_sample_seconds": 5,
+  "pid": 8141,
+  "cpu_start": {
+    "user_mach_ticks": 2057604,
+    "system_mach_ticks": 1476662,
+    "user_ns": 85733500,
+    "system_ns": 61527583
+  },
+  "cpu_end": {
+    "user_mach_ticks": 4351410,
+    "system_mach_ticks": 2561318,
+    "user_ns": 181308750,
+    "system_ns": 106721583
+  },
+  "cpu_timebase": {
+    "numerator": 125,
+    "denominator": 3
+  },
+  "cpu_delta_mach_ticks": 3378462,
+  "cpu_delta_ns": 140769250,
+  "elapsed_seconds": 5.000040625,
+  "cpu_percent_one_core": 2.8153621251827334,
+  "focused_at_start": true,
+  "focus_events_during_sample": [],
+  "settings": {
+    "actual_window_dimensions": "not measured; keep window unchanged",
+    "app_build_revision": "not inferred; use --label to identify the build",
+    "font_family": "Menlo",
+    "font_size_points": 14,
+    "opacity": 1.0,
+    "pty_peer": "idle Rust peer",
+    "requested_default_window_logical_height": 768,
+    "requested_default_window_logical_width": 1024
+  },
+  "scope": "App process user + system CPU only; 100% is one CPU core. Excludes PTY peer, WindowServer, GPU usage and energy. Compare identical hardware, display, window size and app build profile.",
+  "app_stderr": "[2026-10-02T02:39:20Z INFO  mechanic::app] spawned window WindowId(33664647808) (total: 1)\n[2026-10-02T02:39:20Z DEBUG mechanic::app] window WindowId(33664647808) focused: false\n[2026-10-02T02:39:20Z DEBUG mechanic::app] window WindowId(33664647808) focused: true\n"
+}

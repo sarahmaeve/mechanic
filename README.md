@@ -9,8 +9,9 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Rust 1.99.0 is pinned in `rust-toolchain.toml`. `--hot-cpu` enables continuous
-shader animations; `--no-mouse-tracking` keeps mouse selection local.
+Rust 1.99.0 is pinned in `rust-toolchain.toml`. `--animate` enables paced
+gradient and logo animations while focused (`--hot-cpu` remains an alias).
+`--no-mouse-tracking` keeps mouse selection local.
 
 Configuration: `$XDG_CONFIG_HOME/mechanic/mechanic.toml`, or
 `~/.config/mechanic/mechanic.toml`. Missing keys use defaults. Invalid files
@@ -42,9 +43,14 @@ its I/O worker. Fatal transport errors leave a restartable window with an
 error banner.
 
 PTY parsing yields between chunks after roughly 4 ms, or at most 4 MiB per
-call. Remaining output schedules another redraw, and exit/error handling waits
-for buffered output. The time budget is soft: one parser chunk and rendering
-can take additional time.
+call. One window parses per event-loop turn, rotating through pending windows
+independently of redraws. Exit/error handling waits for buffered output. The
+time budget is soft: one parser chunk can take additional time.
+
+Content redraws are paced at 16 ms and animation frames at 33 ms. Input and
+resize redraws remain immediate. Hidden windows keep parsing but suspend
+presentation. Focus glow runs briefly by default; continuous effects require
+`--animate`. The event loop waits when parsing and animations are idle.
 
 See [benchmarks](benchmarks/README.md) for Rust microbenchmarks and identical
 workloads for Mechanic, iTerm2, and Ghostty.
